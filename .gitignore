@@ -1,42 +1,49 @@
-# Python
+# Python-specific ignores
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
 .Python
 env/
-venv/
-.venv/
-pip-log.txt
-pip-delete-this-directory.txt
-.tox/
-.coverage
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-.hypothesis/
-.pytest_cache/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
 *.egg-info/
 .installed.cfg
 *.egg
 
-# Environment variables
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+# Virtual Environment
+venv/
+ENV/
 
-# macOS
+# Environment Variables
+.env
+
+# MacOS
 .DS_Store
-.AppleDouble
-.LSOverride
-Icon
 
 # IDEs
 .vscode/
 .idea/
 
-# Local history
-.history/
+# Testing
+.tox/
+.coverage
+.cache
+nosetests.xml
+coverage.xml
+*,cover
+.hypothesis/
+.pytest_cache/
+
+# Logs
+*.log

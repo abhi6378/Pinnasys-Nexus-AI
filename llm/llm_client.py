@@ -1,38 +1,33 @@
 # ============================================================
-# llm/llm_client.py
-# ------------------------------------------------------------
-# Abstracted LLM layer using LangChain.
+# llm/llm_client.py  (v5)
+# ============================================================
+# LangChain abstraction over OpenAI.
 #
-# WHY LangChain here?
-# LangChain gives us a clean abstraction over the OpenAI API:
-#   - Easy to swap OpenAI → Claude → local model later
-#   - Built-in prompt templates
-#   - Memory integration
-#   - Future: tool calling, agents, chains
+# LangChain is used STRICTLY as:
+#   ✅ LLM call wrapper (ChatOpenAI)
+#   ✅ Prompt template helper (SystemMessage, HumanMessage, AIMessage)
+#   ✅ Tool calling utilities
 #
-# Used by the orchestrator for ALL direct LLM calls.
-# The OpenClaw client handles the other 2 agents separately.
+# LangChain is NOT used for:
+#   ❌ Orchestration or routing
+#   ❌ Workflow control
+#   ❌ Agent autonomy (no AgentExecutor)
 # ============================================================
 
 import os
+import json
+import re
+import logging
+
 from langchain_openai import ChatOpenAI
 from langchain.schema import SystemMessage, HumanMessage, AIMessage
-from langchain.prompts import ChatPromptTemplate, SystemMessagePromptTemplate
 from tools.tool_registry import get_tools_description
 
+logger = logging.getLogger(__name__)
 
-# ── LLM SETUP ─────────────────────────────────────────────────
 
-def get_llm(model: str = "gpt-4o-mini", temperature: float = 0.7):
-    """
-    Returns a LangChain ChatOpenAI instance.
-    Swap the model name to change the LLM — nothing else needs to change.
-    
-    Models:
-        gpt-4o-mini  → cheap, fast, good for demos
-        gpt-4o       → more powerful, higher cost
-        gpt-4-turbo  → balance of speed and quality
-    """
+def get_llm(model: str = "gpt-4o-mini",
+            temperature: float = 0.7) -> ChatOpenAI:
     return ChatOpenAI(
         model=model,
         temperature=temperature,
@@ -41,153 +36,153 @@ def get_llm(model: str = "gpt-4o-mini", temperature: float = 0.7):
     )
 
 
-# ── PROMPT BUILDER ────────────────────────────────────────────
-
-def build_system_prompt(config: dict, workspace_context: str = "",
+def build_system_prompt(config: dict,
+                        workspace_context: str = "",
                         workflow_input: str = "") -> str:
     """
-    Builds the full system prompt for an agent by combining:
-      1. Agent role (who they are)
-      2. Agent tone (how they write)
-      3. Business context from shared workspace memory
-      4. Available tools description
-      5. Workflow input (if this agent is part of a chain)
+    Builds the full system prompt for an agent.
 
-    Args:
-        config           : Agent config dict from configs.py
-        workspace_context: Business context from WorkspaceMemory
-        workflow_input   : Content passed from a previous agent in a chain
-
-    Returns:
-        str: Complete system prompt
+    Sections:
+      1. Role (WHO the agent is)
+      2. Tone (HOW the agent writes)
+      3. Brain AI context (business + brand + prior outputs)
+      4. Available tools
+      5. Workflow handoff input (if chained)
+      6. Output format instructions
+      7. Behavioral guardrails
     """
-    parts = [config["role"], f"\nTone: {config['tone']}"]
+    parts: list[str] = []
 
-    # Inject business context from shared workspace
+    # 1. Role
+    parts.append(config["role"])
+
+    # 2. Tone
+    parts.append(f"\nTone guidelines: {config['tone']}")
+
+    # 3. Brain AI — shared workspace context
     if workspace_context:
-        parts.append(f"\n\n{workspace_context}")
+        parts.append(
+            f"\n\n{'='*56}\n"
+            f"BRAIN AI — SHARED WORKSPACE CONTEXT\n"
+            f"(injected by the orchestrator — apply to all outputs)\n"
+            f"{'='*56}\n"
+            f"{workspace_context}"
+        )
 
-    # Inject tool descriptions so the agent knows what it can do
+    # 4. Available tools
     tool_desc = get_tools_description(config.get("allowed_tools", []))
     if tool_desc:
         parts.append(tool_desc)
 
-    # Inject workflow input from previous agent
+    # 5. Workflow input (previous agent's output)
     if workflow_input:
         parts.append(
-            f"\n\nINPUT FROM PREVIOUS AGENT:\n{workflow_input}\n"
-            f"Use the above as your starting point and build upon it."
+            f"\n\n{'='*56}\n"
+            f"INPUT FROM PREVIOUS AGENT\n"
+            f"Build on this — improve it, don't repeat it.\n"
+            f"{'='*56}\n"
+            f"{workflow_input}"
         )
 
+    # 6. Output format
     parts.append(
-        "\n\nAlways stay in character. Be specific and actionable. "
-        "Do not add unnecessary preamble. Get straight to the task."
+        "\n\nOUTPUT FORMAT:\n"
+        "- Use clear headers (##) to structure your response\n"
+        "- Be specific and actionable — no generic advice\n"
+        "- Ground everything in the business context above\n"
+        "- Include concrete examples where applicable"
+    )
+
+    # 7. Guardrails
+    parts.append(
+        "\n\nGUARDRAILS:\n"
+        "- Stay in character at all times\n"
+        "- Do NOT explain what you're about to do — just do it\n"
+        "- Do NOT add disclaimers or meta-commentary\n"
+        "- Apply brand voice to everything you write"
     )
 
     return "\n".join(parts)
 
 
-# ── MAIN LLM CALL ─────────────────────────────────────────────
-
-def run_llm(system_prompt: str, user_message: str,
-            history: list = None, model: str = "gpt-4o-mini") -> str:
+def run_llm(system_prompt: str,
+            user_message: str,
+            history: list = None,
+            model: str = "gpt-4o-mini") -> str:
     """
-    Calls the LLM via LangChain and returns the response string.
-
-    Args:
-        system_prompt : Full agent system prompt (role + context + tools)
-        user_message  : The user's input
-        history       : List of past messages [{"role": "...", "content": "..."}]
-        model         : Which model to use
-
-    Returns:
-        str: LLM response text
+    Calls the LLM with full context. Returns plain string.
+    LangChain used as wrapper ONLY — no agent control logic.
     """
     llm = get_llm(model=model)
-
-    # Build the messages list for LangChain
     messages = [SystemMessage(content=system_prompt)]
 
-    # Add conversation history
-    if history:
-        for msg in history:
-            if msg["role"] == "user":
-                messages.append(HumanMessage(content=msg["content"]))
-            elif msg["role"] == "assistant":
-                messages.append(AIMessage(content=msg["content"]))
+    for msg in (history or []):
+        if msg["role"] == "user":
+            messages.append(HumanMessage(content=msg["content"]))
+        elif msg["role"] == "assistant":
+            messages.append(AIMessage(content=msg["content"]))
 
-    # Add the current user message
     messages.append(HumanMessage(content=user_message))
 
     try:
         response = llm.invoke(messages)
+        logger.info(f"[LLM] Success. ~{len(response.content)//4} tokens")
         return response.content
     except Exception as e:
+        logger.error(f"[LLM] Error: {e}")
         return f"❌ LLM Error: {str(e)}"
 
 
-# ── ROUTER LLM CALL ───────────────────────────────────────────
-
-def run_router_llm(user_message: str, available_agents: list) -> dict:
+def run_router_llm(user_message: str,
+                   available_agents: list[str]) -> dict:
     """
-    Uses GPT to intelligently decide which agent(s) should handle
-    a user's query, and whether it needs a single agent or a workflow.
-
-    Returns:
-        dict: {
-            "mode": "single" | "workflow",
-            "agent": "agent_name",           (if single)
-            "workflow": "workflow_name",      (if workflow)
-            "reason": "explanation"
-        }
+    GPT-powered routing suggestion (last-resort, auto mode only).
+    Called ONLY when intent classifier finds no match.
+    DecisionLayer validates the suggestion before any execution.
     """
-    llm = get_llm(model="gpt-4o-mini", temperature=0.1)
-
-    agents_list = "\n".join(f"  - {a}" for a in available_agents)
-
-    system = (
-        "You are a routing engine for a multi-agent AI system. "
-        "Your job is to read a user's request and decide which agent or workflow should handle it. "
-        "Reply ONLY with valid JSON. No explanation outside the JSON."
+    llm          = get_llm(model="gpt-4o-mini", temperature=0.0)
+    agents_list  = "\n".join(f"  - {a}" for a in available_agents)
+    workflows_str = (
+        "  - content_pipeline    : Write → SEO → Social\n"
+        "  - research_and_write  : Data → Copy\n"
+        "  - email_campaign      : Copy → Email sequence\n"
+        "  - full_marketing_blast: Strategy → Copy → SEO → Email → Social\n"
+        "  - sales_campaign      : Strategy → Sales pitch → Outreach\n"
+        "  - data_to_social      : Data → Article → Social\n"
+        "  - product_launch      : PM → PR → Copy → Email → Social\n"
+        "  - support_and_report  : Support → Data → Strategy report"
     )
 
-    prompt = f"""User request: "{user_message}"
+    system = (
+        "You are a routing engine. Your ONLY job is to read the request "
+        "and pick the best agent or workflow. Reply ONLY with valid JSON."
+    )
+    prompt = f"""Request: "{user_message}"
 
-Available agents:
+Agents:
 {agents_list}
 
-Available workflows:
-  - content_pipeline: Copywriter → SEO Specialist → Social Media Manager
-    (Use when user wants to create AND optimize AND format content for social)
-  - research_and_write: Data Analyst → Copywriter
-    (Use when user wants data insights turned into content)
+Workflows (use ONLY when 2+ agents are clearly needed in sequence):
+{workflows_str}
 
-Decide:
-- If this is a simple task for ONE agent → mode: "single"
-- If this clearly benefits from a multi-step workflow → mode: "workflow"
-
-Respond with ONLY this JSON:
+Return ONLY this JSON:
 {{
-  "mode": "single" or "workflow",
-  "agent": "exact agent name from the list above" (if single),
-  "workflow": "content_pipeline" or "research_and_write" (if workflow),
-  "reason": "one sentence explanation"
+  "mode":     "single" or "workflow",
+  "agent":    "exact agent name" (if single),
+  "workflow": "workflow_key"     (if workflow),
+  "reason":   "one sentence"
 }}"""
 
     try:
-        response = llm.invoke([
-            SystemMessage(content=system),
-            HumanMessage(content=prompt)
-        ])
-        import json, re
-        text = response.content.strip()
-        # Strip markdown fences if present
-        text = re.sub(r"```json|```", "", text).strip()
-        return json.loads(text)
+        resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=prompt)])
+        text = re.sub(r"```(?:json)?|```", "", resp.content.strip()).strip()
+        result = json.loads(text)
+        logger.info(f"[LLM ROUTER] {result}")
+        return result
     except Exception as e:
-        # Fallback: default to Virtual Assistant
+        logger.error(f"[LLM ROUTER] Parse failed: {e}")
         return {
-            "mode": "single",
-            "agent": "Virtual Assistant",
-            "reason": f"Router fallback due to error: {str(e)}"
+            "mode":   "single",
+            "agent":  "Virtual Assistant",
+            "reason": f"Router fallback: {str(e)}",
         }
