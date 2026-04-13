@@ -1,27 +1,29 @@
 """
 helpers/executor.py  —  Runs a single helper with Brain AI context
 
-Mission 3 update: run_agent() now supports structured tool calls.
+Mission 6 update: tool availability is now driven by the agent config's
+``allowed_tools`` list, not by scanning the registry. The config is the
+single authority for which tools an agent may use.
 
 Backward compatibility:
   - Signature is  run_agent(agent_key, user_input, brain_context, **kwargs)
   - Existing callers (handler.py, engine.py) pass 3 positional args → text-only
   - When workspace_id + db are passed, tool-aware mode activates for agents
-    that have tools in the registry.
+    whose config has  tool_mode == "tool_enabled"  and  allowed_tools != [].
   - Return contract is the same:  {agent, name?, output, success}
-    plus NEW optional keys:  {tool_used, connect_required, connect_url, resume_token}
+    plus optional keys:  {tool_used, connect_required, connect_url, resume_token}
 
 Tool execution flow:
-  1. Check if the agent has any allowed tools in the registry.
-  2. If no tools → plain text mode (existing path, zero overhead).
-  3. If tools exist → call generate_with_tool_awareness() which injects
-     available tools into the system prompt.
-  4. Parse the LLM response:
-     a) Normal text → return as-is (same as before).
-     b) JSON with tool_call → validate → check connection → execute.
-  5. If tool executed successfully → feed result back into the LLM for a
-     final human-readable response.
-  6. Hard cap on tool loop iterations (MAX_TOOL_ITERATIONS).
+  1. Read tool_mode + allowed_tools from agent config.
+  2. If tool_mode != "tool_enabled" or allowed_tools is empty → text-only path.
+  3. Resolve allowed_tools names to full registry entries via get_tools_by_names().
+  4. Call generate_with_tool_awareness() with the resolved tool list.
+  5. Parse the LLM response:
+     a) Normal text → return as-is.
+     b) JSON with tool_call → validate name is in allowed_tools → execute.
+  6. If tool executed successfully → feed result back for final human response.
+  7. Hard cap on tool loop iterations (MAX_TOOL_ITERATIONS).
+  8. Duplicate-call prevention via seen_calls set.
 """
 from __future__ import annotations
 
@@ -32,7 +34,7 @@ from typing import Optional
 
 from helpers.configs import get_agent
 from llm.client import generate, generate_with_tool_awareness
-from tools.tool_registry import get_tools_for_agent, is_agent_allowed, get_tool
+from tools.tool_registry import get_tools_by_names, is_agent_allowed, get_tool
 
 logger = logging.getLogger(__name__)
 
@@ -194,12 +196,18 @@ def run_agent(
     agent_name = agent["name"]
 
     # ── Determine if this agent has tools available ───────────────────────
-    # Tools are only available when:
+    # Tools are only available when ALL three conditions are met:
     #   1. workspace_id and db are provided (caller opted in)
-    #   2. The agent has at least one allowed tool in the registry
+    #   2. Agent config has tool_mode == "tool_enabled"
+    #   3. Agent config has a non-empty allowed_tools list
+    # The config's allowed_tools is the SINGLE SOURCE OF TRUTH for what
+    # tools this agent may use. The registry just provides metadata.
     available_tools = []
-    if workspace_id and db:
-        available_tools = get_tools_for_agent(agent_key)
+    config_tools = agent.get("allowed_tools", [])
+    tool_mode = agent.get("tool_mode", "text_only")
+
+    if workspace_id and db and tool_mode == "tool_enabled" and config_tools:
+        available_tools = get_tools_by_names(config_tools)
 
     # ── Text-only path (no tools, or tool infrastructure not provided) ────
     if not available_tools:
@@ -250,7 +258,9 @@ def _run_with_tools(
 ) -> dict:
     """
     Calls the LLM with tool awareness. If the LLM requests a tool:
-      - Validates it against the registry
+      - Validates tool name is in agent config's allowed_tools (config gate)
+      - Validates it exists in the registry (registry gate)
+      - Validates agent permission in registry (permission gate)
       - Checks connection via tool_executor
       - Executes if connected
       - Feeds tool output back for a final human response
@@ -267,6 +277,8 @@ def _run_with_tools(
     tool_used = None
     # Track (tool_name, params_hash) to prevent identical repeated calls.
     seen_calls: set[tuple[str, str]] = set()
+    # Build the config-level allow-set once for fast O(1) membership tests.
+    config_allowed: set[str] = set(agent.get("allowed_tools", []))
 
     for iteration in range(MAX_TOOL_ITERATIONS):
         try:
@@ -329,7 +341,27 @@ def _run_with_tools(
             continue
         seen_calls.add(call_key)
 
-        # ── Validate: does this tool exist? ───────────────────────────────
+        # ── Gate 1: config-level allowed_tools check ──────────────────────
+        # The agent config's allowed_tools is the primary authority.
+        # Even if a tool exists in the registry, the agent can only use it
+        # if its config explicitly lists it. This prevents hallucinated
+        # tool names from slipping through.
+        if tool_name not in config_allowed:
+            logger.warning(
+                "Agent '%s' requested tool '%s' which is not in its "
+                "allowed_tools config", agent_key, tool_name,
+            )
+            current_prompt = (
+                f"The tool '{tool_name}' is not in your allowed tools list. "
+                f"You can only use these tools: {', '.join(sorted(config_allowed))}. "
+                f"Please respond to the original request using only your "
+                f"own knowledge, without calling any tools.\n\n"
+                f"Original request: {user_input}"
+            )
+            available_tools = []
+            continue
+
+        # ── Gate 2: does this tool exist in the registry? ─────────────────
         tool_entry = get_tool(tool_name)
         if tool_entry is None:
             logger.warning(
@@ -345,7 +377,7 @@ def _run_with_tools(
             available_tools = []  # prevent further tool attempts
             continue
 
-        # ── Validate: is this agent allowed? ──────────────────────────────
+        # ── Gate 3: is this agent allowed in the registry? ────────────────
         if not is_agent_allowed(tool_name, agent_key):
             logger.warning(
                 "Agent '%s' not allowed to use tool '%s'", agent_key, tool_name

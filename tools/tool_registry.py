@@ -120,6 +120,25 @@ def get_tools_for_agent(agent_key: str) -> list[dict]:
     return result
 
 
+def get_tools_by_names(tool_names: list[str]) -> list[dict]:
+    """
+    Resolve a list of tool names (from agent config's ``allowed_tools``)
+    into their full registry entries.
+
+    Only returns tools that actually exist in the registry — silently
+    skips invalid or unknown names so callers never crash on stale config.
+
+    This is the primary bridge between the config-driven ``allowed_tools``
+    list in helpers/configs.py and the registry's full metadata.
+    """
+    result = []
+    for name in tool_names:
+        entry = TOOL_REGISTRY.get(name)
+        if entry is not None:
+            result.append(entry)
+    return result
+
+
 def get_tools_for_toolkit(toolkit: str) -> list[dict]:
     """Return all registry entries belonging to a specific toolkit."""
     return [

@@ -17,6 +17,10 @@ AGENTS = {
             "Write landing page headlines",
             "Write blog post outlines",
         ],
+        # ── Tool policy (structured) ──
+        "tool_mode": "text_only",
+        "allowed_tools": [],
+        "requires_auth": False,
         "icon": "✍️",
         "color": "#6C63FF",
     },
@@ -35,6 +39,10 @@ AGENTS = {
             "Content gap analysis",
             "Local SEO strategy",
         ],
+        # ── Tool policy (structured) ──
+        "tool_mode": "text_only",
+        "allowed_tools": [],
+        "requires_auth": False,
         "icon": "🔍",
         "color": "#00B4D8",
     },
@@ -53,6 +61,10 @@ AGENTS = {
             "Plan a content calendar",
             "Suggest viral content ideas",
         ],
+        # ── Tool policy (structured) ──
+        "tool_mode": "text_only",
+        "allowed_tools": [],
+        "requires_auth": False,
         "icon": "📱",
         "color": "#F72585",
     },
@@ -71,6 +83,19 @@ AGENTS = {
             "Create support scripts",
             "Respond to negative reviews",
         ],
+        # ── Tool policy (structured) ──
+        "tool_mode": "tool_enabled",
+        "allowed_tools": [
+            "GMAIL_SEND_EMAIL",
+            "GMAIL_LIST_EMAILS",
+            "SLACK_SEND_MESSAGE",
+        ],
+        "requires_auth": True,
+        "tool_policy": (
+            "Use Gmail or Slack ONLY when the user explicitly asks to send "
+            "a support email or post a Slack message. For writing scripts, "
+            "FAQs, or drafting replies, respond with text."
+        ),
         "tool_instructions": (
             "You have access to Gmail and Slack tools. Use them ONLY when the user "
             "explicitly asks you to send a support email or post a Slack message. "
@@ -95,6 +120,20 @@ AGENTS = {
             "Analyze sales objections",
             "Write proposal templates",
         ],
+        # ── Tool policy (structured) ──
+        "tool_mode": "tool_enabled",
+        "allowed_tools": [
+            "GMAIL_SEND_EMAIL",
+            "GMAIL_LIST_EMAILS",
+            "HUBSPOT_CREATE_CONTACT",
+            "HUBSPOT_GET_CONTACTS",
+        ],
+        "requires_auth": True,
+        "tool_policy": (
+            "Use Gmail ONLY to actually send an email. Use HubSpot ONLY to "
+            "create or look up contacts. For writing copy, strategies, or "
+            "pitch outlines, respond with text."
+        ),
         "tool_instructions": (
             "You have access to Gmail (send emails) and HubSpot (manage contacts). "
             "Use Gmail ONLY when the user asks you to actually send an email. "
@@ -120,6 +159,10 @@ AGENTS = {
             "Competitive analysis",
             "Growth strategy recommendations",
         ],
+        # ── Tool policy (structured) ──
+        "tool_mode": "text_only",
+        "allowed_tools": [],
+        "requires_auth": False,
         "icon": "🧠",
         "color": "#7209B7",
     },
@@ -138,6 +181,17 @@ AGENTS = {
             "Create data summaries",
             "Suggest KPIs to track",
         ],
+        # ── Tool policy (structured) ──
+        "tool_mode": "tool_enabled",
+        "allowed_tools": [
+            "HUBSPOT_GET_CONTACTS",
+        ],
+        "requires_auth": True,
+        "tool_policy": (
+            "Use HubSpot ONLY when the user asks to pull or list real "
+            "contact data. For general analysis or KPI recommendations, "
+            "respond with text."
+        ),
         "tool_instructions": (
             "You have access to HubSpot tools to fetch contact data. Use them ONLY "
             "when the user asks you to pull or list real contact data from HubSpot. "
@@ -162,6 +216,22 @@ AGENTS = {
             "Research topics",
             "Set reminders and to-do lists",
         ],
+        # ── Tool policy (structured) ──
+        "tool_mode": "tool_enabled",
+        "allowed_tools": [
+            "GMAIL_SEND_EMAIL",
+            "GMAIL_GET_PROFILE",
+            "GMAIL_LIST_EMAILS",
+            "GOOGLE_CALENDAR_CREATE_EVENT",
+            "GOOGLE_CALENDAR_LIST_EVENTS",
+            "SLACK_SEND_MESSAGE",
+        ],
+        "requires_auth": True,
+        "tool_policy": (
+            "Use tools ONLY when the user explicitly asks to perform an action — "
+            "send an email, schedule an event, or post a message. For drafting, "
+            "summarizing, researching, or planning, respond with text."
+        ),
         "tool_instructions": (
             "You have access to Gmail (send/list emails, get profile), Google Calendar "
             "(create/list events), and Slack (send messages). Use these tools ONLY when "
@@ -187,6 +257,18 @@ AGENTS = {
             "Screen candidate summaries",
             "Write offer letters",
         ],
+        # ── Tool policy (structured) ──
+        "tool_mode": "tool_enabled",
+        "allowed_tools": [
+            "GMAIL_SEND_EMAIL",
+            "GOOGLE_CALENDAR_CREATE_EVENT",
+        ],
+        "requires_auth": True,
+        "tool_policy": (
+            "Use Gmail ONLY to actually send a recruiting email or offer letter. "
+            "Use Calendar ONLY to schedule an interview. For writing job descriptions, "
+            "interview questions, or screening summaries, respond with text."
+        ),
         "tool_instructions": (
             "You have access to Gmail (send emails) and Google Calendar (schedule events). "
             "Use Gmail ONLY when the user asks you to actually send a recruiting email or "
@@ -212,6 +294,18 @@ AGENTS = {
             "Draft re-engagement sequences",
             "Write newsletters",
         ],
+        # ── Tool policy (structured) ──
+        "tool_mode": "tool_enabled",
+        "allowed_tools": [
+            "GMAIL_SEND_EMAIL",
+            "GMAIL_LIST_EMAILS",
+        ],
+        "requires_auth": True,
+        "tool_policy": (
+            "Use Gmail ONLY to actually send or check campaign emails. "
+            "For writing email copy, sequences, or campaign drafts, "
+            "respond with text."
+        ),
         "tool_instructions": (
             "You have access to Gmail tools (send and list emails). Use Gmail ONLY when "
             "the user asks you to actually send a campaign email or check sent emails. "
@@ -236,6 +330,10 @@ AGENTS = {
             "Advise on UI/UX improvements",
             "Write creative direction for campaigns",
         ],
+        # ── Tool policy (structured) ──
+        "tool_mode": "text_only",
+        "allowed_tools": [],
+        "requires_auth": False,
         "icon": "🎨",
         "color": "#FF6B6B",
     },
@@ -254,6 +352,10 @@ AGENTS = {
             "Suggest cost-cutting strategies",
             "Outline cash flow projections",
         ],
+        # ── Tool policy (structured) ──
+        "tool_mode": "text_only",
+        "allowed_tools": [],
+        "requires_auth": False,
         "icon": "💹",
         "color": "#2DC653",
     },
