@@ -1,11 +1,13 @@
 """
 ui/pages/chat_page.py  —  Main chat interface with agent selector
 
-Mission 4 update:
-  - Renders connect_required messages as a connector card with Connect button.
-  - Shows a Retry button after connect_required so the user can re-send
-    their original request without re-typing it.
-  - Stores pending retry context in st.session_state.pending_tool_retry.
+Mission 7 update:
+  - Shows tool execution status indicators (⚡ Using... / ✅ Done).
+  - Expandable "View tool details" section for tool-enabled responses.
+  - Persists tool_used metadata in chat_history entries.
+  - Improved connect_required card with clear visuals.
+  - Retry button for connect_required and tool failure cases.
+  - Backward compatible: text-only agents / workflows unaffected.
 """
 import streamlit as st
 from storage.db import SessionLocal
@@ -25,6 +27,18 @@ TOOLKIT_ICONS = {
     "GOOGLE_SHEETS":    ("table", "Google Sheets"),
 }
 
+# Maps tool_name → (emoji, human label) for execution indicators
+TOOL_DISPLAY = {
+    "GMAIL_SEND_EMAIL":              ("📧", "Sent email via Gmail"),
+    "GMAIL_GET_PROFILE":             ("📧", "Fetched Gmail profile"),
+    "GMAIL_LIST_EMAILS":             ("📧", "Listed emails from Gmail"),
+    "GOOGLE_CALENDAR_CREATE_EVENT":  ("📅", "Created calendar event"),
+    "GOOGLE_CALENDAR_LIST_EVENTS":   ("📅", "Listed calendar events"),
+    "SLACK_SEND_MESSAGE":            ("💬", "Sent Slack message"),
+    "HUBSPOT_CREATE_CONTACT":        ("📊", "Created HubSpot contact"),
+    "HUBSPOT_GET_CONTACTS":          ("📊", "Fetched HubSpot contacts"),
+}
+
 
 def _toolkit_display(toolkit_key: str) -> tuple[str, str]:
     """Return (emoji, display_name) for a toolkit."""
@@ -37,6 +51,46 @@ def _toolkit_display(toolkit_key: str) -> tuple[str, str]:
         "GOOGLE_SHEETS":   ("📋", "Google Sheets"),
     }
     return lookup.get(toolkit_key.upper(), ("🔗", toolkit_key.replace("_", " ").title()))
+
+
+def _tool_display(tool_name: str) -> tuple[str, str]:
+    """Return (emoji, human_label) for a tool execution indicator."""
+    return TOOL_DISPLAY.get(tool_name, ("⚡", tool_name.replace("_", " ").title()))
+
+
+# ── Tool execution indicator ─────────────────────────────────────────────────
+
+def _render_tool_indicator(tool_name: str):
+    """Render a compact tool execution badge after the message."""
+    emoji, label = _tool_display(tool_name)
+    st.markdown(
+        f"""<div style="
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 12px;
+            margin: 6px 0 2px 0;
+            border-radius: 8px;
+            background: linear-gradient(135deg, #0d3320 0%, #1a4731 100%);
+            border: 1px solid #2d6a4f;
+            font-size: 0.82em;
+            color: #b7e4c7;
+        ">
+        ✅ <strong>{label}</strong>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+
+# ── Expandable tool details ──────────────────────────────────────────────────
+
+def _render_tool_details(tool_name: str):
+    """Render an expandable section showing tool execution details."""
+    emoji, label = _tool_display(tool_name)
+    with st.expander(f"🔧 View tool details"):
+        st.markdown(f"**Tool:** `{tool_name}`")
+        st.markdown(f"**Action:** {label}")
+        st.markdown(f"**Status:** ✅ Executed successfully")
 
 
 # ── Connect-required card ─────────────────────────────────────────────────────
@@ -98,6 +152,42 @@ def _render_connect_card(msg: dict, msg_idx: int):
                     "resume_token": resume_token,
                 }
                 st.rerun()
+
+
+# ── Tool error display ────────────────────────────────────────────────────────
+
+def _render_tool_error(msg: dict, msg_idx: int):
+    """Render a friendly tool error message with retry option."""
+    original_input = msg.get("original_input", "")
+
+    st.markdown(
+        """<div style="
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 12px;
+            margin: 6px 0 2px 0;
+            border-radius: 8px;
+            background: linear-gradient(135deg, #3d1f1f 0%, #4a2020 100%);
+            border: 1px solid #6b3030;
+            font-size: 0.82em;
+            color: #f5b7b1;
+        ">
+        ⚠️ <strong>Tool execution failed — responded from knowledge</strong>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    if original_input:
+        if st.button(
+            "🔄 Retry",
+            key=f"error_retry_{msg_idx}",
+        ):
+            st.session_state.pending_tool_retry = {
+                "original_input": original_input,
+                "resume_token": "",
+            }
+            st.rerun()
 
 
 # ── Main page render ──────────────────────────────────────────────────────────
@@ -196,6 +286,16 @@ def render_chat():
                         st.caption(f"{icon} **{label}**")
                         st.markdown(msg["content"])
 
+                        # ── Tool execution indicator ──────────────────────────
+                        tool_used = msg.get("tool_used")
+                        if tool_used:
+                            _render_tool_indicator(tool_used)
+                            _render_tool_details(tool_used)
+
+                        # ── Tool error indicator ──────────────────────────────
+                        if msg.get("tool_error"):
+                            _render_tool_error(msg, msg_idx)
+
                         # ── Connect-required card ─────────────────────────────
                         if msg.get("connect_required"):
                             _render_connect_card(msg, msg_idx)
@@ -241,7 +341,7 @@ def render_chat():
                     force_agent=st.session_state.selected_agent
                 )
 
-            _append_result_to_history(result)
+            _append_result_to_history(result, original_input=retry_input)
             st.rerun()
 
         # ── Input ─────────────────────────────────────────────────────────────
@@ -254,13 +354,22 @@ def render_chat():
                 "content": user_input
             })
 
-            # Call orchestrator
-            with st.spinner("🧠 Thinking..."):
+            # Call orchestrator — show tool-aware spinner
+            selected = st.session_state.selected_agent
+            agent_conf = AGENTS.get(selected, {}) if selected else {}
+            tool_mode = agent_conf.get("tool_mode", "text_only")
+
+            if tool_mode == "tool_enabled":
+                spinner_msg = "🧠 Thinking... (tools available)"
+            else:
+                spinner_msg = "🧠 Thinking..."
+
+            with st.spinner(spinner_msg):
                 result = handle_request(
                     user_input,
                     ws_id,
                     db,
-                    force_agent=st.session_state.selected_agent
+                    force_agent=selected
                 )
 
             _append_result_to_history(result, original_input=user_input)
@@ -275,7 +384,8 @@ def render_chat():
 def _append_result_to_history(result: dict, original_input: str = "") -> None:
     """
     Append an orchestrator result to chat_history.
-    Handles normal, workflow, and connect_required modes.
+    Handles normal, workflow, connect_required, and tool-used modes.
+    Persists tool metadata for display on page refresh.
     """
     # Determine label and icon
     if result["mode"] == "workflow":
@@ -296,6 +406,16 @@ def _append_result_to_history(result: dict, original_input: str = "") -> None:
         "steps":   result.get("steps", []),
         "idea":    result.get("idea"),
     }
+
+    # Persist tool execution metadata
+    tool_used = result.get("tool_used")
+    if tool_used:
+        entry["tool_used"] = tool_used
+
+    # Flag tool errors (output contains error markers from executor)
+    if result.get("error") and not result.get("mode") == "workflow":
+        entry["tool_error"] = True
+        entry["original_input"] = original_input
 
     # If connect_required, attach extra fields for the connector card
     if result.get("mode") == "connect_required":

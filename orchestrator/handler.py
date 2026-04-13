@@ -128,6 +128,9 @@ def _exec_single_agent(agent_key: str, user_input: str,
     When workspace_id and db are provided, the agent runs in tool-aware
     mode — it can request Composio tools and may return connect_required.
     When they're absent, the agent runs in pure text-only mode (unchanged).
+
+    Tool metadata (tool_used) is propagated when a tool was executed
+    successfully, enabling the UI to show execution indicators.
     """
     agent_result = run_agent(
         agent_key, user_input, brain_context,
@@ -137,6 +140,16 @@ def _exec_single_agent(agent_key: str, user_input: str,
 
     # ── connect_required: propagate as a distinct mode ────────────────
     if agent_result.get("connect_required"):
+        # Extract toolkit from connect_url path or fall back to empty.
+        # The URL path typically ends with the toolkit name.
+        connect_url = agent_result.get("connect_url", "")
+        toolkit = ""
+        if connect_url:
+            try:
+                toolkit = connect_url.rstrip("/").split("/")[-1]
+            except Exception:
+                pass
+
         return {
             "mode":          "connect_required",
             "agent":         agent_key,
@@ -144,19 +157,26 @@ def _exec_single_agent(agent_key: str, user_input: str,
             "output":        agent_result["output"],
             "steps":         [],
             "connect_required": True,
-            "connect_url":   agent_result.get("connect_url"),
+            "connect_url":   connect_url,
             "resume_token":  agent_result.get("resume_token", ""),
-            "toolkit":       agent_result.get("connect_url", "").split("/")[-1]
-                             if agent_result.get("connect_url") else "",
+            "toolkit":       toolkit,
         }
 
-    return {
+    # ── Normal single-agent response ──────────────────────────────────
+    result = {
         "mode":   "single",
         "agent":  agent_key,
         "name":   agent_result.get("name", agent_key),
         "output": agent_result["output"],
         "steps":  [],
     }
+
+    # Propagate tool metadata if a tool was used
+    tool_used = agent_result.get("tool_used")
+    if tool_used:
+        result["tool_used"] = tool_used
+
+    return result
 
 
 def _exec_workflow(workflow_key: str, user_input: str,
