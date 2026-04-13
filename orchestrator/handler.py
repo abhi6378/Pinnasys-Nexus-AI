@@ -1,5 +1,11 @@
 """
 orchestrator/handler.py  —  The central brain. Routes every request.
+
+Routing priority:
+  1. force_agent      — user explicitly selected a helper in the UI
+  2. force_workflow   — idea acceptance or direct workflow launch
+  3. LLM router       — orchestrator/router.py (primary auto-route)
+  4. Legacy fallback  — detect_workflow() keyword match → detect_agent() LLM pick
 """
 import json
 from sqlalchemy.orm import Session
@@ -11,9 +17,10 @@ from helpers.configs import AGENTS
 from workflows.engine import run_workflow, WORKFLOWS
 from storage import repositories as repo
 from llm.client import generate_json
+from orchestrator.router import route_request
 
 
-# ── Workflow detection keywords ───────────────────────────────────────────────
+# ── Legacy routing (fallback only) ────────────────────────────────────────────
 
 WORKFLOW_TRIGGERS = {
     "marketing_campaign": [
@@ -40,6 +47,7 @@ WORKFLOW_TRIGGERS = {
 
 
 def detect_workflow(user_input: str) -> str | None:
+    """Legacy keyword workflow detection. Used as fallback only."""
     lowered = user_input.lower()
     for workflow_key, triggers in WORKFLOW_TRIGGERS.items():
         if any(t in lowered for t in triggers):
@@ -49,7 +57,7 @@ def detect_workflow(user_input: str) -> str | None:
 
 def detect_agent(user_input: str) -> str:
     """
-    Uses GPT-4o-mini to pick the best helper if no workflow detected.
+    Legacy LLM-based agent selection. Used as fallback only.
     Falls back to 'assistant' if uncertain.
     """
     agent_list = "\n".join(
@@ -109,6 +117,111 @@ Respond with JSON:
     return None
 
 
+# ── Route execution helpers ───────────────────────────────────────────────────
+
+def _exec_single_agent(agent_key: str, user_input: str,
+                        brain_context: str) -> dict:
+    """Execute a single agent and return a standardised result dict."""
+    agent_result = run_agent(agent_key, user_input, brain_context)
+    return {
+        "mode":   "single",
+        "agent":  agent_key,
+        "name":   agent_result.get("name", agent_key),
+        "output": agent_result["output"],
+        "steps":  [],
+    }
+
+
+def _exec_workflow(workflow_key: str, user_input: str,
+                    brain_context: str, workspace_id: str,
+                    db: Session) -> dict:
+    """Execute a workflow chain and return a standardised result dict."""
+    wf_result = run_workflow(workflow_key, user_input, brain_context)
+    result = {
+        "mode":     "workflow",
+        "workflow": workflow_key,
+        "output":   wf_result["final_output"],
+        "steps":    wf_result["steps"],
+        "error":    wf_result.get("error", False),
+    }
+    repo.save_workflow_run(
+        db, workspace_id, workflow_key,
+        wf_result["steps"], wf_result["final_output"]
+    )
+    return result
+
+
+def _exec_clarify(question: str) -> dict:
+    """Return a clarification-request result."""
+    return {
+        "mode":   "clarify",
+        "agent":  "system",
+        "output": f"🤔 **I need a bit more detail to help you effectively.**\n\n{question}",
+        "steps":  [],
+    }
+
+
+def _exec_reject(reason: str) -> dict:
+    """Return a safe rejection result."""
+    return {
+        "mode":   "reject",
+        "agent":  "system",
+        "output": f"🚫 **I can't process this request.**\n\n{reason}",
+        "steps":  [],
+    }
+
+
+# ── Router-driven auto-routing ────────────────────────────────────────────────
+
+def _auto_route(user_input: str, workspace_id: str, db: Session,
+                brain_context: str) -> dict:
+    """
+    Primary auto-routing path. Tries the LLM router first; falls back to
+    legacy keyword → LLM detection if the router fails.
+    """
+    # ── Try the central LLM router ────────────────────────────────────────
+    route = route_request(user_input, workspace_id, db, brain_context)
+
+    if route:
+        route_type = route["route_type"]
+
+        if route_type == "single_agent":
+            return _exec_single_agent(
+                route["selected_agent"], user_input, brain_context
+            )
+
+        if route_type == "workflow":
+            wf_key = route.get("selected_workflow")
+            if wf_key and wf_key in WORKFLOWS:
+                return _exec_workflow(
+                    wf_key, user_input, brain_context, workspace_id, db
+                )
+            # Router returned a workflow type but no valid key — fall through
+            # to legacy detection which may find the right workflow.
+
+        if route_type == "clarify":
+            return _exec_clarify(
+                route.get("clarification_question",
+                           "Could you provide more detail?")
+            )
+
+        if route_type == "reject":
+            return _exec_reject(
+                route.get("reason",
+                           "This request is outside the system's capabilities.")
+            )
+
+    # ── Fallback: legacy keyword → LLM detection ─────────────────────────
+    workflow_key = detect_workflow(user_input)
+    if workflow_key:
+        return _exec_workflow(
+            workflow_key, user_input, brain_context, workspace_id, db
+        )
+
+    agent_key = detect_agent(user_input)
+    return _exec_single_agent(agent_key, user_input, brain_context)
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def handle_request(user_input: str, workspace_id: str, db: Session,
@@ -119,85 +232,41 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
 
     Returns:
         {
-          mode: "single" | "workflow",
+          mode: "single" | "workflow" | "clarify" | "reject",
           agent/workflow: str,
           output: str,
           steps: list (workflows only),
-          idea: dict | None
+          idea: dict | None,
+          error: bool,
         }
     """
     # 1. Load Brain AI context
     brain = BrainAI(workspace_id, db)
     brain_context = brain.get_relevant_context(user_input)
 
-    result = {}
-
-    # 2. Route: workflow or single agent
+    # 2. Route — priority: force_agent > force_workflow > LLM router > legacy
     if force_agent:
-        # User explicitly chose a helper from the UI agent selector
-        agent_result = run_agent(force_agent, user_input, brain_context)
-        result = {
-            "mode":   "single",
-            "agent":  force_agent,
-            "name":   agent_result.get("name", force_agent),
-            "output": agent_result["output"],
-            "steps":  [],
-        }
+        result = _exec_single_agent(force_agent, user_input, brain_context)
     elif force_workflow and force_workflow in WORKFLOWS:
-        # Idea acceptance: workflow_hint is authoritative — skip keyword detection
-        # entirely so the correct workflow always fires regardless of how the
-        # idea description is phrased.
-        wf_result = run_workflow(force_workflow, user_input, brain_context)
-        result = {
-            "mode":     "workflow",
-            "workflow": force_workflow,
-            "output":   wf_result["final_output"],
-            "steps":    wf_result["steps"],
-        }
-        repo.save_workflow_run(
-            db, workspace_id, force_workflow,
-            wf_result["steps"], wf_result["final_output"]
+        result = _exec_workflow(
+            force_workflow, user_input, brain_context, workspace_id, db
         )
     else:
-        # Auto-route: keyword detection first, then LLM agent selection
-        workflow_key = detect_workflow(user_input)
-        if workflow_key:
-            wf_result = run_workflow(workflow_key, user_input, brain_context)
-            result = {
-                "mode":     "workflow",
-                "workflow": workflow_key,
-                "output":   wf_result["final_output"],
-                "steps":    wf_result["steps"],
-            }
-            # Save workflow run
-            repo.save_workflow_run(
-                db, workspace_id, workflow_key,
-                wf_result["steps"], wf_result["final_output"]
-            )
-        else:
-            agent_key = detect_agent(user_input)
-            agent_result = run_agent(agent_key, user_input, brain_context)
-            result = {
-                "mode":   "single",
-                "agent":  agent_key,
-                "name":   agent_result.get("name", agent_key),
-                "output": agent_result["output"],
-                "steps":  [],
-            }
+        result = _auto_route(user_input, workspace_id, db, brain_context)
 
-    # 3. Save conversation — always, including on workflow error, so the
-    #    failure is visible in chat history and persists after refresh.
+    # 3. Save conversation — always, including on workflow error / clarify / reject,
+    #    so the exchange is visible in chat history and persists after refresh.
     agent_label = result.get("agent") or result.get("workflow", "system")
     repo.save_conversation(db, workspace_id, agent_label, user_input, result["output"])
 
-    # 4. Auto-extract memory — skip if the workflow hit a step error,
-    #    because the output is an error message, not useful knowledge.
-    is_error = result.get("error", False)
-    if not is_error:
+    # 4. Auto-extract memory — skip on error, clarify, and reject.
+    is_error   = result.get("error", False)
+    is_special = result.get("mode") in ("clarify", "reject")
+    if not is_error and not is_special:
         extract_and_save(workspace_id, result["output"], db)
 
-    # 5. Check for Ideas Inbox opportunity — skip on error for the same reason.
-    if not is_error:
+    # 5. Check for Ideas Inbox opportunity — skip on error / clarify / reject.
+    if not is_error and not is_special:
         opportunity = detect_opportunity(result["output"], brain_context)
         if opportunity:
             idea = repo.push_idea(
