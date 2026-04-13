@@ -13,8 +13,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./sintra.db")
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    raise ValueError("CRITICAL: DATABASE_URL not found in environment. PostgreSQL is required.")
+
+if not DATABASE_URL.startswith("postgresql"):
+    raise ValueError(f"CRITICAL: Invalid database protocol. Expected PostgreSQL, got: {DATABASE_URL.split(':', 1)[0]}")
+
+# PostgreSQL doesn't use check_same_thread
+engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
