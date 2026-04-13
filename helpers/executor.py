@@ -41,10 +41,10 @@ logger = logging.getLogger(__name__)
 MAX_TOOL_ITERATIONS = 5
 
 
-# ── System prompt builder (unchanged) ─────────────────────────────────────────
+# ── System prompt builder ─────────────────────────────────────────────────────
 
 def build_system_prompt(agent: dict, brain_context: str) -> str:
-    return f"""You are {agent['name']}, an AI {agent['role']}.
+    base = f"""You are {agent['name']}, an AI {agent['role']}.
 
 Your goal: {agent['goal']}
 Your tone: {agent['tone']}
@@ -58,6 +58,18 @@ Output format: {agent['output_format']}
 Always stay in your role. Use the business context to make your response
 specific and relevant to this business. Never make up facts not in the context.
 """
+
+    # Inject agent-level tool guidance if present in the config.
+    # This gives the agent personality-level awareness of tool usage.
+    tool_instructions = agent.get("tool_instructions")
+    if tool_instructions:
+        base += (
+            f"\n--- TOOL USAGE GUIDANCE ---\n"
+            f"{tool_instructions}\n"
+            f"--- END GUIDANCE ---\n"
+        )
+
+    return base
 
 
 # ── Tool-call JSON parser ─────────────────────────────────────────────────────
@@ -253,6 +265,8 @@ def _run_with_tools(
 
     current_prompt = user_input
     tool_used = None
+    # Track (tool_name, params_hash) to prevent identical repeated calls.
+    seen_calls: set[tuple[str, str]] = set()
 
     for iteration in range(MAX_TOOL_ITERATIONS):
         try:
@@ -293,6 +307,27 @@ def _run_with_tools(
             "Agent '%s' requesting tool '%s' (iteration %d/%d)",
             agent_key, tool_name, iteration + 1, MAX_TOOL_ITERATIONS,
         )
+
+        # ── Guard: prevent identical duplicate tool calls ─────────────────
+        try:
+            call_key = (tool_name, json.dumps(tool_params, sort_keys=True))
+        except (TypeError, ValueError):
+            call_key = (tool_name, str(tool_params))
+
+        if call_key in seen_calls:
+            logger.warning(
+                "Duplicate tool call '%s' by agent '%s' — forcing text fallback",
+                tool_name, agent_key,
+            )
+            current_prompt = (
+                f"You already called the tool '{tool_name}' with the same parameters. "
+                f"Do NOT call it again. Please respond to the original request "
+                f"using only your own knowledge, without calling any tools.\n\n"
+                f"Original request: {user_input}"
+            )
+            available_tools = []
+            continue
+        seen_calls.add(call_key)
 
         # ── Validate: does this tool exist? ───────────────────────────────
         tool_entry = get_tool(tool_name)

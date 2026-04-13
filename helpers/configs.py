@@ -71,6 +71,12 @@ AGENTS = {
             "Create support scripts",
             "Respond to negative reviews",
         ],
+        "tool_instructions": (
+            "You have access to Gmail and Slack tools. Use them ONLY when the user "
+            "explicitly asks you to send a support email or post a Slack message. "
+            "For writing scripts, FAQs, or drafting replies, respond with text — "
+            "do NOT call a tool. Never guess tool names."
+        ),
         "icon": "💬",
         "color": "#4CC9F0",
     },
@@ -89,6 +95,13 @@ AGENTS = {
             "Analyze sales objections",
             "Write proposal templates",
         ],
+        "tool_instructions": (
+            "You have access to Gmail (send emails) and HubSpot (manage contacts). "
+            "Use Gmail ONLY when the user asks you to actually send an email. "
+            "Use HubSpot ONLY when the user asks you to create or look up contacts. "
+            "For writing sales copy, strategies, or pitch outlines, respond with text — "
+            "do NOT call a tool. Never guess tool names."
+        ),
         "icon": "💰",
         "color": "#F4A261",
     },
@@ -125,6 +138,12 @@ AGENTS = {
             "Create data summaries",
             "Suggest KPIs to track",
         ],
+        "tool_instructions": (
+            "You have access to HubSpot tools to fetch contact data. Use them ONLY "
+            "when the user asks you to pull or list real contact data from HubSpot. "
+            "For general analysis, KPI recommendations, or interpreting data provided "
+            "by the user, respond with text — do NOT call a tool. Never guess tool names."
+        ),
         "icon": "📊",
         "color": "#3A86FF",
     },
@@ -143,6 +162,13 @@ AGENTS = {
             "Research topics",
             "Set reminders and to-do lists",
         ],
+        "tool_instructions": (
+            "You have access to Gmail (send/list emails, get profile), Google Calendar "
+            "(create/list events), and Slack (send messages). Use these tools ONLY when "
+            "the user explicitly asks to perform an action — send an email, schedule an "
+            "event, or post a message. For drafting, summarizing, researching, or planning, "
+            "respond with text — do NOT call a tool. Never guess tool names."
+        ),
         "icon": "🤖",
         "color": "#06D6A0",
     },
@@ -161,6 +187,13 @@ AGENTS = {
             "Screen candidate summaries",
             "Write offer letters",
         ],
+        "tool_instructions": (
+            "You have access to Gmail (send emails) and Google Calendar (schedule events). "
+            "Use Gmail ONLY when the user asks you to actually send a recruiting email or "
+            "offer letter. Use Calendar ONLY when asked to schedule an interview. "
+            "For writing job descriptions, interview questions, or screening summaries, "
+            "respond with text — do NOT call a tool. Never guess tool names."
+        ),
         "icon": "👥",
         "color": "#FFB703",
     },
@@ -179,6 +212,12 @@ AGENTS = {
             "Draft re-engagement sequences",
             "Write newsletters",
         ],
+        "tool_instructions": (
+            "You have access to Gmail tools (send and list emails). Use Gmail ONLY when "
+            "the user asks you to actually send a campaign email or check sent emails. "
+            "For writing email copy, sequences, newsletters, or campaign drafts, respond "
+            "with text — do NOT call a tool. Never guess tool names."
+        ),
         "icon": "📧",
         "color": "#E76F51",
     },

@@ -94,15 +94,21 @@ def generate_with_tool_awareness(
 You have access to the following tools:
 {tool_catalog}
 
-IMPORTANT RULES FOR TOOL USE:
-- If the user's request can be answered from your knowledge alone, respond normally with text.
-- If the user's request requires executing an external action (sending email, creating event, etc.), respond with ONLY a JSON block like this:
+RULES FOR TOOL USAGE:
+1. DEFAULT to a normal text response. Only use a tool when the request
+   explicitly requires an external action (sending email, creating event,
+   fetching live data, posting a message, etc.).
+2. Tasks you can answer from your own knowledge — writing, advising,
+   explaining, drafting, strategizing — MUST be answered with plain text.
+   Do NOT call a tool for these.
+3. When you DO need a tool, respond with ONLY a JSON block:
 ```json
-{{"message": "Brief explanation of what you're doing", "tool_call": {{"name": "TOOL_NAME_FROM_LIST", "params": {{"param1": "value1"}}}}}}
+{{"message": "Brief explanation of what you are doing", "tool_call": {{"name": "TOOL_NAME_FROM_LIST_ABOVE", "params": {{"param1": "value1"}}}}}}
 ```
-- Only use tool names from the list above. Do not invent tools.
-- If unsure whether to use a tool, respond with normal text instead.
-- Never use a tool for something you can answer directly.
+4. Use ONLY tool names from the list above. Do NOT invent or guess tool names.
+5. Include all required parameters in the params object.
+6. NEVER call the same tool twice with identical parameters.
+7. If you are unsure whether a tool is needed, respond with normal text.
 --- END TOOLS ---
 """
         full_system = system_prompt + tool_instruction
