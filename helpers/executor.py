@@ -422,6 +422,7 @@ def _run_with_tools(
                 "connect_required": True,
                 "connect_url": connect_url,
                 "resume_token": resume_token,
+                "toolkit": toolkit,
             }
 
         # ── failure: tell the user and fall back to text ──────────────────

@@ -140,16 +140,6 @@ def _exec_single_agent(agent_key: str, user_input: str,
 
     # ── connect_required: propagate as a distinct mode ────────────────
     if agent_result.get("connect_required"):
-        # Extract toolkit from connect_url path or fall back to empty.
-        # The URL path typically ends with the toolkit name.
-        connect_url = agent_result.get("connect_url", "")
-        toolkit = ""
-        if connect_url:
-            try:
-                toolkit = connect_url.rstrip("/").split("/")[-1]
-            except Exception:
-                pass
-
         return {
             "mode":          "connect_required",
             "agent":         agent_key,
@@ -157,9 +147,9 @@ def _exec_single_agent(agent_key: str, user_input: str,
             "output":        agent_result["output"],
             "steps":         [],
             "connect_required": True,
-            "connect_url":   connect_url,
+            "connect_url":   agent_result.get("connect_url"),
             "resume_token":  agent_result.get("resume_token", ""),
-            "toolkit":       toolkit,
+            "toolkit":       agent_result.get("toolkit", ""),
         }
 
     # ── Normal single-agent response ──────────────────────────────────
