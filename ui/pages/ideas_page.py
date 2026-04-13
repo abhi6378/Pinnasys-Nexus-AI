@@ -45,25 +45,32 @@ def render_ideas():
                             if st.button("✅ Accept", key=f"accept_{idea.id}", type="primary",
                                          use_container_width=True):
                                 repo.update_idea_status(db, idea.id, "accepted")
-                                # Trigger linked workflow
-                                if idea.workflow_hint and idea.workflow_hint not in ("none", ""):
-                                    with st.spinner(f"Running {idea.workflow_hint} workflow..."):
-                                        result = handle_request(
-                                            idea.description, ws_id, db
-                                        )
-                                    st.success("✅ Workflow triggered!")
-                                    st.session_state.chat_history.append({
-                                        "role": "assistant",
-                                        "content": result["output"],
-                                        "label": f"Workflow: {idea.workflow_hint}",
-                                        "icon": "⚙️",
-                                        "steps": result.get("steps", []),
-                                        "idea": None,
-                                    })
-                                    st.session_state.page = "chat"
-                                    st.rerun()
-                                else:
-                                    st.rerun()
+                                # Always call handle_request with the workflow_hint.
+                                # force_workflow pins the routing; if the hint is
+                                # empty/"none"/unknown, handle_request falls back to
+                                # auto-route on idea.description automatically.
+                                hint = idea.workflow_hint or ""
+                                with st.spinner(f"🧠 Running idea workflow..."):
+                                    result = handle_request(
+                                        idea.description, ws_id, db,
+                                        force_workflow=hint if hint not in ("", "none") else None
+                                    )
+                                st.success("✅ Workflow triggered!")
+                                wf_label = (
+                                    f"Workflow: {hint.replace('_', ' ').title()}"
+                                    if hint and hint != "none"
+                                    else result.get("agent", "Assistant")
+                                )
+                                st.session_state.chat_history.append({
+                                    "role":    "assistant",
+                                    "content": result["output"],
+                                    "label":   wf_label,
+                                    "icon":    "⚙️",
+                                    "steps":   result.get("steps", []),
+                                    "idea":    None,
+                                })
+                                st.session_state.page = "chat"
+                                st.rerun()
 
                             if st.button("❌ Reject", key=f"reject_{idea.id}",
                                          use_container_width=True):

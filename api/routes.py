@@ -165,14 +165,18 @@ def api_accept_idea(idea_id: str, db: Session = Depends(get_db)):
     idea = repo.update_idea_status(db, idea_id, "accepted")
     if not idea:
         raise HTTPException(status_code=404, detail="Idea not found")
-    # Trigger workflow if hint provided
-    if idea.workflow_hint and idea.workflow_hint != "none":
-        from orchestrator.handler import handle_request
-        result = handle_request(
-            idea.description, idea.workspace_id, db
-        )
-        return {"accepted": True, "workflow_triggered": idea.workflow_hint, "result": result}
-    return {"accepted": True}
+    # Pass workflow_hint as force_workflow so routing is authoritative.
+    # If hint is empty/"none", force_workflow=None and auto-routing applies.
+    hint = (idea.workflow_hint or "").strip()
+    result = handle_request(
+        idea.description, idea.workspace_id, db,
+        force_workflow=hint if hint not in ("", "none") else None
+    )
+    return {
+        "accepted": True,
+        "workflow_triggered": hint or "auto",
+        "result": result,
+    }
 
 
 @app.post("/ideas/{idea_id}/reject")

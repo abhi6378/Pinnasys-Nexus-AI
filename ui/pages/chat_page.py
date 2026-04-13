@@ -103,16 +103,19 @@ def render_chat():
                         st.markdown(msg["content"])
 
                         # Show workflow steps if available
-                        if msg.get("steps"):
+                        # Uses .get() so both live and DB-hydrated entries are safe
+                        steps = msg.get("steps") or []
+                        if steps:
                             with st.expander("🔍 View workflow steps"):
-                                for step in msg["steps"]:
+                                for step in steps:
                                     st.markdown(f"**Step: {step.get('step', '')}** — Agent: `{step.get('agent', '')}`")
                                     st.markdown(step.get("output", "")[:400] + "...")
                                     st.markdown("---")
 
                         # Idea notification
-                        if msg.get("idea"):
-                            idea = msg["idea"]
+                        # Uses .get() so DB-hydrated entries (idea=None) don't raise
+                        idea = msg.get("idea")
+                        if idea:
                             st.info(f"💡 **New Idea:** {idea['title']}\n\n{idea['description']}")
                             if st.button("View in Ideas Inbox →", key=f"goto_ideas_{idea['id']}"):
                                 st.session_state.page = "ideas"

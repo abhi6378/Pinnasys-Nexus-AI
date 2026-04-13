@@ -4,8 +4,7 @@ ui/pages/workflows_page.py  —  Browse + manually launch workflows + history
 import streamlit as st
 from storage.db import SessionLocal
 from storage import repositories as repo
-from workflows.engine import WORKFLOWS, run_workflow
-from brain.brain_ai import BrainAI
+from orchestrator.handler import handle_request
 
 
 WORKFLOW_META = {
@@ -84,42 +83,49 @@ def render_workflows():
                         if user_input.strip():
                             db = SessionLocal()
                             try:
-                                brain = BrainAI(ws_id, db)
-                                brain_context = brain.get_relevant_context(user_input)
-
                                 with st.spinner(f"⚙️ Running {meta['title']} workflow..."):
-                                    result = run_workflow(key, user_input, brain_context)
-
-                                # Save run
-                                repo.save_workflow_run(
-                                    db, ws_id, key,
-                                    result["steps"], result["final_output"]
-                                )
+                                    # Route through handle_request with force_workflow so
+                                    # memory extraction, idea detection, and
+                                    # save_workflow_run all run inside the orchestrator.
+                                    # No manual BrainAI init or duplicate save needed.
+                                    result = handle_request(
+                                        user_input, ws_id, db,
+                                        force_workflow=key
+                                    )
 
                                 st.success("✅ Workflow complete!")
 
                                 # Push to chat history
                                 st.session_state.chat_history.append({
-                                    "role": "user",
-                                    "content": f"[{meta['title']} Workflow] {user_input}"
+                                    "role":    "user",
+                                    "content": f"[{meta['title']} Workflow] {user_input}",
                                 })
                                 st.session_state.chat_history.append({
-                                    "role": "assistant",
-                                    "content": result["final_output"],
-                                    "label": f"Workflow: {meta['title']}",
-                                    "icon": meta["icon"],
-                                    "steps": result["steps"],
-                                    "idea": None,
+                                    "role":    "assistant",
+                                    "content": result["output"],
+                                    "label":   f"Workflow: {meta['title']}",
+                                    "icon":    meta["icon"],
+                                    "steps":   result.get("steps", []),
+                                    "idea":    result.get("idea"),
                                 })
 
                                 with st.expander("📋 View full output", expanded=True):
-                                    st.markdown(result["final_output"])
+                                    st.markdown(result["output"])
 
                                 with st.expander("🔍 Step-by-step trace"):
-                                    for step in result["steps"]:
+                                    for step in result.get("steps", []):
                                         st.markdown(f"**{step['step']}** — `{step['agent']}`")
                                         st.markdown(step["output"][:500])
                                         st.markdown("---")
+
+                                # Surface idea notification if the orchestrator detected one
+                                if result.get("idea"):
+                                    idea = result["idea"]
+                                    st.info(
+                                        f"💡 **New Idea detected:** {idea['title']}\n\n"
+                                        f"{idea['description']}\n\n"
+                                        "_Check your Ideas Inbox to act on it._"
+                                    )
 
                             finally:
                                 db.close()

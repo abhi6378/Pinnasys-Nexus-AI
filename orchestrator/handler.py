@@ -112,7 +112,8 @@ Respond with JSON:
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def handle_request(user_input: str, workspace_id: str, db: Session,
-                   force_agent: str = None) -> dict:
+                   force_agent: str = None,
+                   force_workflow: str = None) -> dict:
     """
     Main orchestrator function. Called by API and UI.
 
@@ -133,7 +134,7 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
 
     # 2. Route: workflow or single agent
     if force_agent:
-        # User explicitly chose a helper
+        # User explicitly chose a helper from the UI agent selector
         agent_result = run_agent(force_agent, user_input, brain_context)
         result = {
             "mode":   "single",
@@ -142,7 +143,23 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
             "output": agent_result["output"],
             "steps":  [],
         }
+    elif force_workflow and force_workflow in WORKFLOWS:
+        # Idea acceptance: workflow_hint is authoritative — skip keyword detection
+        # entirely so the correct workflow always fires regardless of how the
+        # idea description is phrased.
+        wf_result = run_workflow(force_workflow, user_input, brain_context)
+        result = {
+            "mode":     "workflow",
+            "workflow": force_workflow,
+            "output":   wf_result["final_output"],
+            "steps":    wf_result["steps"],
+        }
+        repo.save_workflow_run(
+            db, workspace_id, force_workflow,
+            wf_result["steps"], wf_result["final_output"]
+        )
     else:
+        # Auto-route: keyword detection first, then LLM agent selection
         workflow_key = detect_workflow(user_input)
         if workflow_key:
             wf_result = run_workflow(workflow_key, user_input, brain_context)
@@ -168,29 +185,39 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
                 "steps":  [],
             }
 
-    # 3. Save conversation
+    # 3. Save conversation — always, including on workflow error, so the
+    #    failure is visible in chat history and persists after refresh.
     agent_label = result.get("agent") or result.get("workflow", "system")
     repo.save_conversation(db, workspace_id, agent_label, user_input, result["output"])
 
-    # 4. Auto-extract memory from output
-    extract_and_save(workspace_id, result["output"], db)
+    # 4. Auto-extract memory — skip if the workflow hit a step error,
+    #    because the output is an error message, not useful knowledge.
+    is_error = result.get("error", False)
+    if not is_error:
+        extract_and_save(workspace_id, result["output"], db)
 
-    # 5. Check for Ideas Inbox opportunity
-    opportunity = detect_opportunity(result["output"], brain_context)
-    if opportunity:
-        idea = repo.push_idea(
-            db, workspace_id,
-            title=opportunity["title"],
-            description=opportunity["description"],
-            source_agent=agent_label,
-            workflow_hint=opportunity.get("workflow_hint", "")
-        )
-        result["idea"] = {
-            "id":    idea.id,
-            "title": idea.title,
-            "description": idea.description,
-        }
+    # 5. Check for Ideas Inbox opportunity — skip on error for the same reason.
+    if not is_error:
+        opportunity = detect_opportunity(result["output"], brain_context)
+        if opportunity:
+            idea = repo.push_idea(
+                db, workspace_id,
+                title=opportunity["title"],
+                description=opportunity["description"],
+                source_agent=agent_label,
+                workflow_hint=opportunity.get("workflow_hint", "")
+            )
+            result["idea"] = {
+                "id":          idea.id,
+                "title":       idea.title,
+                "description": idea.description,
+            }
+        else:
+            result["idea"] = None
     else:
         result["idea"] = None
+
+    # Propagate error flag so callers (UI, API) can surface it correctly.
+    result.setdefault("error", False)
 
     return result
