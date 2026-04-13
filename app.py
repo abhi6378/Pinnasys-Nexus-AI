@@ -29,6 +29,8 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "selected_agent" not in st.session_state:
     st.session_state.selected_agent = None
+if "pending_tool_retry" not in st.session_state:
+    st.session_state.pending_tool_retry = None
 
 # ── Hydrate chat history from DB on cold start / browser refresh ──────────────
 # Runs only when: workspace is known AND chat_history is empty (i.e. page was

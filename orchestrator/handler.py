@@ -120,9 +120,36 @@ Respond with JSON:
 # ── Route execution helpers ───────────────────────────────────────────────────
 
 def _exec_single_agent(agent_key: str, user_input: str,
-                        brain_context: str) -> dict:
-    """Execute a single agent and return a standardised result dict."""
-    agent_result = run_agent(agent_key, user_input, brain_context)
+                        brain_context: str,
+                        workspace_id: str = "",
+                        db: Session = None) -> dict:
+    """Execute a single agent and return a standardised result dict.
+
+    When workspace_id and db are provided, the agent runs in tool-aware
+    mode — it can request Composio tools and may return connect_required.
+    When they're absent, the agent runs in pure text-only mode (unchanged).
+    """
+    agent_result = run_agent(
+        agent_key, user_input, brain_context,
+        workspace_id=workspace_id,
+        db=db,
+    )
+
+    # ── connect_required: propagate as a distinct mode ────────────────
+    if agent_result.get("connect_required"):
+        return {
+            "mode":          "connect_required",
+            "agent":         agent_key,
+            "name":          agent_result.get("name", agent_key),
+            "output":        agent_result["output"],
+            "steps":         [],
+            "connect_required": True,
+            "connect_url":   agent_result.get("connect_url"),
+            "resume_token":  agent_result.get("resume_token", ""),
+            "toolkit":       agent_result.get("connect_url", "").split("/")[-1]
+                             if agent_result.get("connect_url") else "",
+        }
+
     return {
         "mode":   "single",
         "agent":  agent_key,
@@ -187,7 +214,8 @@ def _auto_route(user_input: str, workspace_id: str, db: Session,
 
         if route_type == "single_agent":
             return _exec_single_agent(
-                route["selected_agent"], user_input, brain_context
+                route["selected_agent"], user_input, brain_context,
+                workspace_id=workspace_id, db=db,
             )
 
         if route_type == "workflow":
@@ -219,7 +247,10 @@ def _auto_route(user_input: str, workspace_id: str, db: Session,
         )
 
     agent_key = detect_agent(user_input)
-    return _exec_single_agent(agent_key, user_input, brain_context)
+    return _exec_single_agent(
+        agent_key, user_input, brain_context,
+        workspace_id=workspace_id, db=db,
+    )
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -232,12 +263,17 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
 
     Returns:
         {
-          mode: "single" | "workflow" | "clarify" | "reject",
+          mode: "single" | "workflow" | "clarify" | "reject" | "connect_required",
           agent/workflow: str,
           output: str,
           steps: list (workflows only),
           idea: dict | None,
           error: bool,
+          # Extra fields when mode == "connect_required":
+          connect_required: True,
+          connect_url: str | None,
+          resume_token: str,
+          toolkit: str,
         }
     """
     # 1. Load Brain AI context
@@ -246,7 +282,10 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
 
     # 2. Route — priority: force_agent > force_workflow > LLM router > legacy
     if force_agent:
-        result = _exec_single_agent(force_agent, user_input, brain_context)
+        result = _exec_single_agent(
+            force_agent, user_input, brain_context,
+            workspace_id=workspace_id, db=db,
+        )
     elif force_workflow and force_workflow in WORKFLOWS:
         result = _exec_workflow(
             force_workflow, user_input, brain_context, workspace_id, db
@@ -259,9 +298,9 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
     agent_label = result.get("agent") or result.get("workflow", "system")
     repo.save_conversation(db, workspace_id, agent_label, user_input, result["output"])
 
-    # 4. Auto-extract memory — skip on error, clarify, and reject.
+    # 4. Auto-extract memory — skip on error, clarify, reject, and connect_required.
     is_error   = result.get("error", False)
-    is_special = result.get("mode") in ("clarify", "reject")
+    is_special = result.get("mode") in ("clarify", "reject", "connect_required")
     if not is_error and not is_special:
         extract_and_save(workspace_id, result["output"], db)
 

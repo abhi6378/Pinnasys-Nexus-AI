@@ -40,6 +40,10 @@ class ChatRequest(BaseModel):
     message: str
     agent: Optional[str] = None
 
+class ResumeRequest(BaseModel):
+    resume_token: str
+    workspace_id: str
+
 class KnowledgeRequest(BaseModel):
     workspace_id: str
     title: str
@@ -83,6 +87,37 @@ def api_get_workspace(workspace_id: str, db: Session = Depends(get_db)):
 @app.post("/chat")
 def api_chat(req: ChatRequest, db: Session = Depends(get_db)):
     result = handle_request(req.message, req.workspace_id, db, force_agent=req.agent)
+    return result
+
+
+@app.post("/chat/resume")
+def api_chat_resume(req: ResumeRequest, db: Session = Depends(get_db)):
+    """
+    Resume a request that was paused because a tool needed authentication.
+
+    The client passes the resume_token that was returned in the original
+    connect_required response.  We look up the pending request, extract
+    the original user message, and re-send it through handle_request().
+    """
+    from tools.tool_executor import get_pending_request, mark_request_resumed
+
+    pending = get_pending_request(db, req.resume_token)
+    if not pending:
+        raise HTTPException(
+            status_code=404,
+            detail="Resume token not found or already used.",
+        )
+
+    # Mark it as resumed so it can't be replayed
+    mark_request_resumed(db, req.resume_token)
+
+    # Re-send the original request through the orchestrator
+    result = handle_request(
+        pending.original_input,
+        req.workspace_id,
+        db,
+        force_agent=pending.agent_key if pending.agent_key else None,
+    )
     return result
 
 

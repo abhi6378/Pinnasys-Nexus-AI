@@ -108,7 +108,15 @@ class IdeaModel(Base):
     created_at   = Column(DateTime, default=datetime.utcnow)
 
 
+
 def init_db():
+    # Import tool-layer models inside init_db() so they register on
+    # Base.metadata before create_all(), but AFTER all modules have
+    # finished loading. This avoids the circular import:
+    #   tool_executor → models → storage/db → models (boom)
+    from models.tool_connections import ToolConnectionModel          # noqa: F401
+    from models.pending_tool_requests import PendingToolRequestModel  # noqa: F401
+    from models.tool_call_logs import ToolCallLogModel                # noqa: F401
     Base.metadata.create_all(bind=engine)
 
 
