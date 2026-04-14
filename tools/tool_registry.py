@@ -40,6 +40,15 @@ TOOL_REGISTRY: dict[str, dict] = {
         "action":         "Send an email via Gmail",
         "allowed_agents": ["assistant", "sales", "email_marketer", "support", "recruiter"],
         "requires_auth":  True,
+        "expected_params": ["to", "subject", "body"],
+    },
+    "GMAIL_CREATE_DRAFT": {
+        "tool_name":      "GMAIL_CREATE_DRAFT",
+        "toolkit":        "GMAIL",
+        "action":         "Draft an email via Gmail",
+        "allowed_agents": ["email_marketer", "assistant"],
+        "requires_auth":  True,
+        "expected_params": ["to", "subject", "body"],
     },
     "GMAIL_GET_PROFILE": {
         "tool_name":      "GMAIL_GET_PROFILE",
@@ -47,6 +56,7 @@ TOOL_REGISTRY: dict[str, dict] = {
         "action":         "Get Gmail profile info",
         "allowed_agents": ["assistant"],
         "requires_auth":  True,
+        "expected_params": [],
     },
     "GMAIL_LIST_EMAILS": {
         "tool_name":      "GMAIL_LIST_EMAILS",
@@ -54,6 +64,7 @@ TOOL_REGISTRY: dict[str, dict] = {
         "action":         "List recent emails",
         "allowed_agents": ["assistant", "sales", "email_marketer", "support"],
         "requires_auth":  True,
+        "expected_params": [],
     },
 
     # ── Google Calendar ───────────────────────────────────────────────────
@@ -63,6 +74,7 @@ TOOL_REGISTRY: dict[str, dict] = {
         "action":         "Create a calendar event",
         "allowed_agents": ["assistant", "recruiter"],
         "requires_auth":  True,
+        "expected_params": ["summary", "start_time", "end_time"],
     },
     "GOOGLE_CALENDAR_LIST_EVENTS": {
         "tool_name":      "GOOGLE_CALENDAR_LIST_EVENTS",
@@ -70,6 +82,7 @@ TOOL_REGISTRY: dict[str, dict] = {
         "action":         "List upcoming calendar events",
         "allowed_agents": ["assistant"],
         "requires_auth":  True,
+        "expected_params": [],
     },
 
     # ── Slack ─────────────────────────────────────────────────────────────
@@ -79,6 +92,7 @@ TOOL_REGISTRY: dict[str, dict] = {
         "action":         "Send a Slack message",
         "allowed_agents": ["assistant", "support"],
         "requires_auth":  True,
+        "expected_params": ["channel", "text"],
     },
 
     # ── HubSpot ───────────────────────────────────────────────────────────
@@ -88,6 +102,7 @@ TOOL_REGISTRY: dict[str, dict] = {
         "action":         "Create a HubSpot contact",
         "allowed_agents": ["sales"],
         "requires_auth":  True,
+        "expected_params": [],
     },
     "HUBSPOT_GET_CONTACTS": {
         "tool_name":      "HUBSPOT_GET_CONTACTS",
@@ -95,6 +110,53 @@ TOOL_REGISTRY: dict[str, dict] = {
         "action":         "List HubSpot contacts",
         "allowed_agents": ["sales", "data_analyst"],
         "requires_auth":  True,
+        "expected_params": [],
+    },
+    "HUBSPOT_CREATE_DEAL": {
+        "tool_name":      "HUBSPOT_CREATE_DEAL",
+        "toolkit":        "HUBSPOT",
+        "action":         "Create a HubSpot deal",
+        "allowed_agents": ["sales"],
+        "requires_auth":  True,
+        "expected_params": ["dealname"],
+    },
+
+    # ── Google Sheets ─────────────────────────────────────────────────────
+    "GOOGLE_SHEETS_ADD_ROWS_TO_SHEET": {
+        "tool_name":      "GOOGLE_SHEETS_ADD_ROWS_TO_SHEET",
+        "toolkit":        "GOOGLE_SHEETS",
+        "action":         "Add rows to a Google Sheet",
+        "allowed_agents": ["data_analyst", "assistant"],
+        "requires_auth":  True,
+        "expected_params": ["spreadsheetId", "values"],
+    },
+
+    # ── GitHub ────────────────────────────────────────────────────────────
+    "GITHUB_CREATE_ISSUE": {
+        "tool_name":      "GITHUB_CREATE_ISSUE",
+        "toolkit":        "GITHUB",
+        "action":         "Create a GitHub issue",
+        "allowed_agents": ["assistant"],
+        "requires_auth":  True,
+        "expected_params": ["owner", "repo", "title"],
+    },
+    "GITHUB_GET_REPOSITORY_ISSUES": {
+        "tool_name":      "GITHUB_GET_REPOSITORY_ISSUES",
+        "toolkit":        "GITHUB",
+        "action":         "List repository issues",
+        "allowed_agents": ["assistant"],
+        "requires_auth":  True,
+        "expected_params": ["owner", "repo"],
+    },
+
+    # ── Tavily ────────────────────────────────────────────────────────────
+    "TAVILY_SEARCH": {
+        "tool_name":      "TAVILY_SEARCH",
+        "toolkit":        "TAVILY",
+        "action":         "Search the web via Tavily",
+        "allowed_agents": ["assistant", "seo", "strategist"],
+        "requires_auth":  False,
+        "expected_params": ["query"],
     },
 }
 

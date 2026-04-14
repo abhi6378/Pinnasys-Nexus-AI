@@ -40,9 +40,11 @@ AGENTS = {
             "Local SEO strategy",
         ],
         # ── Tool policy (structured) ──
-        "tool_mode": "text_only",
-        "allowed_tools": [],
+        "tool_mode": "tool_enabled",
+        "allowed_tools": ["TAVILY_SEARCH"],
         "requires_auth": False,
+        "tool_policy": "Use Tavily ONLY when asked to search the web for SEO research.",
+        "tool_instructions": "You have access to Tavily for web search. Use it ONLY when the user asks for current web research. Do not guess tool names.",
         "icon": "🔍",
         "color": "#00B4D8",
     },
@@ -127,17 +129,17 @@ AGENTS = {
             "GMAIL_LIST_EMAILS",
             "HUBSPOT_CREATE_CONTACT",
             "HUBSPOT_GET_CONTACTS",
+            "HUBSPOT_CREATE_DEAL",
         ],
         "requires_auth": True,
         "tool_policy": (
             "Use Gmail ONLY to actually send an email. Use HubSpot ONLY to "
-            "create or look up contacts. For writing copy, strategies, or "
+            "manage contacts or deals. For writing copy, strategies, or "
             "pitch outlines, respond with text."
         ),
         "tool_instructions": (
-            "You have access to Gmail (send emails) and HubSpot (manage contacts). "
-            "Use Gmail ONLY when the user asks you to actually send an email. "
-            "Use HubSpot ONLY when the user asks you to create or look up contacts. "
+            "You have access to Gmail (send emails) and HubSpot (manage contacts and deals). "
+            "Use them ONLY when the user asks you to perform an action. "
             "For writing sales copy, strategies, or pitch outlines, respond with text — "
             "do NOT call a tool. Never guess tool names."
         ),
@@ -160,9 +162,11 @@ AGENTS = {
             "Growth strategy recommendations",
         ],
         # ── Tool policy (structured) ──
-        "tool_mode": "text_only",
-        "allowed_tools": [],
+        "tool_mode": "tool_enabled",
+        "allowed_tools": ["TAVILY_SEARCH"],
         "requires_auth": False,
+        "tool_policy": "Use Tavily ONLY when asked to research current web information.",
+        "tool_instructions": "You have access to Tavily for web search. Use it ONLY when the user asks for current web research. Do not guess tool names.",
         "icon": "🧠",
         "color": "#7209B7",
     },
@@ -185,16 +189,17 @@ AGENTS = {
         "tool_mode": "tool_enabled",
         "allowed_tools": [
             "HUBSPOT_GET_CONTACTS",
+            "GOOGLE_SHEETS_ADD_ROWS_TO_SHEET",
         ],
         "requires_auth": True,
         "tool_policy": (
-            "Use HubSpot ONLY when the user asks to pull or list real "
-            "contact data. For general analysis or KPI recommendations, "
-            "respond with text."
+            "Use HubSpot ONLY to pull data. Use Google Sheets ONLY "
+            "when asked to log or append data. For general analysis "
+            "or KPI recommendations, respond with text."
         ),
         "tool_instructions": (
-            "You have access to HubSpot tools to fetch contact data. Use them ONLY "
-            "when the user asks you to pull or list real contact data from HubSpot. "
+            "You have access to HubSpot (fetch contacts) and Google Sheets (add rows). Use them ONLY "
+            "when the user asks you to interact with data. "
             "For general analysis, KPI recommendations, or interpreting data provided "
             "by the user, respond with text — do NOT call a tool. Never guess tool names."
         ),
@@ -222,21 +227,24 @@ AGENTS = {
             "GMAIL_SEND_EMAIL",
             "GMAIL_GET_PROFILE",
             "GMAIL_LIST_EMAILS",
+            "GMAIL_CREATE_DRAFT",
             "GOOGLE_CALENDAR_CREATE_EVENT",
             "GOOGLE_CALENDAR_LIST_EVENTS",
             "SLACK_SEND_MESSAGE",
+            "GITHUB_CREATE_ISSUE",
+            "GITHUB_GET_REPOSITORY_ISSUES",
+            "TAVILY_SEARCH",
         ],
         "requires_auth": True,
         "tool_policy": (
-            "Use tools ONLY when the user explicitly asks to perform an action — "
-            "send an email, schedule an event, or post a message. For drafting, "
-            "summarizing, researching, or planning, respond with text."
+            "Use tools ONLY when explicitly asked to perform an action — "
+            "send/draft an email, schedule an event, post a message, create an issue, "
+            "or search the web. Respond with text for other tasks."
         ),
         "tool_instructions": (
-            "You have access to Gmail (send/list emails, get profile), Google Calendar "
-            "(create/list events), and Slack (send messages). Use these tools ONLY when "
-            "the user explicitly asks to perform an action — send an email, schedule an "
-            "event, or post a message. For drafting, summarizing, researching, or planning, "
+            "You have access to Gmail, Google Calendar, Slack, GitHub, and Tavily Search. "
+            "Use these tools ONLY when the user explicitly asks to perform an action. "
+            "For drafting, summarizing, or planning without external systems, "
             "respond with text — do NOT call a tool. Never guess tool names."
         ),
         "icon": "🤖",
@@ -299,18 +307,19 @@ AGENTS = {
         "allowed_tools": [
             "GMAIL_SEND_EMAIL",
             "GMAIL_LIST_EMAILS",
+            "GMAIL_CREATE_DRAFT",
         ],
         "requires_auth": True,
         "tool_policy": (
-            "Use Gmail ONLY to actually send or check campaign emails. "
-            "For writing email copy, sequences, or campaign drafts, "
+            "Use Gmail ONLY to actually send, draft, or check campaign emails. "
+            "For writing email copy or sequences without sending, "
             "respond with text."
         ),
         "tool_instructions": (
-            "You have access to Gmail tools (send and list emails). Use Gmail ONLY when "
-            "the user asks you to actually send a campaign email or check sent emails. "
-            "For writing email copy, sequences, newsletters, or campaign drafts, respond "
-            "with text — do NOT call a tool. Never guess tool names."
+            "You have access to Gmail tools (send, draft, list). Use Gmail ONLY when "
+            "the user asks you to actually create a draft, send an email, or check emails. "
+            "For simply writing email copy or newsletters for the user to review, "
+            "respond with text — do NOT call a tool. Never guess tool names."
         ),
         "icon": "📧",
         "color": "#E76F51",

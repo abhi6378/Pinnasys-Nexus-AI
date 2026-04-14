@@ -290,25 +290,45 @@ def attempt_tool_call(
         )
         return result
 
-    # ── Step 3: Check connection (local cache first, then remote) ─────────
-    local_conn = _get_local_connection(db, workspace_id, toolkit)
-    if local_conn:
-        # Fast path — we already know this toolkit is connected
-        connected = True
-    elif is_available():
-        # Slow path — ask Composio
-        conn_info = check_connection(workspace_id, toolkit)
-        connected = conn_info.get("connected", False)
+    # ── Step 2.5: Validate expected parameters ────────────────────────────
+    expected = tool_entry.get("expected_params", [])
+    missing = [p for p in expected if p not in input_args]
+    if missing:
+        result = _fail(
+            "validation_error",
+            f"Missing required parameters for tool '{tool_name}': {', '.join(missing)}"
+        )
+        _log_attempt(
+            db, workspace_id, agent_key, tool_name, toolkit,
+            "validation_error", input_args, error_message=result["error"],
+        )
+        return result
 
-        # Cache the result locally if connected
-        if connected and conn_info.get("connected_account_id"):
-            _save_local_connection(
-                db, workspace_id, toolkit,
-                conn_info["connected_account_id"],
-            )
+    # ── Step 3: Check connection (local cache first, then remote) ─────────
+    requires_auth = tool_entry.get("requires_auth", True)
+
+    if not requires_auth:
+        # Tool does not require dynamic OAuth
+        connected = True
     else:
-        # Composio not available — treat as not connected
-        connected = False
+        local_conn = _get_local_connection(db, workspace_id, toolkit)
+        if local_conn:
+            # Fast path — we already know this toolkit is connected
+            connected = True
+        elif is_available():
+            # Slow path — ask Composio
+            conn_info = check_connection(workspace_id, toolkit)
+            connected = conn_info.get("connected", False)
+
+            # Cache the result locally if connected
+            if connected and conn_info.get("connected_account_id"):
+                _save_local_connection(
+                    db, workspace_id, toolkit,
+                    conn_info["connected_account_id"],
+                )
+        else:
+            # Composio not available — treat as not connected
+            connected = False
 
     # ── Step 4: Not connected → return connect_required ───────────────────
     if not connected:

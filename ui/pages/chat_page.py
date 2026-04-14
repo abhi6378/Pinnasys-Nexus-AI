@@ -25,11 +25,13 @@ TOOLKIT_ICONS = {
     "HUBSPOT":          ("contact", "HubSpot"),
     "GITHUB":           ("code", "GitHub"),
     "GOOGLE_SHEETS":    ("table", "Google Sheets"),
+    "TAVILY":           ("globe", "Tavily Search"),
 }
 
 # Maps tool_name → (emoji, human label) for execution indicators
 TOOL_DISPLAY = {
     "GMAIL_SEND_EMAIL":              ("📧", "Sent email via Gmail"),
+    "GMAIL_CREATE_DRAFT":            ("📧", "Drafted email via Gmail"),
     "GMAIL_GET_PROFILE":             ("📧", "Fetched Gmail profile"),
     "GMAIL_LIST_EMAILS":             ("📧", "Listed emails from Gmail"),
     "GOOGLE_CALENDAR_CREATE_EVENT":  ("📅", "Created calendar event"),
@@ -37,6 +39,11 @@ TOOL_DISPLAY = {
     "SLACK_SEND_MESSAGE":            ("💬", "Sent Slack message"),
     "HUBSPOT_CREATE_CONTACT":        ("📊", "Created HubSpot contact"),
     "HUBSPOT_GET_CONTACTS":          ("📊", "Fetched HubSpot contacts"),
+    "HUBSPOT_CREATE_DEAL":           ("📊", "Created HubSpot deal"),
+    "GOOGLE_SHEETS_ADD_ROWS_TO_SHEET": ("📋", "Added row to Google Sheet"),
+    "GITHUB_CREATE_ISSUE":           ("💻", "Created GitHub issue"),
+    "GITHUB_GET_REPOSITORY_ISSUES":  ("💻", "Listed GitHub issues"),
+    "TAVILY_SEARCH":                 ("🌐", "Searched the web via Tavily"),
 }
 
 
@@ -49,6 +56,7 @@ def _toolkit_display(toolkit_key: str) -> tuple[str, str]:
         "HUBSPOT":         ("📊", "HubSpot"),
         "GITHUB":          ("💻", "GitHub"),
         "GOOGLE_SHEETS":   ("📋", "Google Sheets"),
+        "TAVILY":          ("🌐", "Tavily Search"),
     }
     return lookup.get(toolkit_key.upper(), ("🔗", toolkit_key.replace("_", " ").title()))
 
