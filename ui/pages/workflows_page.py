@@ -43,6 +43,34 @@ WORKFLOW_META = {
         "agents": ["🧠 Strat (Strategist)", "📊 Dexter (Data Analyst)"],
         "example": "Strategy for expanding into the European market",
     },
+    "research_draft_send": {
+        "icon": "🔍",
+        "title": "Research & Outreach",
+        "description": "Research a topic → Draft email → Send via Gmail",
+        "agents": ["🤖 Buddy (Assistant)", "✍️ Penn (Copywriter)"],
+        "example": "Research the latest trends in AI and send a summary to my team",
+    },
+    "lead_capture": {
+        "icon": "📈",
+        "title": "Lead Capture Sync",
+        "description": "Extract lead → Log to HubSpot → Append to Google Sheets",
+        "agents": ["💰 Milli (Sales)", "📊 Dexter (Data Analyst)"],
+        "example": "Extract lead info from this message: John Doe (john@example.com) is interested in our Pro plan",
+    },
+    "email_triage": {
+        "icon": "📧",
+        "title": "Email Triage",
+        "description": "List recent emails → Triage priority → Draft replies",
+        "agents": ["🤖 Buddy (Assistant)", "✍️ Penn (Copywriter)"],
+        "example": "Check my recent emails and draft replies for anything urgent",
+    },
+    "competitor_research": {
+        "icon": "🏢",
+        "title": "Competitor Insight",
+        "description": "Research competitors → Generate competitive analysis report",
+        "agents": ["🧠 Strat (Strategist)", "✍️ Penn (Copywriter)"],
+        "example": "Research top 3 competitors for our project management tool",
+    },
 }
 
 
@@ -93,7 +121,48 @@ def render_workflows():
                                         force_workflow=key
                                     )
 
-                                st.success("✅ Workflow complete!")
+                                if result.get("mode") == "connect_required":
+                                    st.warning(f"🔌 **Authentication Required** for step: {result.get('step_label')}")
+                                    st.markdown(f"The workflow paused because the toolkit **{result.get('toolkit')}** is not connected.")
+                                    if result.get("connect_url"):
+                                        st.link_button("🔗 Connect Account", result["connect_url"], type="primary")
+                                    else:
+                                        st.error("A connect link could not be created for this integration.")
+                                    st.info("After connecting, you can resume from the Chat or re-run the workflow.")
+                                    # Still add to history so user doesn't lose progress
+                                    st.session_state.chat_history.append({"role": "user", "content": f"[{meta['title']} Workflow] {user_input}"})
+                                    st.session_state.chat_history.append({
+                                        "role": "assistant",
+                                        "content": result["output"],
+                                        "label": f"Workflow: {meta['title']}",
+                                        "icon": meta["icon"],
+                                        "steps": result.get("steps", []),
+                                        "connect_required": True,
+                                        "connect_url": result.get("connect_url"),
+                                        "resume_token": result.get("resume_token", ""),
+                                        "toolkit": result.get("toolkit", ""),
+                                        "workflow_paused": True,
+                                        "step_label": result.get("step_label", ""),
+                                        "original_input": user_input,
+                                    })
+                                    st.stop()
+                                elif result.get("mode") == "auth_unavailable":
+                                    st.error("Setup Required")
+                                    st.markdown(result["output"])
+                                    st.stop()
+                                elif result.get("mode") in {"invalid_tool", "tool_error"}:
+                                    st.error("Workflow stopped because a required tool could not be executed.")
+                                    st.markdown(result["output"])
+                                    st.stop()
+                                elif result.get("mode") == "validation_error":
+                                    st.error(f"❌ **Validation Error** at step: {result.get('step_label')}")
+                                    st.markdown(result["output"])
+                                    st.stop()
+
+                                if result.get("workflow_resumed"):
+                                    st.success("✅ Workflow resumed and completed!")
+                                else:
+                                    st.success("✅ Workflow complete!")
 
                                 # Push to chat history
                                 st.session_state.chat_history.append({
@@ -107,6 +176,7 @@ def render_workflows():
                                     "icon":    meta["icon"],
                                     "steps":   result.get("steps", []),
                                     "idea":    result.get("idea"),
+                                    "workflow_resumed": result.get("workflow_resumed", False),
                                 })
 
                                 with st.expander("📋 View full output", expanded=True):

@@ -14,8 +14,10 @@ from workspace.manager import create_workspace, list_workspaces, get_workspace_c
 from brain.quiz_engine import get_next_question, save_answer, quiz_progress
 from orchestrator.handler import handle_request
 from helpers.configs import list_agents
+from utils.logging_utils import configure_logging
 
 app = FastAPI(title="Sintra Clone API", version="1.0.0")
+configure_logging()
 
 app.add_middleware(
     CORSMiddleware,
@@ -99,7 +101,11 @@ def api_chat_resume(req: ResumeRequest, db: Session = Depends(get_db)):
     connect_required response.  We look up the pending request, extract
     the original user message, and re-send it through handle_request().
     """
-    from tools.tool_executor import get_pending_request, mark_request_resumed
+    from tools.tool_executor import (
+        get_pending_request,
+        mark_request_resumed,
+        mark_request_completed,
+    )
 
     pending = get_pending_request(db, req.resume_token)
     if not pending:
@@ -111,13 +117,28 @@ def api_chat_resume(req: ResumeRequest, db: Session = Depends(get_db)):
     # Mark it as resumed so it can't be replayed
     mark_request_resumed(db, req.resume_token)
 
+    # Invalidate stale Composio session so fresh connection state is picked up
+    from tools.composio_client import invalidate_session
+    invalidate_session(req.workspace_id)
+
+    # Determine if this was a workflow resume
+    context = pending.context_json or {}
+    wf_key = context.get("workflow_key")
+
     # Re-send the original request through the orchestrator
     result = handle_request(
         pending.original_input,
         req.workspace_id,
         db,
-        force_agent=pending.agent_key if pending.agent_key else None,
+        force_agent=pending.agent_key if (pending.agent_key and not wf_key) else None,
+        force_workflow=wf_key,
+        resume_state=context
     )
+    if result.get("mode") not in {
+        "connect_required", "auth_unavailable", "invalid_tool",
+        "validation_error", "tool_error"
+    } and not result.get("error", False):
+        mark_request_completed(db, req.resume_token)
     return result
 
 

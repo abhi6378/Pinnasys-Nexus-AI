@@ -2,6 +2,7 @@
 storage/repositories.py  —  CRUD helpers for every table
 """
 import uuid
+import logging
 from datetime import datetime
 from typing import Optional
 
@@ -11,6 +12,10 @@ from storage.db import (
     WorkspaceModel, BrainProfileModel, KnowledgeItemModel,
     QuizAnswerModel, ConversationModel, WorkflowRunModel, IdeaModel
 )
+from utils.logging_utils import log_event, log_exception
+
+
+logger = logging.getLogger(__name__)
 
 
 def _id():
@@ -47,57 +52,117 @@ def get_brain(db: Session, workspace_id: str) -> Optional[BrainProfileModel]:
 
 
 def update_brain(db: Session, workspace_id: str, updates: dict) -> BrainProfileModel:
-    brain = get_brain(db, workspace_id)
-    if not brain:
-        brain = BrainProfileModel(workspace_id=workspace_id)
-        db.add(brain)
-    for k, v in updates.items():
-        if hasattr(brain, k) and v:
-            setattr(brain, k, v)
-    brain.updated_at = datetime.utcnow()
-    db.commit()
-    db.refresh(brain)
-    return brain
+    try:
+        brain = get_brain(db, workspace_id)
+        if not brain:
+            brain = BrainProfileModel(workspace_id=workspace_id)
+            db.add(brain)
+        for k, v in updates.items():
+            if hasattr(brain, k) and v:
+                setattr(brain, k, v)
+        brain.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(brain)
+        log_event(
+            logger,
+            logging.INFO,
+            "storage.brain.updated",
+            workspace_id=workspace_id,
+            field_count=len([k for k, v in updates.items() if v]),
+        )
+        return brain
+    except Exception as exc:
+        log_exception(
+            logger,
+            "storage.brain.update_failed",
+            exc,
+            workspace_id=workspace_id,
+        )
+        raise
 
 
 # ── Knowledge ─────────────────────────────────────────────────────────────────
 
 def add_knowledge(db: Session, workspace_id: str, type_: str,
                   title: str, content: str, tags: list = None) -> KnowledgeItemModel:
-    item = KnowledgeItemModel(
-        id=_id(), workspace_id=workspace_id,
-        type=type_, title=title, content=content,
-        tags=tags or [], created_at=datetime.utcnow()
-    )
-    db.add(item)
-    db.commit()
-    db.refresh(item)
-    return item
+    try:
+        item = KnowledgeItemModel(
+            id=_id(), workspace_id=workspace_id,
+            type=type_, title=title, content=content,
+            tags=tags or [], created_at=datetime.utcnow()
+        )
+        db.add(item)
+        db.commit()
+        db.refresh(item)
+        log_event(
+            logger,
+            logging.INFO,
+            "storage.knowledge.added",
+            workspace_id=workspace_id,
+            knowledge_type=type_,
+        )
+        return item
+    except Exception as exc:
+        log_exception(
+            logger,
+            "storage.knowledge_add_failed",
+            exc,
+            workspace_id=workspace_id,
+            knowledge_type=type_,
+        )
+        raise
 
 
 def get_knowledge(db: Session, workspace_id: str, query: str = "", limit: int = 10):
-    items = db.query(KnowledgeItemModel).filter(
-        KnowledgeItemModel.workspace_id == workspace_id
-    ).order_by(KnowledgeItemModel.created_at.desc()).all()
+    try:
+        items = db.query(KnowledgeItemModel).filter(
+            KnowledgeItemModel.workspace_id == workspace_id
+        ).order_by(KnowledgeItemModel.created_at.desc()).all()
 
-    if not query:
-        return items[:limit]
+        if not query:
+            result = items[:limit]
+            log_event(
+                logger,
+                logging.INFO,
+                "storage.knowledge.fetched",
+                workspace_id=workspace_id,
+                query_present=False,
+                result_count=len(result),
+            )
+            return result
 
-    q = query.lower()
-    scored = []
-    for item in items:
-        score = 0
-        if q in item.content.lower():
-            score += 2
-        if q in item.title.lower():
-            score += 1
-        if any(q in tag.lower() for tag in (item.tags or [])):
-            score += 1
-        if score > 0:
-            scored.append((score, item))
+        q = query.lower()
+        scored = []
+        for item in items:
+            score = 0
+            if q in item.content.lower():
+                score += 2
+            if q in item.title.lower():
+                score += 1
+            if any(q in tag.lower() for tag in (item.tags or [])):
+                score += 1
+            if score > 0:
+                scored.append((score, item))
 
-    scored.sort(key=lambda x: -x[0])
-    return [i for _, i in scored[:limit]]
+        scored.sort(key=lambda x: -x[0])
+        result = [i for _, i in scored[:limit]]
+        log_event(
+            logger,
+            logging.INFO,
+            "storage.knowledge.fetched",
+            workspace_id=workspace_id,
+            query_present=True,
+            result_count=len(result),
+        )
+        return result
+    except Exception as exc:
+        log_exception(
+            logger,
+            "storage.knowledge_fetch_failed",
+            exc,
+            workspace_id=workspace_id,
+        )
+        raise
 
 
 def list_all_knowledge(db: Session, workspace_id: str):
@@ -137,34 +202,88 @@ def get_quiz_answers(db: Session, workspace_id: str):
 
 def save_conversation(db: Session, workspace_id: str,
                       helper: str, input_: str, output: str) -> ConversationModel:
-    conv = ConversationModel(
-        id=_id(), workspace_id=workspace_id,
-        helper=helper, input=input_, output=output,
-        created_at=datetime.utcnow()
-    )
-    db.add(conv)
-    db.commit()
-    return conv
+    try:
+        conv = ConversationModel(
+            id=_id(), workspace_id=workspace_id,
+            helper=helper, input=input_, output=output,
+            created_at=datetime.utcnow()
+        )
+        db.add(conv)
+        db.commit()
+        log_event(
+            logger,
+            logging.INFO,
+            "storage.conversation.saved",
+            workspace_id=workspace_id,
+            agent_name=helper,
+        )
+        return conv
+    except Exception as exc:
+        log_exception(
+            logger,
+            "storage.conversation_save_failed",
+            exc,
+            workspace_id=workspace_id,
+            agent_name=helper,
+        )
+        raise
 
 
 def get_conversations(db: Session, workspace_id: str, limit: int = 20):
-    return db.query(ConversationModel).filter(
-        ConversationModel.workspace_id == workspace_id
-    ).order_by(ConversationModel.created_at.desc()).limit(limit).all()
+    try:
+        result = db.query(ConversationModel).filter(
+            ConversationModel.workspace_id == workspace_id
+        ).order_by(ConversationModel.created_at.desc()).limit(limit).all()
+        log_event(
+            logger,
+            logging.INFO,
+            "storage.conversation.fetched",
+            workspace_id=workspace_id,
+            result_count=len(result),
+            limit=limit,
+        )
+        return result
+    except Exception as exc:
+        log_exception(
+            logger,
+            "storage.conversation_fetch_failed",
+            exc,
+            workspace_id=workspace_id,
+            limit=limit,
+        )
+        raise
 
 
 # ── Workflow Runs ─────────────────────────────────────────────────────────────
 
 def save_workflow_run(db: Session, workspace_id: str, workflow_name: str,
                       steps: list, final_output: str) -> WorkflowRunModel:
-    run = WorkflowRunModel(
-        id=_id(), workspace_id=workspace_id,
-        workflow_name=workflow_name, steps=steps,
-        final_output=final_output, created_at=datetime.utcnow()
-    )
-    db.add(run)
-    db.commit()
-    return run
+    try:
+        run = WorkflowRunModel(
+            id=_id(), workspace_id=workspace_id,
+            workflow_name=workflow_name, steps=steps,
+            final_output=final_output, created_at=datetime.utcnow()
+        )
+        db.add(run)
+        db.commit()
+        log_event(
+            logger,
+            logging.INFO,
+            "storage.workflow.saved",
+            workspace_id=workspace_id,
+            workflow_name=workflow_name,
+            step_count=len(steps or []),
+        )
+        return run
+    except Exception as exc:
+        log_exception(
+            logger,
+            "storage.workflow_save_failed",
+            exc,
+            workspace_id=workspace_id,
+            workflow_name=workflow_name,
+        )
+        raise
 
 
 def get_workflow_runs(db: Session, workspace_id: str, limit: int = 10):
@@ -202,3 +321,24 @@ def update_idea_status(db: Session, idea_id: str, status: str):
         idea.status = status
         db.commit()
     return idea
+
+
+def list_pending_tool_requests(db: Session, workspace_id: str, limit: int = 5):
+    """
+    Return the newest pending or resumed tool requests for a workspace.
+
+    This powers UI refresh/resume without requiring a schema change in the
+    conversation table.
+    """
+    from models.pending_tool_requests import PendingToolRequestModel
+
+    return (
+        db.query(PendingToolRequestModel)
+        .filter(
+            PendingToolRequestModel.workspace_id == workspace_id,
+            PendingToolRequestModel.status.in_(["pending", "resumed"]),
+        )
+        .order_by(PendingToolRequestModel.updated_at.desc())
+        .limit(limit)
+        .all()
+    )

@@ -55,6 +55,29 @@ def render_ideas():
                                         idea.description, ws_id, db,
                                         force_workflow=hint if hint not in ("", "none") else None
                                     )
+                                if result.get("mode") == "connect_required":
+                                    st.warning("The workflow paused for account connection.")
+                                    st.markdown(result["output"])
+                                    st.session_state.chat_history.append({
+                                        "role": "assistant",
+                                        "content": result["output"],
+                                        "label": f"Workflow: {(hint or result.get('workflow', 'auto')).replace('_', ' ').title()}",
+                                        "icon": "⚙️",
+                                        "steps": result.get("steps", []),
+                                        "connect_required": True,
+                                        "connect_url": result.get("connect_url"),
+                                        "resume_token": result.get("resume_token", ""),
+                                        "toolkit": result.get("toolkit", ""),
+                                        "workflow_paused": True,
+                                        "step_label": result.get("step_label", ""),
+                                        "original_input": idea.description,
+                                    })
+                                    st.stop()
+                                if result.get("mode") in {"auth_unavailable", "invalid_tool", "validation_error", "tool_error"}:
+                                    st.error("The workflow could not continue.")
+                                    st.markdown(result["output"])
+                                    st.stop()
+
                                 st.success("✅ Workflow triggered!")
                                 wf_label = (
                                     f"Workflow: {hint.replace('_', ' ').title()}"

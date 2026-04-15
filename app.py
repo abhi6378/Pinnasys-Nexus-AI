@@ -6,6 +6,7 @@ import streamlit as st
 from storage.db import init_db, SessionLocal
 from storage import repositories as repo
 from helpers.configs import AGENTS
+from utils.logging_utils import configure_logging
 
 # Must be first Streamlit call
 st.set_page_config(
@@ -14,6 +15,8 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+configure_logging()
 
 # Init DB on startup
 init_db()

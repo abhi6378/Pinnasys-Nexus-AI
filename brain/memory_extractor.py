@@ -3,9 +3,14 @@ brain/memory_extractor.py  —  Extracts useful facts from LLM outputs
                                and saves them back into Brain AI
 """
 import json
+import logging
 from sqlalchemy.orm import Session
 from llm.client import generate_json
 from storage import repositories as repo
+from utils.logging_utils import log_event, log_exception
+
+
+logger = logging.getLogger(__name__)
 
 
 EXTRACTION_PROMPT = """
@@ -43,6 +48,13 @@ def extract_and_save(workspace_id: str, content: str, db: Session):
     Runs extraction on any text and saves useful facts to Brain AI.
     Called automatically after every helper execution.
     """
+    log_event(
+        logger,
+        logging.INFO,
+        "memory.extract.start",
+        workspace_id=workspace_id,
+        content_length=len(content or ""),
+    )
     try:
         prompt = EXTRACTION_PROMPT.format(content=content[:2000])
         raw = generate_json(prompt)
@@ -67,6 +79,21 @@ def extract_and_save(workspace_id: str, content: str, db: Session):
         if profile_updates:
             repo.update_brain(db, workspace_id, profile_updates)
 
-    except Exception:
+        log_event(
+            logger,
+            logging.INFO,
+            "memory.extract.finish",
+            workspace_id=workspace_id,
+            fact_count=len(data.get("facts", [])) if data.get("has_facts") else 0,
+            profile_update_count=len(profile_updates),
+        )
+
+    except Exception as exc:
+        log_exception(
+            logger,
+            "memory.extract.failed",
+            exc,
+            workspace_id=workspace_id,
+        )
         # Extraction is best-effort — never crash the main flow
         pass

@@ -1,172 +1,440 @@
 """
-tools/composio_client.py  —  Composio SDK wrapper: session management,
-connection checks, and Connect Link generation.
+tools/composio_client.py  —  Composio SDK wrapper for tool schemas,
+connection checks, connect links, and action execution.
 
-This module is the ONLY place that imports the Composio SDK. All other
-modules go through the functions here.
+This module is the only place that talks directly to the Composio SDK.
+All callers use the helpers below so the rest of the app can stay insulated
+from SDK changes and optional dependency failures.
 
-Design decisions:
-  - Lazy initialization: the Composio client is created on first use, so
-    the app can start even if COMPOSIO_API_KEY is not set (tools are just
-    unavailable).
-  - Session cache: sessions are cached per user_id in a process-level dict.
-    Composio sessions are immutable and don't expire, so this is safe.
-  - Graceful degradation: every public function catches exceptions and
-    returns a safe default so that callers never crash.
-
-This module does NOT execute tools — that's tool_executor.py.
+Updated for Composio SDK 1.0 (composio >= 0.11 / 1.0.0-rc series):
+  - `Action` and `App` enums have been removed; actions and apps are plain
+    strings (e.g. "GMAIL_SEND_EMAIL", "gmail").
+  - `composio_openai.ComposioToolSet` has been replaced by the unified
+    `composio.Composio` client with `composio.sdk.OpenAIProvider`.
+  - Entity-centric helpers (get_entity / get_connections) are replaced by
+    the `client.connected_accounts` and `client.tools` resource APIs.
 """
 from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from typing import Any, Optional
 
 from dotenv import load_dotenv
+
+from tools.tool_registry import get_toolkit_app_enum, get_toolkit_slug
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# ── Internal state ────────────────────────────────────────────────────────────
+ENTITY_PREFIX = os.getenv("COMPOSIO_ENTITY_ID_PREFIX", "")
 
-_composio_client = None          # Composio instance — created lazily
-_sessions: dict[str, object] = {}  # user_id → Session
-_initialized = False
-_api_key: str = ""
+# ── Module-level SDK state (lazily initialised) ──────────────────────────────
+_imports_loaded = False
+_imports_available = False
+_import_error = ""
+_api_key = ""
+
+# The single Composio client instance, cached per entity_id.
+_clients: dict[str, Any] = {}
+# A default (entity-less) Composio client for catalog / admin operations.
+_default_client: Any = None
 
 
-# ── Initialization ────────────────────────────────────────────────────────────
+def _entity_id(workspace_id: str) -> str:
+    """Build the Composio entity id for a workspace."""
+    return f"{ENTITY_PREFIX}{workspace_id}" if ENTITY_PREFIX else workspace_id
 
-def _ensure_client():
+
+def _resolve_callback_url(callback_url: str = "") -> str:
+    """Return the callback URL used for Composio connection redirects."""
+    if callback_url and callback_url.strip():
+        return callback_url.strip()
+    for env_key in ("COMPOSIO_CONNECT_CALLBACK_URL", "COMPOSIO_CALLBACK_URL"):
+        value = os.getenv(env_key, "").strip()
+        if value:
+            return value
+    return ""
+
+
+# ── Lazy SDK initialisation ──────────────────────────────────────────────────
+
+def _load_sdk_imports() -> bool:
+    """Load Composio SDK imports lazily so the app can boot without them.
+
+    In Composio SDK 1.0 the entry point is ``composio.Composio``.  The old
+    ``Action``/``App`` enums and the separate ``composio_openai`` package no
+    longer exist.
     """
-    Lazily initialize the Composio client.
-    Called internally before any SDK operation.
+    global _imports_loaded, _imports_available, _import_error
+    global _api_key, _default_client
 
-    Returns True if the client is ready, False otherwise.
-    """
-    global _composio_client, _initialized, _api_key
+    if _imports_loaded:
+        return _imports_available
 
-    if _initialized:
-        return _composio_client is not None
-
-    _initialized = True
-    _api_key = os.getenv("COMPOSIO_API_KEY", "")
-
+    _imports_loaded = True
+    _api_key = os.getenv("COMPOSIO_API_KEY", "").strip()
     if not _api_key:
-        logger.warning(
-            "COMPOSIO_API_KEY not set — tool integrations disabled. "
-            "Set the key in .env to enable Composio tools."
-        )
+        _import_error = "COMPOSIO_API_KEY not set"
+        logger.warning("COMPOSIO_API_KEY not set; Composio integrations are disabled.")
         return False
 
     try:
-        from composio import Composio
-        _composio_client = Composio(api_key=_api_key)
-        logger.info("Composio client initialized successfully.")
+        from composio import Composio  # noqa: F401 — used via _default_client
+
+        _default_client = Composio(api_key=_api_key)
+        _imports_available = True
+        logger.info("Composio SDK 1.0 client initialised successfully.")
         return True
-    except ImportError:
-        logger.warning(
-            "composio package not installed — tool integrations disabled. "
-            "Run: pip install composio"
-        )
-        return False
     except Exception as exc:
-        logger.error("Failed to initialize Composio client: %s", exc)
+        _import_error = str(exc)
+        logger.warning(
+            "Composio SDK imports unavailable; install composio to enable tools: %s",
+            exc,
+        )
         return False
 
 
 def is_available() -> bool:
-    """Return True if the Composio SDK is ready to use."""
-    return _ensure_client()
+    """Return True when the Composio SDK can be used for tool operations."""
+    return _load_sdk_imports()
 
 
-# ── Session management ────────────────────────────────────────────────────────
+# ── Payload helpers ──────────────────────────────────────────────────────────
 
-def get_session(user_id: str):
-    """
-    Get or create a Composio session for the given user_id.
+def _normalize_sdk_payload(value: Any) -> Any:
+    """Convert SDK objects into JSON-serializable Python structures."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {key: _normalize_sdk_payload(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_normalize_sdk_payload(item) for item in value]
+    if hasattr(value, "model_dump"):
+        return _normalize_sdk_payload(value.model_dump())
+    if hasattr(value, "dict"):
+        return _normalize_sdk_payload(value.dict())
 
-    Sessions are cached for the lifetime of the process.  On failure
-    returns None so callers can handle gracefully.
+    data: dict[str, Any] = {}
+    for attr in dir(value):
+        if attr.startswith("_"):
+            continue
+        try:
+            attr_value = getattr(value, attr)
+        except Exception:
+            continue
+        if callable(attr_value):
+            continue
+        data[attr] = _normalize_sdk_payload(attr_value)
+    return data or str(value)
 
-    In the current architecture, user_id == workspace_id.
-    """
-    if not _ensure_client():
-        return None
 
-    if user_id in _sessions:
-        return _sessions[user_id]
-
+def _coerce_sequence(value: Any) -> list[Any]:
+    """Normalize SDK list-like responses into a plain list."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    items = getattr(value, "items", None)
+    if isinstance(items, list):
+        return items
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, dict):
+        for key in ("items", "data", "tools", "connections"):
+            candidate = value.get(key)
+            if isinstance(candidate, list):
+                return candidate
+        return []
     try:
-        session = _composio_client.create(user_id=user_id)
-        _sessions[user_id] = session
-        logger.info("Created Composio session for user_id=%s", user_id)
-        return session
-    except Exception as exc:
-        logger.error(
-            "Failed to create Composio session for user_id=%s: %s",
-            user_id, exc
-        )
+        return list(value)
+    except TypeError:
+        return []
+
+
+# ── Client management ────────────────────────────────────────────────────────
+
+def _get_client(user_id: str = "", force_refresh: bool = False) -> Any | None:
+    """Return a Composio client instance.
+
+    In SDK 1.0 the client is not scoped to an entity at creation time — the
+    user_id / entity_id is passed per-call.  We still cache client instances
+    to avoid re-creating them on every request.
+    """
+    if not is_available():
         return None
+
+    if not user_id:
+        return _default_client
+
+    entity_id = _entity_id(user_id)
+    if force_refresh:
+        _clients.pop(entity_id, None)
+
+    if entity_id not in _clients:
+        try:
+            from composio import Composio
+            _clients[entity_id] = Composio(api_key=_api_key)
+            logger.info("Created Composio client for entity_id=%s", entity_id)
+        except Exception as exc:
+            logger.error(
+                "Failed to create Composio client for entity_id=%s: %s",
+                entity_id, exc,
+            )
+            return None
+
+    return _clients[entity_id]
 
 
 def invalidate_session(user_id: str) -> None:
+    """Backward-compatible cache invalidation helper."""
+    _clients.pop(_entity_id(user_id), None)
+
+
+def get_session(user_id: str, force_refresh: bool = False) -> Any | None:
+    """Backward-compatible alias for the cached Composio client."""
+    return _get_client(user_id, force_refresh=force_refresh)
+
+
+# ── Resolution helpers ────────────────────────────────────────────────────────
+
+def _resolve_action(tool_name: str) -> str | None:
+    """Resolve a tool/action name to the Composio action slug.
+
+    In SDK 1.0 actions are plain strings — no enum lookup is needed.
     """
-    Remove a cached session so the next call to get_session() creates fresh.
-    Useful after a user revokes or adds connections.
+    return tool_name if tool_name else None
+
+
+def _resolve_app(toolkit: str) -> str | None:
+    """Resolve an internal toolkit key to the Composio toolkit slug.
+
+    In SDK 1.0 apps are plain strings — no enum lookup is needed.
     """
-    _sessions.pop(user_id, None)
+    return get_toolkit_slug(toolkit)
 
 
-# ── Connection check ─────────────────────────────────────────────────────────
+# ── Connection-link helpers ──────────────────────────────────────────────────
 
-def check_connection(user_id: str, toolkit: str) -> dict:
+def _extract_redirect_url(connection_request: Any) -> Optional[str]:
+    """Read a redirect URL from Composio SDK response objects."""
+    for attr in ("redirectUrl", "redirect_url", "url", "link"):
+        value = getattr(connection_request, attr, None)
+        if value:
+            return str(value)
+
+    if isinstance(connection_request, dict):
+        for key in ("redirectUrl", "redirect_url", "url", "link"):
+            value = connection_request.get(key)
+            if value:
+                return str(value)
+    return None
+
+
+# ── Auth-config lookup ────────────────────────────────────────────────────────
+
+def _find_auth_config_id(client: Any, toolkit_slug: str) -> Optional[str]:
+    """Look up the default auth-config id for a toolkit.
+
+    The new SDK flow requires an ``auth_config_id`` when initiating a
+    connection.  We list the configs for the toolkit and pick the first
+    usable one.
+
+    If no config exists, we attempt to auto-create one using Composio
+    managed auth so new deployments don't require manual Composio
+    dashboard setup.
     """
-    Check whether the user has an active connected account for a toolkit.
+    try:
+        configs = client.auth_configs.list(toolkit_slug=toolkit_slug)
+        config_items = _coerce_sequence(configs)
+        for cfg in config_items:
+            cfg_id = getattr(cfg, "id", None) or (cfg.get("id") if isinstance(cfg, dict) else None)
+            if cfg_id:
+                return str(cfg_id)
+    except Exception as exc:
+        logger.warning(
+            "Could not list auth_configs for toolkit_slug=%s: %s",
+            toolkit_slug, exc,
+        )
 
-    Returns:
-        {
-            "connected": bool,
-            "connected_account_id": str | None,
-            "status": "connected" | "pending" | "not_found" | "error",
-            "error": str | None,
+    # No config found — try to auto-create with Composio managed auth.
+    return _auto_create_auth_config(client, toolkit_slug)
+
+
+def _auto_create_auth_config(client: Any, toolkit_slug: str) -> Optional[str]:
+    """Attempt to create a Composio managed auth config for a toolkit.
+
+    This is called automatically when no auth config exists.  Toolkits that
+    don't support Composio managed auth (e.g. Twitter, Tavily) will fail
+    gracefully and return None — the caller will show an appropriate
+    "setup required" message.
+    """
+    try:
+        result = client.auth_configs.create(
+            toolkit=toolkit_slug,
+            options={
+                "type": "use_composio_managed_auth",
+                "name": f"auto-{toolkit_slug}",
+            },
+        )
+        new_id = getattr(result, "id", None)
+        if not new_id and isinstance(result, dict):
+            new_id = result.get("id")
+        if new_id:
+            logger.info(
+                "Auto-created Composio managed auth config for %s: %s",
+                toolkit_slug, new_id,
+            )
+            return str(new_id)
+    except Exception as exc:
+        logger.warning(
+            "Could not auto-create auth config for %s: %s",
+            toolkit_slug, exc,
+        )
+    return None
+
+
+# ── Public API ───────────────────────────────────────────────────────────────
+
+def get_toolkit_auth_details(toolkit: str) -> dict:
+    """
+    Return lightweight availability metadata for a toolkit.
+
+    The newer Composio SDK flow centers on entity connections rather than the
+    older auth-config inspection API, so this helper now reports only what the
+    rest of the app needs to explain connect-link availability gracefully.
+    """
+    toolkit_slug = get_toolkit_slug(toolkit)
+    app_name = get_toolkit_app_enum(toolkit)
+    available = is_available()
+
+    if not available:
+        return {
+            "available": False,
+            "toolkit_slug": toolkit_slug,
+            "managed_auth_available": False,
+            "supported_auth_schemes": [],
+            "auth_config_count": 0,
+            "has_usable_auth_config": False,
+            "preferred_auth_config_id": None,
+            "reason": _import_error or "Composio client not available",
+            "error": _import_error or "Composio client not available",
         }
+
+    if not toolkit_slug or not app_name:
+        reason = f"No Composio app mapping configured for toolkit '{toolkit}'"
+        return {
+            "available": False,
+            "toolkit_slug": toolkit_slug,
+            "managed_auth_available": False,
+            "supported_auth_schemes": [],
+            "auth_config_count": 0,
+            "has_usable_auth_config": False,
+            "preferred_auth_config_id": None,
+            "reason": reason,
+            "error": reason,
+        }
+
+    return {
+        "available": True,
+        "toolkit_slug": toolkit_slug,
+        "managed_auth_available": True,
+        "supported_auth_schemes": [],
+        "auth_config_count": 1,
+        "has_usable_auth_config": True,
+        "preferred_auth_config_id": None,
+        "reason": "Connection flow available.",
+        "error": None,
+    }
+
+
+def check_connection(user_id: str, toolkit: str, force_refresh: bool = False) -> dict:
     """
-    if not _ensure_client():
+    Check whether a workspace has an ACTIVE connection for the requested toolkit.
+
+    Uses the SDK 1.0 ``connected_accounts`` resource to list connections and
+    filter by toolkit slug and status.
+    """
+    if not is_available():
         return {
             "connected": False,
             "connected_account_id": None,
             "status": "error",
-            "error": "Composio client not available",
+            "error": _import_error or "Composio client not available",
         }
 
+    toolkit_slug = get_toolkit_slug(toolkit)
+    if not toolkit_slug:
+        return {
+            "connected": False,
+            "connected_account_id": None,
+            "status": "error",
+            "error": f"No canonical Composio toolkit slug mapping for '{toolkit}'",
+        }
+
+    client = _get_client(user_id, force_refresh=force_refresh)
+    if client is None:
+        return {
+            "connected": False,
+            "connected_account_id": None,
+            "status": "error",
+            "error": _import_error or "Composio client not available",
+        }
+
+    entity_id = _entity_id(user_id)
+
     try:
-        # Composio SDK: list connected accounts for the user, filtered by app
-        accounts = _composio_client.connected_accounts.list(
-            user_id=user_id,
-        )
-        # Filter by toolkit name
-        for acct in accounts:
-            # Account objects have an `app_name` or similar attribute
-            acct_app = getattr(acct, "app_name", "") or getattr(acct, "appName", "") or ""
-            if acct_app.upper() == toolkit.upper():
-                acct_id = getattr(acct, "id", "") or getattr(acct, "connected_account_id", "")
-                status_val = getattr(acct, "status", "connected")
-                if str(status_val).lower() in ("active", "connected"):
-                    return {
-                        "connected": True,
-                        "connected_account_id": str(acct_id),
-                        "status": "connected",
-                        "error": None,
-                    }
-                else:
-                    return {
-                        "connected": False,
-                        "connected_account_id": str(acct_id),
-                        "status": "pending",
-                        "error": None,
-                    }
+        # SDK 1.0: the high-level wrapper has no .list() method.
+        # Use the low-level REST client at client.client.connected_accounts
+        # which accepts plural filter params: user_ids, toolkit_slugs, statuses.
+        low_level = client.client.connected_accounts
+        try:
+            response = low_level.list(
+                user_ids=[entity_id],
+                toolkit_slugs=[toolkit_slug],
+            )
+        except TypeError:
+            # Fallback: list without filters and match locally.
+            response = low_level.list()
+
+        # The response is typically a pydantic model with an .items attribute,
+        # or a list-like.  Normalise it into a plain list.
+        connections = _coerce_sequence(response)
+
+        for connection in connections:
+            # Extract the toolkit slug. The SDK 1.0 returns an ItemToolkit
+            # object (with a .slug attribute) rather than a plain string.
+            raw_toolkit = getattr(connection, "toolkit", None)
+            toolkit_name = ""
+            if raw_toolkit is not None:
+                toolkit_name = str(getattr(raw_toolkit, "slug", raw_toolkit) or "").lower()
+            if not toolkit_name:
+                toolkit_name = str(
+                    getattr(connection, "appName", "")
+                    or getattr(connection, "toolkit_slug", "")
+                    or ""
+                ).lower()
+
+            status = str(getattr(connection, "status", "") or "").upper()
+
+            if toolkit_name and toolkit_name != toolkit_slug:
+                continue
+
+            account_id = (
+                getattr(connection, "id", None)
+                or getattr(connection, "connectedAccountId", None)
+                or getattr(connection, "connected_account_id", None)
+            )
+            if status == "ACTIVE":
+                return {
+                    "connected": True,
+                    "connected_account_id": str(account_id) if account_id else "active",
+                    "status": "connected",
+                    "error": None,
+                }
+            # Don't return early on non-ACTIVE connections — keep scanning
+            # in case a later connection IS active.
 
         return {
             "connected": False,
@@ -174,11 +442,10 @@ def check_connection(user_id: str, toolkit: str) -> dict:
             "status": "not_found",
             "error": None,
         }
-
     except Exception as exc:
         logger.error(
             "check_connection failed for user_id=%s toolkit=%s: %s",
-            user_id, toolkit, exc
+            user_id, toolkit, exc,
         )
         return {
             "connected": False,
@@ -188,87 +455,193 @@ def check_connection(user_id: str, toolkit: str) -> dict:
         }
 
 
-# ── Connect Link generation ──────────────────────────────────────────────────
-
-def get_connect_link(
-    user_id: str,
-    toolkit: str,
-    callback_url: str = "",
-) -> Optional[str]:
+def get_connect_link(user_id: str, toolkit: str, callback_url: str = "") -> Optional[str]:
     """
-    Generate a Composio Connect Link URL for the given user + toolkit.
+    Initiate a Composio connection flow and return the redirect URL.
 
-    The user clicks this link to complete OAuth / enter an API key.
-    After completion, Composio stores the connection server-side and
-    (optionally) redirects to callback_url.
-
-    Returns the URL string, or None on failure.
+    SDK 1.0 uses ``client.connected_accounts.initiate(user_id, auth_config_id, ...)``
+    which requires an ``auth_config_id``.  We look it up from the toolkit slug.
     """
-    if not _ensure_client():
-        logger.warning("Cannot generate connect link — Composio not available.")
+    if not is_available():
+        logger.warning("Cannot generate connect link; Composio is unavailable.")
+        return None
+
+    toolkit_slug = _resolve_app(toolkit)
+    if not toolkit_slug:
+        logger.error(
+            "Cannot generate connect link; no toolkit slug for toolkit=%s", toolkit,
+        )
+        return None
+
+    client = _get_client(user_id)
+    if client is None:
         return None
 
     try:
-        session = get_session(user_id)
-        if session is None:
+        # Find the auth config for this toolkit.
+        auth_config_id = _find_auth_config_id(client, toolkit_slug)
+        if not auth_config_id:
+            logger.error(
+                "Cannot generate connect link; no auth_config found for toolkit_slug=%s",
+                toolkit_slug,
+            )
             return None
 
-        # Use Composio's initiate_connection (or equivalent) to get a link
-        conn_request = _composio_client.connected_accounts.initiate(
-            user_id=user_id,
-            app_name=toolkit.upper(),
-            **({"callback_url": callback_url} if callback_url else {}),
+        entity_id = _entity_id(user_id)
+        redirect_url = _resolve_callback_url(callback_url)
+
+        # SDK 1.0: initiate a connected-account flow.
+        # allow_multiple=True permits reconnecting even when existing
+        # accounts are present for this user + auth config pair.
+        kwargs: dict[str, Any] = {"allow_multiple": True}
+        if redirect_url:
+            kwargs["callback_url"] = redirect_url
+
+        request = client.connected_accounts.initiate(
+            user_id=entity_id,
+            auth_config_id=auth_config_id,
+            **kwargs,
         )
-
-        # The response object should contain the redirect URL
-        url = (
-            getattr(conn_request, "redirect_url", None)
-            or getattr(conn_request, "redirectUrl", None)
-            or getattr(conn_request, "url", None)
-        )
-
-        if url:
-            logger.info(
-                "Generated connect link for user_id=%s toolkit=%s",
-                user_id, toolkit
-            )
-            return str(url)
-
-        logger.warning(
-            "Composio returned no redirect URL for user_id=%s toolkit=%s",
-            user_id, toolkit
-        )
-        return None
-
+        return _extract_redirect_url(request)
     except Exception as exc:
         logger.error(
             "get_connect_link failed for user_id=%s toolkit=%s: %s",
-            user_id, toolkit, exc
+            user_id, toolkit, exc,
         )
         return None
 
 
-# ── Tool schema fetching (for future function-calling integration) ────────────
-
 def get_tool_schemas(user_id: str, tool_names: list[str] | None = None) -> list[dict]:
     """
-    Fetch Composio tool schemas for the user's session.
+    Fetch OpenAI-formatted Composio tool schemas for a workspace.
 
-    Returns a list of tool definition dicts (Composio format).
-    An empty list if unavailable.
-
-    NOT used by tool_executor yet — provided for Phase 3 (LLM function-calling).
+    SDK 1.0 uses ``client.tools.get(user_id, tools=[...])`` which returns an
+    ``OpenAIToolCollection`` (a list-like of tool dicts).
     """
-    session = get_session(user_id)
-    if session is None:
+    if not is_available():
         return []
 
+    client = _get_client(user_id)
+    if client is None:
+        return []
+
+    actions = [name for name in (tool_names or []) if name]
+    if not actions:
+        return []
+
+    entity_id = _entity_id(user_id)
+
     try:
-        tools = session.tools()
-        if tool_names:
-            name_set = set(tool_names)
-            tools = [t for t in tools if getattr(t, "name", "") in name_set]
-        return tools
+        tools = _coerce_sequence(
+            client.tools.get(user_id=entity_id, tools=actions)
+        )
+        schemas: list[dict] = []
+        for tool in tools:
+            normalized = _normalize_sdk_payload(tool)
+            if isinstance(normalized, dict):
+                schemas.append(normalized)
+        return schemas
     except Exception as exc:
         logger.error("get_tool_schemas failed for user_id=%s: %s", user_id, exc)
         return []
+
+
+def validate_tool_slug(tool_name: str) -> dict:
+    """
+    Validate a tool/action name by attempting to fetch its Composio schema.
+    """
+    if not is_available():
+        return {
+            "available": False,
+            "exists": False,
+            "error": _import_error or "Composio client not available",
+        }
+
+    try:
+        schemas = get_tool_schemas("__catalog__", [tool_name])
+        return {
+            "available": True,
+            "exists": bool(schemas),
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "exists": False,
+            "error": str(exc),
+        }
+
+
+def execute_tool(
+    user_id: str,
+    tool_name: str,
+    arguments: dict | None = None,
+    connected_account_id: str | None = None,
+) -> dict:
+    """
+    Execute a Composio action directly for a workspace entity.
+
+    SDK 1.0 uses ``client.tools.execute(slug, arguments, user_id=...)``
+    instead of the old ``toolset.execute_action(action, params)`` pattern.
+
+    Parameters:
+        user_id              — The workspace / entity id.
+        tool_name            — Composio action slug (e.g. "GMAIL_FETCH_EMAILS").
+        arguments            — Dict of parameters to send to the tool.
+        connected_account_id — If known, the Composio connected-account id
+                               obtained from ``check_connection``.  Passing this
+                               avoids the "toolkit version not specified" error
+                               that occurs in manual (non-framework) execution.
+    """
+    client = _get_client(user_id)
+    if client is None:
+        raise RuntimeError(_import_error or "Composio client not available")
+
+    action = _resolve_action(tool_name)
+    if not action:
+        raise ValueError(f"Invalid tool name: {tool_name}")
+
+    params = arguments or {}
+    entity_id = _entity_id(user_id)
+
+    try:
+        # SDK 1.0: tools.execute(slug, arguments, ...)
+        # When executing outside a framework integration (OpenAI/LangChain
+        # wrappers), the SDK requires either:
+        #   - a specific ``version`` string, or
+        #   - ``connected_account_id`` so the SDK can resolve the version, or
+        #   - ``dangerously_skip_version_check=True`` to bypass the check.
+        # We pass both connected_account_id (when available) AND the skip
+        # flag as a safety net so execution never fails on version lookup.
+        exec_kwargs: dict[str, Any] = {
+            "user_id": entity_id,
+            "dangerously_skip_version_check": True,
+        }
+        if connected_account_id:
+            exec_kwargs["connected_account_id"] = connected_account_id
+
+        result = client.tools.execute(
+            slug=action,
+            arguments=params,
+            **exec_kwargs,
+        )
+    except Exception as exc:
+        logger.error(
+            "execute_tool failed for user_id=%s tool_name=%s: %s",
+            user_id, tool_name, exc,
+        )
+        raise
+
+    normalized = _normalize_sdk_payload(result)
+    if isinstance(normalized, dict):
+        return {
+            "data": normalized.get("data", normalized),
+            "error": normalized.get("error"),
+            "raw": normalized,
+        }
+
+    return {
+        "data": normalized,
+        "error": None,
+        "raw": normalized,
+    }

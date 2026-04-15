@@ -6,7 +6,16 @@ streamlit>=1.32.0
 python-dotenv>=1.0.0
 httpx>=0.27.0
 pydantic>=2.6.0
-requests>=2.31.0
+requests>=2.31.0,<2.33.0
 alembic
 psycopg2-binary
-composio>=0.7.0
+tenacity>=8.2.0
+
+# ── Composio SDK 1.0 (single package; composio-openai is merged in) ──────────
+composio>=0.11.0
+
+# ── Pin chardet below 6.0 to satisfy the requests version check ──────────────
+# requests 2.32.x asserts chardet >= 3.0.2, < 6.0.0 at import time.
+# If chardet is installed at >= 6.0 the warning fires even though
+# charset_normalizer (which is fine at 3.x) is also present.
+chardet>=3.0.2,<6.0.0

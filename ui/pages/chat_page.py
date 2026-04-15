@@ -11,6 +11,7 @@ Mission 7 update:
 """
 import streamlit as st
 from storage.db import SessionLocal
+from storage import repositories as repo
 from orchestrator.handler import handle_request
 from helpers.configs import list_agents, AGENTS
 from brain.quiz_engine import get_next_question, save_answer, quiz_progress
@@ -26,24 +27,32 @@ TOOLKIT_ICONS = {
     "GITHUB":           ("code", "GitHub"),
     "GOOGLE_SHEETS":    ("table", "Google Sheets"),
     "TAVILY":           ("globe", "Tavily Search"),
+    "TWITTER":          ("share", "X / Twitter"),
+    "LINKEDIN":         ("briefcase", "LinkedIn"),
 }
 
 # Maps tool_name → (emoji, human label) for execution indicators
 TOOL_DISPLAY = {
     "GMAIL_SEND_EMAIL":              ("📧", "Sent email via Gmail"),
-    "GMAIL_CREATE_DRAFT":            ("📧", "Drafted email via Gmail"),
-    "GMAIL_GET_PROFILE":             ("📧", "Fetched Gmail profile"),
-    "GMAIL_LIST_EMAILS":             ("📧", "Listed emails from Gmail"),
-    "GOOGLE_CALENDAR_CREATE_EVENT":  ("📅", "Created calendar event"),
-    "GOOGLE_CALENDAR_LIST_EVENTS":   ("📅", "Listed calendar events"),
+    "GMAIL_CREATE_EMAIL_DRAFT":      ("📧", "Drafted email via Gmail"),
+    "GMAIL_GET_CONTACTS":            ("📧", "Fetched Gmail contacts"),
+    "GMAIL_FETCH_EMAILS":            ("📧", "Listed emails from Gmail"),
+    "GOOGLECALENDAR_CREATE_EVENT":   ("📅", "Created calendar event"),
+    "GOOGLECALENDAR_EVENTS_LIST":    ("📅", "Listed calendar events"),
     "SLACK_SEND_MESSAGE":            ("💬", "Sent Slack message"),
+    "SLACK_FETCH_CONVERSATION_HISTORY": ("💬", "Fetched Slack conversation history"),
+    "SLACK_LIST_ALL_CHANNELS":       ("💬", "Listed Slack channels"),
     "HUBSPOT_CREATE_CONTACT":        ("📊", "Created HubSpot contact"),
-    "HUBSPOT_GET_CONTACTS":          ("📊", "Fetched HubSpot contacts"),
+    "HUBSPOT_LIST_CONTACTS":         ("📊", "Fetched HubSpot contacts"),
     "HUBSPOT_CREATE_DEAL":           ("📊", "Created HubSpot deal"),
-    "GOOGLE_SHEETS_ADD_ROWS_TO_SHEET": ("📋", "Added row to Google Sheet"),
-    "GITHUB_CREATE_ISSUE":           ("💻", "Created GitHub issue"),
-    "GITHUB_GET_REPOSITORY_ISSUES":  ("💻", "Listed GitHub issues"),
+    "GOOGLESHEETS_CREATE_SPREADSHEET_ROW": ("📋", "Added row to Google Sheet"),
+    "GITHUB_CREATE_AN_ISSUE":        ("💻", "Created GitHub issue"),
+    "GITHUB_LIST_REPOSITORY_ISSUES": ("💻", "Listed GitHub issues"),
     "TAVILY_SEARCH":                 ("🌐", "Searched the web via Tavily"),
+    "TWITTER_CREATION_OF_A_POST":    ("📝", "Posted on X / Twitter"),
+    "TWITTER_RECENT_SEARCH":         ("📝", "Fetched recent X / Twitter posts"),
+    "LINKEDIN_GET_MY_INFO":          ("💼", "Fetched LinkedIn profile info"),
+    "LINKEDIN_CREATE_LINKED_IN_POST": ("💼", "Published a LinkedIn post"),
 }
 
 
@@ -57,6 +66,8 @@ def _toolkit_display(toolkit_key: str) -> tuple[str, str]:
         "GITHUB":          ("💻", "GitHub"),
         "GOOGLE_SHEETS":   ("📋", "Google Sheets"),
         "TAVILY":          ("🌐", "Tavily Search"),
+        "TWITTER":         ("📝", "X / Twitter"),
+        "LINKEDIN":        ("💼", "LinkedIn"),
     }
     return lookup.get(toolkit_key.upper(), ("🔗", toolkit_key.replace("_", " ").title()))
 
@@ -143,23 +154,48 @@ def _render_connect_card(msg: dict, msg_idx: int):
                 use_container_width=True,
                 type="primary",
             )
-        else:
-            st.warning("Connection link unavailable. Please try again later.")
 
     with col_retry:
         if original_input:
             if st.button(
-                "🔄 Retry Request",
-                key=f"retry_{msg_idx}_{resume_token[:8]}",
+                "🔄 Retry",
+                key=f"conn_retry_{msg_idx}",
                 use_container_width=True,
             ):
-                # Store the retry context and trigger a rerun.
-                # The main input handler will pick this up.
                 st.session_state.pending_tool_retry = {
                     "original_input": original_input,
                     "resume_token": resume_token,
                 }
                 st.rerun()
+
+# ── Auth Unavailable card ─────────────────────────────────────────────────────
+
+def _render_auth_unavailable_card(msg: dict, msg_idx: int):
+    """Render a card when an integration cannot connect (e.g. missing API keys)."""
+    toolkit_raw = msg.get("toolkit", "")
+    emoji, toolkit_name = _toolkit_display(toolkit_raw)
+    details = msg.get("auth_error", "").strip() or (
+        f"The integration for {toolkit_name} is currently unavailable."
+    )
+
+    st.markdown(
+        f"""<div style="
+            border: 1px solid #662222;
+            border-radius: 12px;
+            padding: 16px 20px;
+            margin: 8px 0;
+            background: linear-gradient(135deg, #2a0e0e 0%, #1a0a0a 100%);
+        ">
+        <span style="font-size: 1.4em;">{emoji} ⚠️</span>
+        <strong style="font-size: 1.1em; margin-left: 8px; color: #ff6b6b;">
+            Setup Required for {toolkit_name}
+        </strong>
+        <p style="margin: 8px 0 0 0; color: #ffcccc; font-size: 0.9em;">
+            {details}
+        </p>
+        </div>""",
+        unsafe_allow_html=True,
+    )
 
 
 # ── Tool error display ────────────────────────────────────────────────────────
@@ -181,7 +217,7 @@ def _render_tool_error(msg: dict, msg_idx: int):
             font-size: 0.82em;
             color: #f5b7b1;
         ">
-        ⚠️ <strong>Tool execution failed — responded from knowledge</strong>
+        ⚠️ <strong>Tool execution failed — request stopped</strong>
         </div>""",
         unsafe_allow_html=True,
     )
@@ -196,6 +232,24 @@ def _render_tool_error(msg: dict, msg_idx: int):
                 "resume_token": "",
             }
             st.rerun()
+
+
+def _render_invalid_tool_card(msg: dict):
+    st.error("Invalid tool configuration or tool name detected.")
+    st.markdown(msg.get("content", ""))
+
+
+def _render_validation_error_card(msg: dict):
+    st.warning("The tool request was invalid, so the app stopped before execution.")
+    st.markdown(msg.get("content", ""))
+
+
+def _render_workflow_state(msg: dict):
+    if msg.get("workflow_paused"):
+        step_label = msg.get("step_label", "Current step")
+        st.info(f"Workflow paused at: **{step_label}**")
+    if msg.get("workflow_resumed"):
+        st.success("Workflow resumed from the last completed step.")
 
 
 # ── Main page render ──────────────────────────────────────────────────────────
@@ -228,6 +282,32 @@ def render_chat():
                             save_answer(ws_id, next_q["field"], next_q["question"], answer.strip(), db)
                             st.success("✅ Saved to Brain AI!")
                             st.rerun()
+
+        st.markdown("---")
+
+        pending_rows = repo.list_pending_tool_requests(db, ws_id, limit=3)
+        if pending_rows:
+            latest_pending = pending_rows[0]
+            st.info(
+                f"Pending tool request detected for **{latest_pending.requested_toolkit}**. "
+                f"You can reconnect or resume it from here after returning from auth."
+            )
+            col_resume, col_reconnect = st.columns([1, 1])
+            with col_resume:
+                if st.button("Resume Pending Request", use_container_width=True):
+                    st.session_state.pending_tool_retry = {
+                        "original_input": latest_pending.original_input,
+                        "resume_token": latest_pending.resume_token,
+                    }
+                    st.rerun()
+            with col_reconnect:
+                try:
+                    from tools.composio_client import get_connect_link
+                    reconnect_url = get_connect_link(ws_id, latest_pending.requested_toolkit)
+                except Exception:
+                    reconnect_url = None
+                if reconnect_url:
+                    st.link_button("Reconnect Account", reconnect_url, use_container_width=True)
 
         st.markdown("---")
 
@@ -304,9 +384,21 @@ def render_chat():
                         if msg.get("tool_error"):
                             _render_tool_error(msg, msg_idx)
 
+                        if msg.get("invalid_tool"):
+                            _render_invalid_tool_card(msg)
+
+                        if msg.get("validation_error"):
+                            _render_validation_error_card(msg)
+
                         # ── Connect-required card ─────────────────────────────
                         if msg.get("connect_required"):
                             _render_connect_card(msg, msg_idx)
+
+                        # ── Auth Unavailable card ─────────────────────────────
+                        if msg.get("auth_unavailable"):
+                            _render_auth_unavailable_card(msg, msg_idx)
+
+                        _render_workflow_state(msg)
 
                         # Show workflow steps if available
                         # Uses .get() so both live and DB-hydrated entries are safe
@@ -331,8 +423,13 @@ def render_chat():
         pending_retry = st.session_state.get("pending_tool_retry")
         if pending_retry:
             retry_input = pending_retry["original_input"]
+            resume_token = pending_retry.get("resume_token", "")
             # Clear the retry state immediately so it doesn't re-trigger
             st.session_state.pending_tool_retry = None
+
+            # Invalidate stale Composio session so fresh connection is detected
+            from tools.composio_client import invalidate_session
+            invalidate_session(ws_id)
 
             # Add user message
             st.session_state.chat_history.append({
@@ -342,12 +439,45 @@ def render_chat():
 
             # Re-send through orchestrator
             with st.spinner("🔄 Retrying with connected tools..."):
-                result = handle_request(
-                    retry_input,
-                    ws_id,
-                    db,
-                    force_agent=st.session_state.selected_agent
-                )
+                if resume_token:
+                    from tools.tool_executor import (
+                        get_pending_request,
+                        mark_request_resumed,
+                        mark_request_completed,
+                    )
+
+                    pending = get_pending_request(db, resume_token)
+                    if pending:
+                        mark_request_resumed(db, resume_token)
+                        context = pending.context_json or {}
+                        workflow_key = context.get("workflow_key")
+                        result = handle_request(
+                            pending.original_input,
+                            ws_id,
+                            db,
+                            force_agent=pending.agent_key if (pending.agent_key and not workflow_key) else None,
+                            force_workflow=workflow_key,
+                            resume_state=context,
+                        )
+                        if result.get("mode") not in {
+                            "connect_required", "auth_unavailable", "invalid_tool",
+                            "validation_error", "tool_error"
+                        } and not result.get("error", False):
+                            mark_request_completed(db, resume_token)
+                    else:
+                        result = handle_request(
+                            retry_input,
+                            ws_id,
+                            db,
+                            force_agent=st.session_state.selected_agent
+                        )
+                else:
+                    result = handle_request(
+                        retry_input,
+                        ws_id,
+                        db,
+                        force_agent=st.session_state.selected_agent
+                    )
 
             _append_result_to_history(result, original_input=retry_input)
             st.rerun()
@@ -421,8 +551,16 @@ def _append_result_to_history(result: dict, original_input: str = "") -> None:
         entry["tool_used"] = tool_used
 
     # Flag tool errors (output contains error markers from executor)
-    if result.get("error") and not result.get("mode") == "workflow":
+    if result.get("mode") == "tool_error":
         entry["tool_error"] = True
+        entry["original_input"] = original_input
+
+    if result.get("mode") == "invalid_tool":
+        entry["invalid_tool"] = True
+        entry["original_input"] = original_input
+
+    if result.get("mode") == "validation_error":
+        entry["validation_error"] = True
         entry["original_input"] = original_input
 
     # If connect_required, attach extra fields for the connector card
@@ -432,5 +570,19 @@ def _append_result_to_history(result: dict, original_input: str = "") -> None:
         entry["resume_token"]    = result.get("resume_token", "")
         entry["toolkit"]         = result.get("toolkit", "")
         entry["original_input"]  = original_input
+
+    # If auth_unavailable, attach fields for the setup required card
+    if result.get("mode") == "auth_unavailable":
+        entry["auth_unavailable"] = True
+        entry["toolkit"]          = result.get("toolkit", "")
+        entry["original_input"]   = original_input
+        entry["auth_error"]       = result.get("auth_error", "")
+
+    if result.get("workflow_paused"):
+        entry["workflow_paused"] = True
+        entry["step_label"] = result.get("step_label", "")
+
+    if result.get("workflow_resumed"):
+        entry["workflow_resumed"] = True
 
     st.session_state.chat_history.append(entry)
