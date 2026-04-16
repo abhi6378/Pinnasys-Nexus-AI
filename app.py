@@ -6,6 +6,8 @@ import streamlit as st
 from storage.db import init_db, SessionLocal
 from storage import repositories as repo
 from helpers.configs import AGENTS
+from ui.connector_state import default_connector_context
+from tools.connector_service import load_persisted_connector_context
 from utils.logging_utils import configure_logging
 
 # Must be first Streamlit call
@@ -34,6 +36,10 @@ if "selected_agent" not in st.session_state:
     st.session_state.selected_agent = None
 if "pending_tool_retry" not in st.session_state:
     st.session_state.pending_tool_retry = None
+if "connector_context" not in st.session_state:
+    st.session_state.connector_context = default_connector_context()
+if "connector_context_workspace_id" not in st.session_state:
+    st.session_state.connector_context_workspace_id = None
 
 # ── Hydrate chat history from DB on cold start / browser refresh ──────────────
 # Runs only when: workspace is known AND chat_history is empty (i.e. page was
@@ -64,6 +70,20 @@ if st.session_state.workspace_id and not st.session_state.chat_history:
             })
     finally:
         _hdb.close()
+
+if (
+    st.session_state.workspace_id
+    and st.session_state.connector_context_workspace_id != st.session_state.workspace_id
+):
+    _cdb = SessionLocal()
+    try:
+        st.session_state.connector_context = load_persisted_connector_context(
+            st.session_state.workspace_id,
+            _cdb,
+        ).to_dict()
+        st.session_state.connector_context_workspace_id = st.session_state.workspace_id
+    finally:
+        _cdb.close()
 
 # ── Sidebar navigation ────────────────────────────────────────────────────────
 from ui.sidebar import render_sidebar

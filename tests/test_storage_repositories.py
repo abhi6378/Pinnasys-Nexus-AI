@@ -36,6 +36,19 @@ def load_repositories_module():
     ConversationModel = make_model_class("ConversationModel", ["workspace_id", "created_at"])
     WorkflowRunModel = make_model_class("WorkflowRunModel", ["workspace_id", "created_at"])
     IdeaModel = make_model_class("IdeaModel", ["workspace_id", "created_at", "id", "status"])
+    MemoryRecordModel = make_model_class(
+        "MemoryRecordModel",
+        ["workspace_id", "created_at", "updated_at", "id", "canonical_key", "superseded_by", "memory_type", "pinned"],
+    )
+    WorkingMemoryStateModel = make_model_class("WorkingMemoryStateModel", ["workspace_id", "updated_at"])
+    MemoryEmbeddingModel = make_model_class(
+        "MemoryEmbeddingModel",
+        ["workspace_id", "updated_at", "memory_record_id", "model_name"],
+    )
+    WorkspaceConnectorPreferenceModel = make_model_class(
+        "WorkspaceConnectorPreferenceModel",
+        ["workspace_id", "updated_at"],
+    )
     PendingToolRequestModel = make_model_class(
         "PendingToolRequestModel",
         ["workspace_id", "status", "updated_at"],
@@ -51,6 +64,10 @@ def load_repositories_module():
             ConversationModel=ConversationModel,
             WorkflowRunModel=WorkflowRunModel,
             IdeaModel=IdeaModel,
+            MemoryRecordModel=MemoryRecordModel,
+            WorkingMemoryStateModel=WorkingMemoryStateModel,
+            MemoryEmbeddingModel=MemoryEmbeddingModel,
+            WorkspaceConnectorPreferenceModel=WorkspaceConnectorPreferenceModel,
         ),
         "sqlalchemy.orm": make_module("sqlalchemy.orm", Session=type("Session", (), {})),
         "sqlalchemy": make_module("sqlalchemy"),
@@ -183,3 +200,113 @@ class RepositoryTests(unittest.TestCase):
 
         self.assertEqual(len(log_exception.calls), 1)
         self.assertEqual(log_exception.calls[0][0][1], "storage.conversation_save_failed")
+
+    def test_upsert_working_memory_merges_lists_and_text_fields(self):
+        existing = self.repo.WorkingMemoryStateModel(
+            workspace_id="ws-1",
+            active_tasks=["draft deck"],
+            open_questions=["budget?"],
+            state_json={"owner": "founder"},
+        )
+        db = FakeSession({
+            self.repo.WorkingMemoryStateModel: FakeQuery(first_result=existing),
+        })
+
+        state = self.repo.upsert_working_memory(
+            db,
+            "ws-1",
+            current_goal="Launch email campaign",
+            active_tasks=["draft deck", "review copy"],
+            open_questions=["budget?", "who approves?"],
+            project_focus="Q2 outreach",
+            state_json={"channel": "email"},
+        )
+
+        self.assertEqual(state.current_goal, "Launch email campaign")
+        self.assertEqual(state.active_tasks, ["draft deck", "review copy"])
+        self.assertEqual(state.open_questions, ["budget?", "who approves?"])
+        self.assertEqual(state.project_focus, "Q2 outreach")
+        self.assertEqual(state.state_json, {"owner": "founder", "channel": "email"})
+
+    def test_upsert_memory_record_merges_existing_canonical_entry(self):
+        existing = self.repo.MemoryRecordModel(
+            id="m-1",
+            workspace_id="ws-1",
+            title="Email preference",
+            content="Prefers concise emails.",
+            summary="Prefers concise emails.",
+            tags=["email"],
+            entity_tags=[],
+            tool_tags=[],
+            importance_score=0.4,
+            confidence_score=0.6,
+            pinned=False,
+            canonical_key="preference:email_style",
+            metadata_json={"source": "old"},
+        )
+        db = FakeSession({
+            self.repo.MemoryRecordModel: FakeQuery(first_result=existing),
+        })
+
+        record = self.repo.upsert_memory_record(
+            db,
+            "ws-1",
+            memory_type="preference",
+            title="Email preference",
+            content="Prefers concise emails with bullets.",
+            summary="Prefers concise emails with bullets.",
+            tags=["email", "style"],
+            importance_score=0.8,
+            confidence_score=0.9,
+            canonical_key="preference:email_style",
+            metadata_json={"source": "new"},
+        )
+
+        self.assertEqual(record.content, "Prefers concise emails with bullets.")
+        self.assertEqual(record.tags, ["email", "style"])
+        self.assertEqual(record.importance_score, 0.8)
+        self.assertEqual(record.metadata_json, {"source": "new"})
+
+    def test_search_memory_records_scores_summary_and_tags(self):
+        items = [
+            SimpleNamespace(id="1", title="Other", summary="nothing", content="plain", tags=[], entity_tags=[], tool_tags=[], importance_score=0.1),
+            SimpleNamespace(id="2", title="Email preference", summary="prefers bullets", content="plain", tags=["email"], entity_tags=[], tool_tags=[], importance_score=0.2),
+            SimpleNamespace(id="3", title="Other", summary="plain", content="email pricing notes", tags=[], entity_tags=[], tool_tags=[], importance_score=0.1),
+        ]
+        query = FakeQuery(all_result=items)
+        db = FakeSession({
+            self.repo.MemoryRecordModel: query,
+        })
+
+        result = self.repo.search_memory_records(db, "ws-1", "email", limit=10)
+
+        self.assertEqual(result[0], items[1])
+        self.assertEqual(result[1], items[2])
+
+    def test_upsert_workspace_connector_preference_creates_and_updates_preference(self):
+        existing = self.repo.WorkspaceConnectorPreferenceModel(
+            workspace_id="ws-1",
+            mode="manual",
+            selected_toolkit="GMAIL",
+            selected_account_id="acct-1",
+            selected_account_alias="Work",
+            source="sidebar",
+        )
+        db = FakeSession({
+            self.repo.WorkspaceConnectorPreferenceModel: FakeQuery(first_result=existing),
+        })
+
+        row = self.repo.upsert_workspace_connector_preference(
+            db,
+            "ws-1",
+            mode="manual",
+            selected_toolkit="HUBSPOT",
+            selected_account_id="acct-2",
+            selected_account_alias="Sales",
+            source="chat_input",
+        )
+
+        self.assertEqual(row.selected_toolkit, "HUBSPOT")
+        self.assertEqual(row.selected_account_id, "acct-2")
+        self.assertEqual(row.selected_account_alias, "Sales")
+        self.assertEqual(row.source, "chat_input")

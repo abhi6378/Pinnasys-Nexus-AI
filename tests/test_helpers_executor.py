@@ -186,3 +186,54 @@ class RunAgentTests(unittest.TestCase):
             generate_tools.calls[0][1]["available_tools"],
             [gmail_tool],
         )
+
+    def test_run_with_tools_rejects_unverified_live_action_claims(self):
+        agent = {
+            "name": "Buddy",
+            "role": "Assistant",
+            "goal": "Help",
+            "tone": "Warm",
+            "boundaries": "None",
+            "output_format": "Text",
+            "allowed_tools": ["GMAIL_SEND_EMAIL"],
+        }
+        gmail_tool = {
+            "tool_name": "GMAIL_SEND_EMAIL",
+            "toolkit": "GMAIL",
+            "action": "Send an email",
+            "expected_params": ["recipient_email", "body"],
+        }
+        with patch_attr(executor, "prepare_tools_for_prompt", Spy(return_value={
+            "tools": [gmail_tool],
+            "filter_applied": False,
+            "groups": ["email"],
+            "reason": "not_narrowed",
+        })), \
+             patch_attr(executor, "get_tool_schemas", Spy(return_value=[])), \
+             patch_attr(executor, "generate_with_tool_awareness", Spy(return_value="I sent the email.")), \
+             stubbed_modules({"tools.tool_executor": make_module("tools.tool_executor", attempt_tool_call=Spy())}):
+            result = executor._run_with_tools(
+                agent_key="assistant",
+                agent=agent,
+                agent_name="Buddy",
+                system_prompt="sys",
+                user_input="send an email",
+                available_tools=[gmail_tool],
+                workspace_id="ws1",
+                db=object(),
+                route_context={"operation": "write", "requires_live_data": True},
+            )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["mode"], "validation_error")
+        self.assertIn("claim a live action", result["output"])
+
+    def test_build_followup_prompt_requires_grounding_in_verified_results(self):
+        prompt = executor._build_followup_prompt(
+            user_input="check my inbox",
+            tool_history=["Tool: GMAIL_FETCH_EMAILS\nResult:\n{}"],
+            tool_output_payload={"emails": []},
+        )
+
+        self.assertIn("Verified execution history", prompt)
+        self.assertIn("Ground the answer only in the verified execution results", prompt)

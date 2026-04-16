@@ -14,6 +14,8 @@ from workspace.manager import create_workspace, list_workspaces, get_workspace_c
 from brain.quiz_engine import get_next_question, save_answer, quiz_progress
 from orchestrator.handler import handle_request
 from helpers.configs import list_agents
+from tools.connector_service import list_connector_accounts, list_workspace_connectors
+from tools.composio_client import get_connect_link
 from utils.logging_utils import configure_logging
 
 app = FastAPI(title="Sintra Clone API", version="1.0.0")
@@ -41,6 +43,7 @@ class ChatRequest(BaseModel):
     workspace_id: str
     message: str
     agent: Optional[str] = None
+    connector_context: Optional[dict] = None
 
 class ResumeRequest(BaseModel):
     resume_token: str
@@ -88,7 +91,13 @@ def api_get_workspace(workspace_id: str, db: Session = Depends(get_db)):
 
 @app.post("/chat")
 def api_chat(req: ChatRequest, db: Session = Depends(get_db)):
-    result = handle_request(req.message, req.workspace_id, db, force_agent=req.agent)
+    result = handle_request(
+        req.message,
+        req.workspace_id,
+        db,
+        force_agent=req.agent,
+        connector_context=req.connector_context,
+    )
     return result
 
 
@@ -124,6 +133,7 @@ def api_chat_resume(req: ResumeRequest, db: Session = Depends(get_db)):
     # Determine if this was a workflow resume
     context = pending.context_json or {}
     wf_key = context.get("workflow_key")
+    connector_context = context.get("connector_context")
 
     # Re-send the original request through the orchestrator
     result = handle_request(
@@ -132,7 +142,8 @@ def api_chat_resume(req: ResumeRequest, db: Session = Depends(get_db)):
         db,
         force_agent=pending.agent_key if (pending.agent_key and not wf_key) else None,
         force_workflow=wf_key,
-        resume_state=context
+        resume_state=context,
+        connector_context=connector_context,
     )
     if result.get("mode") not in {
         "connect_required", "auth_unavailable", "invalid_tool",
@@ -203,6 +214,34 @@ def api_quiz_answer(req: QuizAnswerRequest, db: Session = Depends(get_db)):
 @app.get("/helpers")
 def api_list_helpers():
     return list_agents()
+
+
+@app.get("/workspace/{workspace_id}/connectors")
+def api_list_connectors(workspace_id: str, refresh: bool = False, selected_toolkit: str = "", db: Session = Depends(get_db)):
+    return list_workspace_connectors(
+        workspace_id,
+        db,
+        refresh=refresh,
+        selected_toolkit=selected_toolkit,
+        include_connect_url=bool(selected_toolkit),
+    )
+
+
+@app.get("/workspace/{workspace_id}/connectors/{toolkit}/accounts")
+def api_list_connector_accounts(workspace_id: str, toolkit: str, refresh: bool = False, db: Session = Depends(get_db)):
+    return list_connector_accounts(
+        workspace_id,
+        toolkit,
+        db,
+        include_disconnected=True,
+        refresh=refresh,
+        allow_remote=True,
+    )
+
+
+@app.get("/workspace/{workspace_id}/connectors/{toolkit}/connect-link")
+def api_get_connector_link(workspace_id: str, toolkit: str):
+    return {"connect_url": get_connect_link(workspace_id, toolkit)}
 
 
 # ── Ideas Inbox ───────────────────────────────────────────────────────────────

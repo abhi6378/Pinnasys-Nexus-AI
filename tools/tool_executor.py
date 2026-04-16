@@ -20,18 +20,53 @@ Execution contract (per call):
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Optional
 
-from sqlalchemy.orm import Session as DBSession
+try:
+    from sqlalchemy.orm import Session as DBSession
+except Exception:  # pragma: no cover - fallback for constrained test environments
+    DBSession = object
 
-from tools.tool_registry import get_tool, is_agent_allowed
+try:
+    from tools.tool_registry import (
+        get_tool,
+        get_tool_schema,
+        get_toolkit_runtime_config,
+        is_agent_allowed,
+        normalize_tool_input,
+        validate_tool_input,
+    )
+except ImportError:
+    from tools.tool_registry import get_tool, is_agent_allowed
+
+    def normalize_tool_input(tool_name: str, input_args: dict | None) -> dict:
+        tool_entry = get_tool(tool_name) or {}
+        normalized = dict(input_args or {})
+        for source_key, target_key in tool_entry.get("param_aliases", {}).items():
+            if source_key in normalized and target_key not in normalized:
+                normalized[target_key] = normalized.pop(source_key)
+        for key, value in tool_entry.get("default_params", {}).items():
+            normalized.setdefault(key, value)
+        return normalized
+
+    def validate_tool_input(tool_name: str, input_args: dict | None) -> tuple[dict, list[str]]:
+        return normalize_tool_input(tool_name, input_args), []
+
+    def get_tool_schema(tool_name: str) -> dict:
+        tool_entry = get_tool(tool_name) or {}
+        return dict(tool_entry.get("schema", {}))
+
+    def get_toolkit_runtime_config(toolkit: str) -> dict:
+        return {}
 from tools.composio_client import (
     is_available,
     check_connection,
     get_connect_link,
+    get_live_tool_schema,
     get_toolkit_auth_details,
     validate_tool_slug,
     execute_tool,
@@ -40,8 +75,10 @@ from models.tool_call_logs import ToolCallLogModel
 from models.tool_connections import ToolConnectionModel
 from models.pending_tool_requests import PendingToolRequestModel
 from utils.logging_utils import log_event, log_exception
+from utils.time_utils import utc_now
 
 logger = logging.getLogger(__name__)
+CONNECTOR_STATUS_TTL_SECONDS = int(os.getenv("CONNECTOR_STATUS_TTL_SECONDS", "900") or "900")
 
 
 # ── Result builders ───────────────────────────────────────────────────────────
@@ -62,25 +99,6 @@ def _fail(status: str, error: str, duration_ms: float = 0.0) -> dict:
         "error": error,
         "duration_ms": duration_ms,
     }
-
-
-def _normalize_input_args(tool_entry: dict, input_args: dict) -> dict:
-    """
-    Apply tool-specific alias and default handling before validation/execution.
-
-    This keeps the validation layer strict without requiring the LLM to guess
-    exact schema field names like ``recipient_email`` or ``calendarId``.
-    """
-    normalized = dict(input_args or {})
-
-    for source_key, target_key in tool_entry.get("param_aliases", {}).items():
-        if source_key in normalized and target_key not in normalized:
-            normalized[target_key] = normalized.pop(source_key)
-
-    for key, value in tool_entry.get("default_params", {}).items():
-        normalized.setdefault(key, value)
-
-    return normalized
 
 
 def _connect_required(
@@ -107,30 +125,15 @@ def _connect_required(
     }
 
 
-# Toolkits that require custom API keys (no Composio managed OAuth)
-_CUSTOM_KEY_TOOLKITS: dict[str, str] = {
-    "TAVILY": (
-        "Tavily requires an API key. Please add your Tavily API key in the "
-        "Composio dashboard under the Tavily toolkit settings, then connect "
-        "your account."
-    ),
-    "TWITTER": (
-        "X/Twitter requires developer API credentials (API Key, API Secret, "
-        "Access Token, Access Token Secret). Please configure them in the "
-        "Composio dashboard under the Twitter toolkit, then connect your account."
-    ),
-}
-
-
 def _build_auth_unavailable_error(toolkit: str, auth_details: dict, conn_info: dict) -> str:
     """Explain why a connection link cannot be generated for this toolkit."""
     if conn_info.get("error"):
         return str(conn_info["error"])
 
-    # Toolkit-specific messages for custom-key integrations
-    custom_msg = _CUSTOM_KEY_TOOLKITS.get(toolkit.upper())
+    toolkit_config = get_toolkit_runtime_config(toolkit)
+    custom_msg = toolkit_config.get("setup_message")
     if custom_msg:
-        return custom_msg
+        return str(custom_msg)
 
     if not auth_details:
         return (
@@ -146,6 +149,46 @@ def _build_auth_unavailable_error(toolkit: str, auth_details: dict, conn_info: d
         f"The {toolkit} integration is currently unavailable. "
         f"Please check the Composio dashboard to verify the toolkit is configured."
     )
+
+
+def _extract_parameter_schema(live_schema: dict) -> dict:
+    if not isinstance(live_schema, dict):
+        return {}
+    function_block = live_schema.get("function", {})
+    parameters = function_block.get("parameters")
+    if isinstance(parameters, dict):
+        return parameters
+    schema = live_schema.get("schema")
+    if isinstance(schema, dict):
+        return schema
+    return {}
+
+
+def _validate_against_live_schema(input_args: dict, live_schema: dict) -> list[str]:
+    errors: list[str] = []
+    parameter_schema = _extract_parameter_schema(live_schema)
+    if not parameter_schema:
+        return errors
+
+    required = list(parameter_schema.get("required") or [])
+    properties = dict(parameter_schema.get("properties") or {})
+    for key in required:
+        if key not in input_args:
+            errors.append(f"Missing required parameter: {key}")
+    for key, spec in properties.items():
+        if key not in input_args:
+            continue
+        value = input_args[key]
+        expected_type = spec.get("type")
+        if expected_type == "string" and not isinstance(value, str):
+            errors.append(f"Parameter '{key}' must be a string.")
+        elif expected_type == "integer" and not isinstance(value, int):
+            errors.append(f"Parameter '{key}' must be an integer.")
+        elif expected_type == "array" and not isinstance(value, list):
+            errors.append(f"Parameter '{key}' must be a list.")
+        elif expected_type == "object" and not isinstance(value, dict):
+            errors.append(f"Parameter '{key}' must be an object.")
+    return errors
 
 
 # ── Logging helper ────────────────────────────────────────────────────────────
@@ -178,7 +221,7 @@ def _log_attempt(
             output_json=output_json or {},
             error_message=error_message,
             duration_ms=duration_ms,
-            created_at=datetime.utcnow(),
+            created_at=utc_now(),
         )
         db.add(log)
         db.commit()
@@ -234,7 +277,7 @@ def _save_pending_request(
             existing.resume_token = resume_token
             existing.context_json = context_json or {}
             existing.conversation_id = conversation_id or existing.conversation_id
-            existing.updated_at = datetime.utcnow()
+            existing.updated_at = utc_now()
             db.commit()
             return existing
 
@@ -249,8 +292,8 @@ def _save_pending_request(
             resume_token=resume_token,
             status="pending",
             context_json=context_json or {},
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
+            created_at=utc_now(),
+            updated_at=utc_now(),
         )
         db.add(row)
         db.commit()
@@ -275,21 +318,49 @@ def _save_pending_request(
 # ── Local connection cache helpers ────────────────────────────────────────────
 
 def _get_local_connection(
-    db: DBSession, workspace_id: str, toolkit: str
+    db: DBSession, workspace_id: str, toolkit: str, preferred_account_id: str = ""
 ) -> Optional[ToolConnectionModel]:
     """Check local DB cache for an active connection."""
     try:
-        return (
+        query = (
             db.query(ToolConnectionModel)
             .filter(
                 ToolConnectionModel.workspace_id == workspace_id,
                 ToolConnectionModel.toolkit == toolkit.upper(),
                 ToolConnectionModel.status == "connected",
             )
-            .first()
         )
+        if preferred_account_id:
+            query = query.filter(ToolConnectionModel.connected_account_id == preferred_account_id)
+        return query.order_by(ToolConnectionModel.is_default.desc(), ToolConnectionModel.updated_at.desc()).first()
     except Exception:
         return None
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _is_local_connection_fresh(row: ToolConnectionModel | None) -> bool:
+    if row is None:
+        return False
+    last_verified_at = _as_utc(
+        getattr(row, "last_verified_at", None)
+        or getattr(row, "updated_at", None)
+    )
+    if last_verified_at is None:
+        return False
+    return (utc_now() - last_verified_at).total_seconds() <= CONNECTOR_STATUS_TTL_SECONDS
+
+
+def _get_runtime_connection_cache(context_json: dict | None) -> dict:
+    if not isinstance(context_json, dict):
+        return {}
+    return context_json.setdefault("connector_runtime_cache", {})
 
 
 def _save_local_connection(
@@ -299,21 +370,31 @@ def _save_local_connection(
     connected_account_id: str,
     status: str = "connected",
     auth_mode: str = "oauth2",
+    account_label: str = "",
+    is_default: bool = False,
 ) -> None:
     """Upsert local connection state after a live Composio connection check."""
     try:
-        existing = (
+        query = (
             db.query(ToolConnectionModel)
             .filter(
                 ToolConnectionModel.workspace_id == workspace_id,
                 ToolConnectionModel.toolkit == toolkit.upper(),
             )
-            .first()
         )
+        if connected_account_id:
+            query = query.filter(ToolConnectionModel.connected_account_id == connected_account_id)
+        else:
+            query = query.filter(ToolConnectionModel.connected_account_id == "")
+        existing = query.first()
         if existing:
             existing.status = status
             existing.connected_account_id = connected_account_id
-            existing.updated_at = datetime.utcnow()
+            existing.account_label = account_label or getattr(existing, "account_label", "")
+            existing.is_default = bool(is_default or getattr(existing, "is_default", False))
+            existing.last_verified_at = utc_now()
+            existing.status_updated_at = utc_now()
+            existing.updated_at = utc_now()
         else:
             row = ToolConnectionModel(
                 id=str(uuid.uuid4()),
@@ -323,10 +404,14 @@ def _save_local_connection(
                 toolkit=toolkit.upper(),
                 status=status,
                 connected_account_id=connected_account_id,
+                account_label=account_label,
+                is_default=bool(is_default),
                 auth_mode=auth_mode,
                 metadata_json={},
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow(),
+                last_verified_at=utc_now(),
+                status_updated_at=utc_now(),
+                created_at=utc_now(),
+                updated_at=utc_now(),
             )
             db.add(row)
         db.commit()
@@ -356,6 +441,7 @@ def attempt_tool_call(
     conversation_id: str = "",
     context_json: dict | None = None,
     callback_url: str = "",
+    selected_account_id: str = "",
 ) -> dict:
     """
     Full validation → connection check → execute pipeline for a single
@@ -402,7 +488,7 @@ def attempt_tool_call(
         return result
 
     toolkit = tool_entry["toolkit"]
-    input_args = _normalize_input_args(tool_entry, input_args or {})
+    input_args = normalize_tool_input(tool_name, input_args or {})
 
     # ── Step 2: Validate agent permission ─────────────────────────────────
     if not is_agent_allowed(tool_name, agent_key):
@@ -439,13 +525,19 @@ def attempt_tool_call(
                 error_type="catalog_unavailable",
             )
 
-    # ── Step 4: Validate expected parameters ──────────────────────────────
-    expected = tool_entry.get("expected_params", [])
-    missing = [p for p in expected if p not in input_args]
-    if missing:
+    # ── Step 4: Validate parameters using local schema and live schema ────
+    input_args, validation_errors = validate_tool_input(tool_name, input_args)
+    if is_available():
+        live_schema = get_live_tool_schema(workspace_id, tool_name) or get_live_tool_schema("__catalog__", tool_name)
+        validation_errors.extend(_validate_against_live_schema(input_args, live_schema))
+    else:
+        live_schema = {}
+
+    if validation_errors:
+        unique_errors = list(dict.fromkeys(validation_errors))
         result = _fail(
             "validation_error",
-            f"Missing required parameters for tool '{tool_name}': {', '.join(missing)}"
+            f"Invalid parameters for tool '{tool_name}': {' '.join(unique_errors)}"
         )
         _log_attempt(
             db, workspace_id, agent_key, tool_name, toolkit,
@@ -457,6 +549,7 @@ def attempt_tool_call(
     # ── Step 5: Check connection (local cache, then remote live check) ───
     requires_auth = tool_entry.get("requires_auth", True)
     conn_info: dict = {}
+    selected_account_id = str(selected_account_id or "")
 
     # Detect retry: if coming from a resume path, force fresh connection check
     is_retry = bool(context_json and context_json.get("is_retry"))
@@ -465,8 +558,14 @@ def attempt_tool_call(
         # Tool does not require dynamic OAuth
         connected = True
     else:
-        local_connection = _get_local_connection(db, workspace_id, toolkit)
-        if local_connection and not is_retry:
+        local_connection = _get_local_connection(db, workspace_id, toolkit, preferred_account_id=selected_account_id)
+        runtime_cache = _get_runtime_connection_cache(context_json)
+        cache_key = f"{toolkit.upper()}::{selected_account_id or '*'}"
+        cached_conn_info = runtime_cache.get(cache_key)
+        if cached_conn_info and not is_retry:
+            conn_info = dict(cached_conn_info)
+            connected = bool(conn_info.get("connected", False))
+        elif local_connection and not is_retry and _is_local_connection_fresh(local_connection):
             conn_info = {
                 "connected": True,
                 "connected_account_id": local_connection.connected_account_id,
@@ -474,18 +573,36 @@ def attempt_tool_call(
                 "error": None,
             }
             connected = True
+            runtime_cache[cache_key] = dict(conn_info)
+            log_event(
+                logger,
+                logging.INFO,
+                "tool.connection_cache_hit",
+                workspace_id=workspace_id,
+                agent_name=agent_key,
+                toolkit=toolkit,
+                tool_name=tool_name,
+            )
         else:
             connected = False
 
-        if is_available():
-            conn_info = check_connection(workspace_id, toolkit, force_refresh=is_retry)
+        if not connected and is_available():
+            conn_info = check_connection(
+                workspace_id,
+                toolkit,
+                force_refresh=is_retry,
+                preferred_account_id=selected_account_id,
+            )
             connected = conn_info.get("connected", False)
+            runtime_cache[cache_key] = dict(conn_info)
             _save_local_connection(
                 db,
                 workspace_id,
                 toolkit,
-                conn_info.get("connected_account_id") or "",
+                conn_info.get("connected_account_id") or selected_account_id or "",
                 status="connected" if connected else conn_info.get("status", "pending"),
+                account_label=str(conn_info.get("account_label", "") or ""),
+                is_default=bool(conn_info.get("is_default", False)),
             )
             if connected:
                 log_event(
@@ -497,7 +614,7 @@ def attempt_tool_call(
                     toolkit=toolkit,
                     tool_name=tool_name,
                 )
-        else:
+        elif not connected:
             # Composio not available — caller should show auth/setup failure,
             # not pretend the tool request succeeded.
             connected = False
@@ -640,7 +757,7 @@ def mark_request_resumed(db: DBSession, resume_token: str) -> None:
         )
         if row:
             row.status = "resumed"
-            row.updated_at = datetime.utcnow()
+            row.updated_at = utc_now()
             db.commit()
     except Exception as exc:
         log_exception(
@@ -665,7 +782,7 @@ def mark_request_completed(db: DBSession, resume_token: str) -> None:
         )
         if row:
             row.status = "completed"
-            row.updated_at = datetime.utcnow()
+            row.updated_at = utc_now()
             db.commit()
     except Exception as exc:
         log_exception(

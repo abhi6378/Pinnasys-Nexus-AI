@@ -8,8 +8,8 @@ Routing priority:
   4. Legacy fallback  — detect_workflow() keyword match → detect_agent() LLM pick
 """
 import json
+import hashlib
 import logging
-import random
 import uuid
 from sqlalchemy.orm import Session
 
@@ -21,6 +21,7 @@ from workflows.engine import run_workflow, WORKFLOWS
 from storage import repositories as repo
 from llm.client import generate_json
 from orchestrator.router import route_request
+from tools.connector_service import normalize_connector_context, validate_connector_context
 from utils.logging_utils import log_event, log_exception, request_context
 
 logger = logging.getLogger(__name__)
@@ -135,13 +136,42 @@ Respond with JSON:
     return None
 
 
+def _sanitize_history_output(text: str) -> str:
+    lowered = str(text or "").lower()
+    if (
+        "needs access to" in lowered
+        or "requested an invalid tool" in lowered
+        or "tried to use" in lowered
+        or lowered.startswith("error:")
+        or "i can't process this request" in lowered
+    ):
+        return ""
+    return str(text or "")
+
+
+def _should_probe_opportunity(
+    workspace_id: str,
+    user_input: str,
+    output: str,
+    *,
+    threshold: float = 0.4,
+) -> bool:
+    if len(output or "") <= 200:
+        return False
+    fingerprint = f"{workspace_id}|{user_input.strip()}|{(output or '')[:300]}"
+    bucket = int(hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:8], 16)
+    return (bucket % 1000) / 1000.0 < threshold
+
+
 # ── Route execution helpers ───────────────────────────────────────────────────
 
 def _exec_single_agent(agent_key: str, user_input: str,
                         brain_context: str,
                         workspace_id: str = "",
                         db: Session = None,
-                        resume_state: dict = None) -> dict:
+                        resume_state: dict = None,
+                        route_context: dict | None = None,
+                        connector_context: dict | None = None) -> dict:
     """Execute a single agent and return a standardised result dict.
 
     When workspace_id and db are provided, the agent runs in tool-aware
@@ -158,7 +188,9 @@ def _exec_single_agent(agent_key: str, user_input: str,
             history = []
             for row in reversed(rows):
                 history.append({"role": "user", "content": row.input})
-                history.append({"role": "assistant", "content": row.output})
+                safe_output = _sanitize_history_output(row.output)
+                if safe_output:
+                    history.append({"role": "assistant", "content": safe_output})
         except Exception as exc:
             log_exception(
                 logger,
@@ -183,6 +215,8 @@ def _exec_single_agent(agent_key: str, user_input: str,
         db=db,
         workflow_state=resume_state,
         history=history,
+        route_context=route_context,
+        connector_context=connector_context,
     )
     log_event(
         logger,
@@ -264,18 +298,22 @@ def _exec_single_agent(agent_key: str, user_input: str,
     tool_used = agent_result.get("tool_used")
     if tool_used:
         result["tool_used"] = tool_used
+    if agent_result.get("tool_output") is not None:
+        result["tool_output"] = agent_result.get("tool_output")
 
     return result
 
 
 def _exec_workflow(workflow_key: str, user_input: str,
                     brain_context: str, workspace_id: str,
-                    db: Session, resume_state: dict = None) -> dict:
+                    db: Session, resume_state: dict = None,
+                    connector_context: dict | None = None) -> dict:
     """Execute a workflow chain and return a standardised result dict."""
     wf_result = run_workflow(
         workflow_key, user_input, brain_context,
         workspace_id=workspace_id, db=db,
-        resume_state=resume_state
+        resume_state=resume_state,
+        connector_context=connector_context,
     )
 
     # ── Handle workflow interrupt (connect_required or validation_error) ──
@@ -359,13 +397,14 @@ def _exec_reject(reason: str) -> dict:
 
 def _auto_route(user_input: str, workspace_id: str, db: Session,
                 brain_context: str,
-                resume_state: dict = None) -> dict:
+                resume_state: dict = None,
+                connector_context: dict | None = None) -> dict:
     """
     Primary auto-routing path. Tries the LLM router first; falls back to
     legacy keyword → LLM detection if the router fails.
     """
     # ── Try the central LLM router ────────────────────────────────────────
-    route = route_request(user_input, workspace_id, db, brain_context)
+    route = route_request(user_input, workspace_id, db, brain_context, connector_context=connector_context)
 
     if route:
         log_event(
@@ -386,6 +425,8 @@ def _auto_route(user_input: str, workspace_id: str, db: Session,
                 route["selected_agent"], user_input, brain_context,
                 workspace_id=workspace_id, db=db,
                 resume_state=resume_state,
+                route_context=route,
+                connector_context=connector_context,
             )
 
         if route_type == "workflow":
@@ -394,6 +435,7 @@ def _auto_route(user_input: str, workspace_id: str, db: Session,
                 return _exec_workflow(
                     wf_key, user_input, brain_context, workspace_id, db,
                     resume_state=resume_state,
+                    connector_context=connector_context,
                 )
             # Router returned a workflow type but no valid key — fall through
             # to legacy detection which may find the right workflow.
@@ -426,6 +468,7 @@ def _auto_route(user_input: str, workspace_id: str, db: Session,
         return _exec_workflow(
             workflow_key, user_input, brain_context, workspace_id, db,
             resume_state=resume_state,
+            connector_context=connector_context,
         )
 
     agent_key = detect_agent(user_input)
@@ -443,6 +486,7 @@ def _auto_route(user_input: str, workspace_id: str, db: Session,
         agent_key, user_input, brain_context,
         workspace_id=workspace_id, db=db,
         resume_state=resume_state,
+        connector_context=connector_context,
     )
 
 
@@ -451,7 +495,8 @@ def _auto_route(user_input: str, workspace_id: str, db: Session,
 def handle_request(user_input: str, workspace_id: str, db: Session,
                    force_agent: str = None,
                    force_workflow: str = None,
-                   resume_state: dict = None) -> dict:
+                   resume_state: dict = None,
+                   connector_context: dict | None = None) -> dict:
     """
     Main orchestrator function. Called by API and UI.
 
@@ -481,6 +526,8 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
         local_resume_state["request_id"] = request_id
 
     with request_context(request_id=request_id, workspace_id=workspace_id):
+        request_cache: dict[str, object] = {}
+        normalized_connector = normalize_connector_context(connector_context)
         log_event(
             logger,
             logging.INFO,
@@ -489,7 +536,27 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
             forced_agent=force_agent or "",
             workflow_name=force_workflow or "",
             is_resume=bool(resume_state),
+            selected_toolkit=normalized_connector.selected_toolkit,
+            connector_mode=normalized_connector.mode,
         )
+
+        normalized_connector, connector_status, connector_error = validate_connector_context(
+            normalized_connector,
+            workspace_id,
+            db,
+            request_cache=request_cache,
+        )
+        if connector_error:
+            return {
+                "mode": "validation_error",
+                "agent": "system",
+                "output": connector_error,
+                "steps": [],
+                "error": True,
+                "idea": None,
+                "connector_context": normalized_connector.to_dict(),
+                "connector_status": connector_status.to_dict(),
+            }
 
         # 1. Load Brain AI context
         brain = BrainAI(workspace_id, db)
@@ -501,11 +568,13 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
                 force_agent, user_input, brain_context,
                 workspace_id=workspace_id, db=db,
                 resume_state=local_resume_state,
+                connector_context=normalized_connector.to_dict(),
             )
         elif force_workflow and force_workflow in WORKFLOWS:
             result = _exec_workflow(
                 force_workflow, user_input, brain_context, workspace_id, db,
-                resume_state=local_resume_state
+                resume_state=local_resume_state,
+                connector_context=normalized_connector.to_dict(),
             )
         else:
             result = _auto_route(
@@ -514,6 +583,7 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
                 db,
                 brain_context,
                 resume_state=local_resume_state,
+                connector_context=normalized_connector.to_dict(),
             )
 
         # 3. Save conversation — always, including on workflow error / clarify / reject,
@@ -533,14 +603,32 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
             "tool_error",
         )
         if not is_error and not is_special:
-            extract_and_save(workspace_id, result["output"], db)
+            extract_and_save(
+                workspace_id,
+                result["output"],
+                db,
+                user_input=user_input,
+                assistant_output=result["output"],
+                agent_key=result.get("agent", ""),
+                workflow_name=result.get("workflow", ""),
+                workflow_steps=result.get("steps", []),
+                tool_used=result.get("tool_used", ""),
+                tool_output=result.get("tool_output"),
+                toolkit=result.get("toolkit", ""),
+                source_kind="workflow_output" if result.get("mode") == "workflow" else "assistant_output",
+                route_context={
+                    "mode": result.get("mode", ""),
+                    "workflow_resumed": bool(local_resume_state),
+                    "connector_context": normalized_connector.to_dict(),
+                },
+            )
 
         # 5. Check for Ideas Inbox opportunity — skip on error / clarify / reject.
         if not is_error and not is_special:
-            should_probe = (
-                result.get("mode") in ("single",)
-                and len(result.get("output", "")) > 200
-                and random.random() < 0.4
+            should_probe = result.get("mode") in ("single",) and _should_probe_opportunity(
+                workspace_id,
+                user_input,
+                result.get("output", ""),
             )
             opportunity = detect_opportunity(result["output"], brain_context) if should_probe else None
             if opportunity:
@@ -567,6 +655,8 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
             result["workflow_resumed"] = True
         if local_resume_state and result.get("mode") == "single":
             result["workflow_resumed"] = bool(local_resume_state.get("workflow_key"))
+        result["connector_context"] = normalized_connector.to_dict()
+        result["connector_status"] = connector_status.to_dict()
 
         log_event(
             logger,

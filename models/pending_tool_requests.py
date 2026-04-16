@@ -17,10 +17,10 @@ Statuses:
   expired    — timed out / user never completed auth
   cancelled  — user explicitly cancelled
 """
-from datetime import datetime
 from sqlalchemy import Column, String, Text, DateTime, JSON
 
 from storage.db import Base, new_id
+from utils.time_utils import utc_now
 
 
 class PendingToolRequestModel(Base):
@@ -36,8 +36,8 @@ class PendingToolRequestModel(Base):
     resume_token     = Column(String,   nullable=False, unique=True, index=True)
     status           = Column(String,   nullable=False, default="pending")
     context_json     = Column(JSON,     default=dict)        # brain_context snapshot, etc.
-    created_at       = Column(DateTime, default=datetime.utcnow)
-    updated_at       = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at       = Column(DateTime, default=utc_now)
+    updated_at       = Column(DateTime, default=utc_now, onupdate=utc_now)
 
     def __repr__(self):
         return (

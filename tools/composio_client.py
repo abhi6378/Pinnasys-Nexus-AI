@@ -22,7 +22,7 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 
-from tools.tool_registry import get_toolkit_app_enum, get_toolkit_slug
+from tools.tool_registry import get_toolkit_app_enum, get_toolkit_runtime_config, get_toolkit_slug
 
 load_dotenv()
 
@@ -40,6 +40,7 @@ _api_key = ""
 _clients: dict[str, Any] = {}
 # A default (entity-less) Composio client for catalog / admin operations.
 _default_client: Any = None
+_schema_cache: dict[tuple[str, str], dict] = {}
 
 
 def _entity_id(workspace_id: str) -> str:
@@ -190,6 +191,9 @@ def _get_client(user_id: str = "", force_refresh: bool = False) -> Any | None:
 def invalidate_session(user_id: str) -> None:
     """Backward-compatible cache invalidation helper."""
     _clients.pop(_entity_id(user_id), None)
+    stale_keys = [cache_key for cache_key in _schema_cache if cache_key[0] == _entity_id(user_id)]
+    for cache_key in stale_keys:
+        _schema_cache.pop(cache_key, None)
 
 
 def get_session(user_id: str, force_refresh: bool = False) -> Any | None:
@@ -308,6 +312,7 @@ def get_toolkit_auth_details(toolkit: str) -> dict:
     toolkit_slug = get_toolkit_slug(toolkit)
     app_name = get_toolkit_app_enum(toolkit)
     available = is_available()
+    toolkit_config = get_toolkit_runtime_config(toolkit)
 
     if not available:
         return {
@@ -318,8 +323,8 @@ def get_toolkit_auth_details(toolkit: str) -> dict:
             "auth_config_count": 0,
             "has_usable_auth_config": False,
             "preferred_auth_config_id": None,
-            "reason": _import_error or "Composio client not available",
-            "error": _import_error or "Composio client not available",
+            "reason": _import_error or str(toolkit_config.get("setup_message") or "Composio client not available"),
+            "error": _import_error or str(toolkit_config.get("setup_message") or "Composio client not available"),
         }
 
     if not toolkit_slug or not app_name:
@@ -339,17 +344,85 @@ def get_toolkit_auth_details(toolkit: str) -> dict:
     return {
         "available": True,
         "toolkit_slug": toolkit_slug,
-        "managed_auth_available": True,
+        "managed_auth_available": toolkit_config.get("connection_mode", "managed_account") == "managed_account",
         "supported_auth_schemes": [],
         "auth_config_count": 1,
         "has_usable_auth_config": True,
         "preferred_auth_config_id": None,
-        "reason": "Connection flow available.",
+        "reason": str(toolkit_config.get("setup_message") or "Connection flow available."),
         "error": None,
     }
 
 
-def check_connection(user_id: str, toolkit: str, force_refresh: bool = False) -> dict:
+def list_connected_accounts(user_id: str, toolkit: str = "", force_refresh: bool = False) -> list[dict]:
+    if not is_available():
+        return []
+
+    toolkit_slug = get_toolkit_slug(toolkit) if toolkit else ""
+    client = _get_client(user_id, force_refresh=force_refresh)
+    if client is None:
+        return []
+
+    entity_id = _entity_id(user_id)
+    try:
+        low_level = client.client.connected_accounts
+        try:
+            if toolkit_slug:
+                response = low_level.list(user_ids=[entity_id], toolkit_slugs=[toolkit_slug])
+            else:
+                response = low_level.list(user_ids=[entity_id])
+        except TypeError:
+            response = low_level.list()
+        connections = _coerce_sequence(response)
+        normalized: list[dict] = []
+        for connection in connections:
+            raw_toolkit = getattr(connection, "toolkit", None)
+            toolkit_name = ""
+            if raw_toolkit is not None:
+                toolkit_name = str(getattr(raw_toolkit, "slug", raw_toolkit) or "").lower()
+            if not toolkit_name:
+                toolkit_name = str(
+                    getattr(connection, "appName", "")
+                    or getattr(connection, "toolkit_slug", "")
+                    or ""
+                ).lower()
+            if toolkit_slug and toolkit_name and toolkit_name != toolkit_slug:
+                continue
+            status = str(getattr(connection, "status", "") or "").upper()
+            account_id = (
+                getattr(connection, "id", None)
+                or getattr(connection, "connectedAccountId", None)
+                or getattr(connection, "connected_account_id", None)
+            )
+            normalized.append(
+                {
+                    "connected_account_id": str(account_id or ""),
+                    "toolkit_slug": toolkit_name,
+                    "status": "connected" if status == "ACTIVE" else status.lower() or "unknown",
+                    "account_alias": str(
+                        getattr(connection, "name", None)
+                        or getattr(connection, "email", None)
+                        or getattr(connection, "clientUniqueUserId", None)
+                        or account_id
+                        or ""
+                    ),
+                }
+            )
+        return normalized
+    except Exception as exc:
+        logger.error(
+            "list_connected_accounts failed for user_id=%s toolkit=%s: %s",
+            user_id, toolkit, exc,
+        )
+        return []
+
+
+def check_connection(
+    user_id: str,
+    toolkit: str,
+    force_refresh: bool = False,
+    preferred_account_id: str = "",
+) -> dict:
     """
     Check whether a workspace has an ACTIVE connection for the requested toolkit.
 
@@ -426,15 +499,34 @@ def check_connection(user_id: str, toolkit: str, force_refresh: bool = False) ->
                 or getattr(connection, "connectedAccountId", None)
                 or getattr(connection, "connected_account_id", None)
             )
+            if preferred_account_id and str(account_id or "") != str(preferred_account_id):
+                continue
             if status == "ACTIVE":
+                account_label = str(
+                    getattr(connection, "name", None)
+                    or getattr(connection, "email", None)
+                    or getattr(connection, "clientUniqueUserId", None)
+                    or account_id
+                    or ""
+                )
                 return {
                     "connected": True,
                     "connected_account_id": str(account_id) if account_id else "active",
+                    "account_label": account_label,
+                    "is_default": not preferred_account_id,
                     "status": "connected",
                     "error": None,
                 }
             # Don't return early on non-ACTIVE connections — keep scanning
             # in case a later connection IS active.
+
+        if preferred_account_id:
+            return {
+                "connected": False,
+                "connected_account_id": None,
+                "status": "not_found",
+                "error": f"Selected account '{preferred_account_id}' is not connected.",
+            }
 
         return {
             "connected": False,
@@ -464,6 +556,11 @@ def get_connect_link(user_id: str, toolkit: str, callback_url: str = "") -> Opti
     """
     if not is_available():
         logger.warning("Cannot generate connect link; Composio is unavailable.")
+        return None
+
+    toolkit_config = get_toolkit_runtime_config(toolkit)
+    if toolkit_config.get("connection_mode") == "custom_key":
+        logger.warning("Cannot generate OAuth connect link for custom-key toolkit=%s", toolkit)
         return None
 
     toolkit_slug = _resolve_app(toolkit)
@@ -539,11 +636,39 @@ def get_tool_schemas(user_id: str, tool_names: list[str] | None = None) -> list[
         for tool in tools:
             normalized = _normalize_sdk_payload(tool)
             if isinstance(normalized, dict):
+                tool_name = str(
+                    normalized.get("function", {}).get("name")
+                    or normalized.get("name")
+                    or normalized.get("slug")
+                    or ""
+                )
+                if tool_name:
+                    _schema_cache[(entity_id, tool_name)] = normalized
                 schemas.append(normalized)
         return schemas
     except Exception as exc:
         logger.error("get_tool_schemas failed for user_id=%s: %s", user_id, exc)
         return []
+
+
+def get_live_tool_schema(user_id: str, tool_name: str, force_refresh: bool = False) -> dict:
+    if not tool_name:
+        return {}
+    entity_id = _entity_id(user_id or "__catalog__")
+    cache_key = (entity_id, tool_name)
+    if not force_refresh and cache_key in _schema_cache:
+        return dict(_schema_cache[cache_key])
+    schemas = get_tool_schemas(user_id or "__catalog__", [tool_name])
+    for schema in schemas:
+        schema_name = str(
+            schema.get("function", {}).get("name")
+            or schema.get("name")
+            or schema.get("slug")
+            or ""
+        )
+        if schema_name == tool_name:
+            return dict(schema)
+    return {}
 
 
 def validate_tool_slug(tool_name: str) -> dict:

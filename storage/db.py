@@ -3,13 +3,13 @@ storage/db.py  —  SQLAlchemy ORM models + engine setup
 """
 import os
 import uuid
-from datetime import datetime
 
 from sqlalchemy import (
-    create_engine, Column, String, Text, DateTime, JSON
+    create_engine, Column, String, Text, DateTime, JSON, Float, Integer, Boolean, text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 from dotenv import load_dotenv
+from utils.time_utils import utc_now
 
 load_dotenv()
 
@@ -37,7 +37,7 @@ class WorkspaceModel(Base):
     __tablename__ = "workspaces"
     id         = Column(String, primary_key=True, default=new_id)
     name       = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
 
 
 class BrainProfileModel(Base):
@@ -52,7 +52,7 @@ class BrainProfileModel(Base):
     pricing       = Column(Text,    default="")
     competitors   = Column(Text,    default="")
     support_style = Column(String,  default="")
-    updated_at    = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at    = Column(DateTime, default=utc_now, onupdate=utc_now)
 
 
 class KnowledgeItemModel(Base):
@@ -63,7 +63,7 @@ class KnowledgeItemModel(Base):
     title        = Column(String, default="")
     content      = Column(Text,   nullable=False)
     tags         = Column(JSON,   default=list)
-    created_at   = Column(DateTime, default=datetime.utcnow)
+    created_at   = Column(DateTime, default=utc_now)
 
 
 class QuizAnswerModel(Base):
@@ -73,7 +73,7 @@ class QuizAnswerModel(Base):
     question     = Column(Text,   nullable=False)
     answer       = Column(Text,   nullable=False)
     category     = Column(String, default="general")
-    created_at   = Column(DateTime, default=datetime.utcnow)
+    created_at   = Column(DateTime, default=utc_now)
 
 
 class ConversationModel(Base):
@@ -83,7 +83,7 @@ class ConversationModel(Base):
     helper       = Column(String, nullable=False)
     input        = Column(Text,   nullable=False)
     output       = Column(Text,   nullable=False)
-    created_at   = Column(DateTime, default=datetime.utcnow)
+    created_at   = Column(DateTime, default=utc_now)
 
 
 class WorkflowRunModel(Base):
@@ -93,7 +93,7 @@ class WorkflowRunModel(Base):
     workflow_name = Column(String, nullable=False)
     steps         = Column(JSON,   default=list)
     final_output  = Column(Text,   default="")
-    created_at    = Column(DateTime, default=datetime.utcnow)
+    created_at    = Column(DateTime, default=utc_now)
 
 
 class IdeaModel(Base):
@@ -105,7 +105,83 @@ class IdeaModel(Base):
     source_agent = Column(String, default="system")
     status       = Column(String, default="pending")   # pending | accepted | rejected
     workflow_hint = Column(String, default="")
-    created_at   = Column(DateTime, default=datetime.utcnow)
+    created_at   = Column(DateTime, default=utc_now)
+
+
+class MemoryRecordModel(Base):
+    __tablename__ = "memory_records"
+    id                  = Column(String, primary_key=True, default=new_id)
+    workspace_id        = Column(String, nullable=False)
+    memory_type         = Column(String, nullable=False, default="semantic_fact")
+    title               = Column(String, default="")
+    content             = Column(Text, default="")
+    summary             = Column(Text, default="")
+    source_kind         = Column(String, default="")
+    source_reference_id = Column(String, default="")
+    tags                = Column(JSON, default=list)
+    entity_tags         = Column(JSON, default=list)
+    tool_tags           = Column(JSON, default=list)
+    importance_score    = Column(Float, default=0.5)
+    confidence_score    = Column(Float, default=0.5)
+    access_count        = Column(Integer, default=0)
+    last_accessed_at    = Column(DateTime, default=utc_now)
+    pinned              = Column(Boolean, default=False)
+    canonical_key       = Column(String, default="")
+    superseded_by       = Column(String, default="")
+    metadata_json       = Column(JSON, default=dict)
+    created_at          = Column(DateTime, default=utc_now)
+    updated_at          = Column(DateTime, default=utc_now, onupdate=utc_now)
+
+
+class WorkingMemoryStateModel(Base):
+    __tablename__ = "working_memory_states"
+    workspace_id            = Column(String, primary_key=True)
+    current_goal            = Column(Text, default="")
+    active_tasks            = Column(JSON, default=list)
+    open_questions          = Column(JSON, default=list)
+    current_draft_summary   = Column(Text, default="")
+    recent_tool_summary     = Column(Text, default="")
+    latest_workflow_summary = Column(Text, default="")
+    project_focus           = Column(Text, default="")
+    state_json              = Column(JSON, default=dict)
+    updated_at              = Column(DateTime, default=utc_now, onupdate=utc_now)
+
+
+class MemoryEmbeddingModel(Base):
+    __tablename__ = "memory_embeddings"
+    id               = Column(String, primary_key=True, default=new_id)
+    workspace_id     = Column(String, nullable=False)
+    memory_record_id = Column(String, nullable=False)
+    model_name       = Column(String, default="")
+    content_hash     = Column(String, default="")
+    vector_json      = Column(JSON, default=list)
+    dimensions       = Column(Integer, default=0)
+    created_at       = Column(DateTime, default=utc_now)
+    updated_at       = Column(DateTime, default=utc_now, onupdate=utc_now)
+
+
+class WorkspaceConnectorPreferenceModel(Base):
+    __tablename__ = "workspace_connector_preferences"
+    workspace_id           = Column(String, primary_key=True)
+    mode                   = Column(String, default="auto")
+    selected_toolkit       = Column(String, default="")
+    selected_account_id    = Column(String, default="")
+    selected_account_alias = Column(String, default="")
+    source                 = Column(String, default="persisted_default")
+    created_at             = Column(DateTime, default=utc_now)
+    updated_at             = Column(DateTime, default=utc_now, onupdate=utc_now)
+
+
+def _ensure_additive_connector_columns() -> None:
+    statements = [
+        "ALTER TABLE tool_connections ADD COLUMN IF NOT EXISTS account_label VARCHAR DEFAULT ''",
+        "ALTER TABLE tool_connections ADD COLUMN IF NOT EXISTS is_default BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE tool_connections ADD COLUMN IF NOT EXISTS last_verified_at TIMESTAMP NULL",
+        "ALTER TABLE tool_connections ADD COLUMN IF NOT EXISTS status_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+    ]
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
 
 
 
@@ -118,6 +194,7 @@ def init_db():
     from models.pending_tool_requests import PendingToolRequestModel  # noqa: F401
     from models.tool_call_logs import ToolCallLogModel                # noqa: F401
     Base.metadata.create_all(bind=engine)
+    _ensure_additive_connector_columns()
 
 
 def get_db():

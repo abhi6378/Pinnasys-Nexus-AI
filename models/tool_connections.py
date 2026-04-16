@@ -24,10 +24,10 @@ Columns:
   created_at           — Row creation timestamp
   updated_at           — Last status/metadata change
 """
-from datetime import datetime
-from sqlalchemy import Column, String, Text, DateTime, JSON
+from sqlalchemy import Boolean, Column, String, DateTime, JSON
 
 from storage.db import Base, new_id
+from utils.time_utils import utc_now
 
 
 class ToolConnectionModel(Base):
@@ -40,10 +40,14 @@ class ToolConnectionModel(Base):
     toolkit              = Column(String, nullable=False, index=True)  # e.g. GMAIL
     status               = Column(String, nullable=False, default="pending")
     connected_account_id = Column(String, default="")
+    account_label        = Column(String, default="")
+    is_default           = Column(Boolean, default=False)
     auth_mode            = Column(String, default="oauth2")         # oauth2 | api_key | jwt | none
     metadata_json        = Column(JSON,   default=dict)
-    created_at           = Column(DateTime, default=datetime.utcnow)
-    updated_at           = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_verified_at     = Column(DateTime, nullable=True)
+    status_updated_at    = Column(DateTime, default=utc_now, onupdate=utc_now)
+    created_at           = Column(DateTime, default=utc_now)
+    updated_at           = Column(DateTime, default=utc_now, onupdate=utc_now)
 
     def __repr__(self):
         return (

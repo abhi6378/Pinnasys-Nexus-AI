@@ -15,6 +15,8 @@ from storage import repositories as repo
 from orchestrator.handler import handle_request
 from helpers.configs import list_agents, AGENTS
 from brain.quiz_engine import get_next_question, save_answer, quiz_progress
+from tools.connector_service import list_workspace_connectors, persist_connector_context
+from ui.connector_state import build_connector_context, ensure_connector_state, set_connector_selection
 
 
 # ── Toolkit display helpers ───────────────────────────────────────────────────
@@ -252,10 +254,138 @@ def _render_workflow_state(msg: dict):
         st.success("Workflow resumed from the last completed step.")
 
 
+def _render_connector_controls(workspace_id: str, db) -> dict:
+    """Render the chat-scoped connector selector and return the active context."""
+    ensure_connector_state(st.session_state)
+    current = build_connector_context(st.session_state)
+    current_toolkit = str(current.get("selected_toolkit", "") or "")
+    current_account_id = str(current.get("selected_account_id", "") or "")
+    current_account_alias = str(current.get("selected_account_alias", "") or "")
+    connector_rows = list_workspace_connectors(
+        workspace_id,
+        db,
+        selected_toolkit=current_toolkit,
+        include_connect_url=True,
+    )
+    connector_map = {row["toolkit"]: row for row in connector_rows}
+
+    connector_options = ["AUTO"] + [row["toolkit"] for row in connector_rows]
+    current_option = current_toolkit if current_toolkit in connector_map else "AUTO"
+    selected_connector = st.selectbox(
+        "Connector scope",
+        options=connector_options,
+        index=connector_options.index(current_option),
+        format_func=lambda value: (
+            "Auto"
+            if value == "AUTO"
+            else connector_map[value]["label"]
+        ),
+        key="chat_connector_scope",
+    )
+
+    if selected_connector == "AUTO":
+        if current_toolkit:
+            set_connector_selection(st.session_state, mode="auto", source="chat_input")
+            persist_connector_context(workspace_id, st.session_state.connector_context, db)
+            st.rerun()
+        st.caption("Auto keeps the existing capability-first routing behavior.")
+        return build_connector_context(st.session_state)
+
+    selected_row = connector_map[selected_connector]
+    accounts = selected_row.get("accounts", [])
+    if current_toolkit != selected_connector:
+        default_account = accounts[0] if len(accounts) == 1 else {}
+        set_connector_selection(
+            st.session_state,
+            mode="manual",
+            selected_toolkit=selected_connector,
+            selected_account_id=str(default_account.get("connected_account_id", "") or ""),
+            selected_account_alias=str(default_account.get("account_alias", "") or ""),
+            source="chat_input",
+        )
+        persist_connector_context(workspace_id, st.session_state.connector_context, db)
+        st.rerun()
+
+    state_col, account_col = st.columns([1, 1.2])
+    with state_col:
+        if selected_row.get("connected"):
+            status = "Connected"
+            if selected_row.get("account_count", 0) > 1:
+                status = f"Connected · {selected_row['account_count']} accounts"
+            st.success(f"{selected_row['label']} · {status}")
+        else:
+            st.warning(f"{selected_row['label']} is not connected.")
+            if selected_row.get("connect_url"):
+                st.link_button(
+                    f"Connect {selected_row['label']}",
+                    selected_row["connect_url"],
+                    use_container_width=True,
+                )
+
+    with account_col:
+        if accounts:
+            account_ids = [str(account.get("connected_account_id", "") or "") for account in accounts]
+            if len(accounts) == 1 and not current_account_id:
+                only_account = accounts[0]
+                set_connector_selection(
+                    st.session_state,
+                    mode="manual",
+                    selected_toolkit=selected_connector,
+                    selected_account_id=str(only_account.get("connected_account_id", "") or ""),
+                    selected_account_alias=str(only_account.get("account_alias", "") or ""),
+                    source="chat_input",
+                )
+                persist_connector_context(workspace_id, st.session_state.connector_context, db)
+                st.rerun()
+            selected_account = st.selectbox(
+                f"{selected_row['label']} account",
+                options=account_ids,
+                index=account_ids.index(current_account_id) if current_account_id in account_ids else 0,
+                format_func=lambda value: next(
+                    (
+                        str(account.get("account_alias", "") or value)
+                        for account in accounts
+                        if str(account.get("connected_account_id", "") or "") == value
+                    ),
+                    value or "Connected account",
+                ),
+                key=f"chat_connector_account_{selected_connector}",
+            )
+            if selected_account != current_account_id:
+                selected_account_row = next(
+                    (
+                        account
+                        for account in accounts
+                        if str(account.get("connected_account_id", "") or "") == selected_account
+                    ),
+                    {},
+                )
+                set_connector_selection(
+                    st.session_state,
+                    mode="manual",
+                    selected_toolkit=selected_connector,
+                    selected_account_id=selected_account,
+                    selected_account_alias=str(selected_account_row.get("account_alias", "") or ""),
+                    source="chat_input",
+                )
+                persist_connector_context(workspace_id, st.session_state.connector_context, db)
+                st.rerun()
+        else:
+            st.caption("No connected accounts available yet.")
+
+    selected_label = current_account_alias or current_account_id or "Any connected account"
+    st.caption(
+        f"Manual mode is active. Execution is constrained to **{selected_row['label']}**"
+        f" and account **{selected_label}**."
+    )
+    return build_connector_context(st.session_state)
+
+
 # ── Main page render ──────────────────────────────────────────────────────────
 
 def render_chat():
     ws_id = st.session_state.workspace_id
+    ensure_connector_state(st.session_state)
 
     st.markdown(f"## 💬 Chat — {st.session_state.workspace_name}")
 
@@ -451,6 +581,7 @@ def render_chat():
                         mark_request_resumed(db, resume_token)
                         context = pending.context_json or {}
                         workflow_key = context.get("workflow_key")
+                        retry_connector_context = context.get("connector_context") or build_connector_context(st.session_state)
                         result = handle_request(
                             pending.original_input,
                             ws_id,
@@ -458,6 +589,7 @@ def render_chat():
                             force_agent=pending.agent_key if (pending.agent_key and not workflow_key) else None,
                             force_workflow=workflow_key,
                             resume_state=context,
+                            connector_context=retry_connector_context,
                         )
                         if result.get("mode") not in {
                             "connect_required", "auth_unavailable", "invalid_tool",
@@ -469,20 +601,26 @@ def render_chat():
                             retry_input,
                             ws_id,
                             db,
-                            force_agent=st.session_state.selected_agent
+                            force_agent=st.session_state.selected_agent,
+                            connector_context=build_connector_context(st.session_state),
                         )
                 else:
                     result = handle_request(
                         retry_input,
                         ws_id,
                         db,
-                        force_agent=st.session_state.selected_agent
+                        force_agent=st.session_state.selected_agent,
+                        connector_context=build_connector_context(st.session_state),
                     )
 
+            if result.get("connector_context"):
+                st.session_state.connector_context = result["connector_context"]
             _append_result_to_history(result, original_input=retry_input)
             st.rerun()
 
         # ── Input ─────────────────────────────────────────────────────────────
+        st.markdown("---")
+        connector_context = _render_connector_controls(ws_id, db)
         user_input = st.chat_input("Ask anything... (e.g. 'Write a product description' or 'Create a marketing campaign')")
 
         if user_input:
@@ -507,9 +645,12 @@ def render_chat():
                     user_input,
                     ws_id,
                     db,
-                    force_agent=selected
+                    force_agent=selected,
+                    connector_context=connector_context,
                 )
 
+            if result.get("connector_context"):
+                st.session_state.connector_context = result["connector_context"]
             _append_result_to_history(result, original_input=user_input)
             st.rerun()
 

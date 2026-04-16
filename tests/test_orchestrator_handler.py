@@ -5,6 +5,80 @@ from tests.support import Spy, import_fresh, make_module, make_sqlalchemy_stubs,
 
 
 def load_handler_module():
+    class StubConnectorContext:
+        def __init__(
+            self,
+            mode="auto",
+            selected_toolkit="",
+            selected_account_id="",
+            selected_account_alias="",
+            validation_status="ok",
+            connected=False,
+            available_account_count=0,
+            effective_account_id="",
+            effective_account_alias="",
+        ):
+            self.mode = mode
+            self.selected_toolkit = selected_toolkit
+            self.selected_account_id = selected_account_id
+            self.selected_account_alias = selected_account_alias
+            self.validation_status = validation_status
+            self.connected = connected
+            self.available_account_count = available_account_count
+            self.effective_account_id = effective_account_id
+            self.effective_account_alias = effective_account_alias
+
+        def to_dict(self):
+            return {
+                "mode": self.mode,
+                "selected_toolkit": self.selected_toolkit,
+                "selected_connector_key": self.selected_toolkit,
+                "selected_account_id": self.selected_account_id,
+                "selected_account_alias": self.selected_account_alias,
+                "enforce_toolkit": bool(self.selected_toolkit and self.mode == "manual"),
+                "enforce_account": bool(self.selected_account_id),
+                "source": "system_inferred",
+                "display_label": self.selected_toolkit.title(),
+                "validation_status": self.validation_status,
+                "stale_selection": False,
+                "status_reason": "",
+                "available_account_count": self.available_account_count,
+                "effective_account_id": self.effective_account_id,
+                "effective_account_alias": self.effective_account_alias,
+                "connected": self.connected,
+            }
+
+    class StubConnectorStatus:
+        def __init__(self, validation_status="ok"):
+            self.validation_status = validation_status
+
+        def to_dict(self):
+            return {
+                "toolkit": "",
+                "connector_key": "",
+                "label": "",
+                "slug": "",
+                "connected": False,
+                "status": "unknown",
+                "source": "local_cache",
+                "validation_status": self.validation_status,
+                "status_reason": "",
+                "stale": False,
+                "stale_selection": False,
+                "account_required": False,
+                "account_count": 0,
+                "selected_account_id": "",
+                "selected_account_alias": "",
+                "effective_account_id": "",
+                "effective_account_alias": "",
+                "connect_url": None,
+                "setup_message": "",
+                "connection_mode": "",
+                "auth_mode": "",
+                "last_verified_at": "",
+                "accounts": [],
+            }
+
     stubs = {}
     stubs.update(make_sqlalchemy_stubs())
     stubs["brain.brain_ai"] = make_module(
@@ -20,7 +94,7 @@ def load_handler_module():
     )
     stubs["brain.memory_extractor"] = make_module(
         "brain.memory_extractor",
-        extract_and_save=lambda workspace_id, content, db: None,
+        extract_and_save=lambda workspace_id, content, db, **kwargs: None,
     )
     stubs["helpers.executor"] = make_module(
         "helpers.executor",
@@ -52,6 +126,19 @@ def load_handler_module():
     stubs["orchestrator.router"] = make_module(
         "orchestrator.router",
         route_request=lambda *args, **kwargs: None,
+    )
+    stubs["tools.connector_service"] = make_module(
+        "tools.connector_service",
+        normalize_connector_context=lambda value=None: StubConnectorContext(
+            mode=str((value or {}).get("mode", "auto") or "auto"),
+            selected_toolkit=str((value or {}).get("selected_toolkit", "") or ""),
+            selected_account_id=str((value or {}).get("selected_account_id", "") or ""),
+        ),
+        validate_connector_context=lambda connector, workspace_id, db, **kwargs: (
+            connector,
+            StubConnectorStatus(),
+            "",
+        ),
     )
     return import_fresh("orchestrator.handler", stubs)
 
@@ -207,7 +294,7 @@ class HandleRequestTests(unittest.TestCase):
             "output": long_output,
             "steps": [],
         })), \
-             patch_attr(self.handler.random, "random", Spy(return_value=0.1)), \
+             patch_attr(self.handler, "_should_probe_opportunity", Spy(return_value=True)), \
              patch_attr(self.handler, "detect_opportunity", Spy(return_value={
                  "title": "Follow up",
                  "description": "Send a campaign",
@@ -218,6 +305,24 @@ class HandleRequestTests(unittest.TestCase):
 
         self.assertEqual(result["idea"]["id"], "idea-1")
         self.assertEqual(len(repo.push_idea.calls), 1)
+
+    def test_should_probe_opportunity_is_deterministic_for_same_input(self):
+        output = "x" * 250
+
+        first = self.handler._should_probe_opportunity("ws1", "hello", output)
+        second = self.handler._should_probe_opportunity("ws1", "hello", output)
+
+        self.assertEqual(first, second)
+
+    def test_sanitize_history_output_filters_tool_and_error_noise(self):
+        self.assertEqual(
+            self.handler._sanitize_history_output("Assistant needs access to Gmail to continue."),
+            "",
+        )
+        self.assertEqual(
+            self.handler._sanitize_history_output("Here is the clean summary."),
+            "Here is the clean summary.",
+        )
 
     def test_handle_request_marks_single_result_as_resumed_when_resume_state_has_workflow_key(self):
         self.handler.repo.save_conversation = Spy()
@@ -238,3 +343,69 @@ class HandleRequestTests(unittest.TestCase):
             )
 
         self.assertTrue(result["workflow_resumed"])
+
+    def test_handle_request_passes_connector_context_to_agent_execution(self):
+        self.handler.repo.save_conversation = Spy()
+        exec_single = Spy(return_value={
+            "mode": "single",
+            "agent": "assistant",
+            "output": "done",
+            "steps": [],
+        })
+        with patch_attr(self.handler, "_exec_single_agent", exec_single), \
+             patch_attr(self.handler, "extract_and_save", Spy()), \
+             patch_attr(self.handler, "detect_opportunity", Spy(return_value=None)):
+            self.handler.handle_request(
+                "hello",
+                "ws1",
+                object(),
+                force_agent="assistant",
+                connector_context={"mode": "manual", "selected_toolkit": "HUBSPOT"},
+            )
+
+        self.assertEqual(
+            exec_single.calls[0][1]["connector_context"],
+            {
+                "mode": "manual",
+                "selected_toolkit": "HUBSPOT",
+                "selected_connector_key": "HUBSPOT",
+                "selected_account_id": "",
+                "selected_account_alias": "",
+                "enforce_toolkit": True,
+                "enforce_account": False,
+                "source": "system_inferred",
+                "display_label": "Hubspot",
+                "validation_status": "ok",
+                "stale_selection": False,
+                "status_reason": "",
+                "available_account_count": 0,
+                "effective_account_id": "",
+                "effective_account_alias": "",
+                "connected": False,
+            },
+        )
+
+    def test_handle_request_returns_validation_error_for_invalid_connector_selection(self):
+        self.handler.repo.save_conversation = Spy()
+        with patch_attr(
+            self.handler,
+            "validate_connector_context",
+            Spy(
+                return_value=(
+                    SimpleNamespace(to_dict=lambda: {}, selected_toolkit="HUBSPOT", mode="manual"),
+                    SimpleNamespace(to_dict=lambda: {"validation_status": "invalid_toolkit"}),
+                    "Bad connector",
+                )
+            ),
+        ):
+            result = self.handler.handle_request(
+                "hello",
+                "ws1",
+                object(),
+                connector_context={"mode": "manual", "selected_toolkit": "HUBSPOT"},
+            )
+
+        self.assertEqual(result["mode"], "validation_error")
+        self.assertEqual(result["output"], "Bad connector")
+        self.assertEqual(result["connector_status"]["validation_status"], "invalid_toolkit")
+        self.assertEqual(len(self.handler.repo.save_conversation.calls), 0)

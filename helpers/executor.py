@@ -30,15 +30,17 @@ from typing import Optional
 
 from helpers.configs import get_agent
 from llm.client import generate, generate_with_tool_awareness
+from models.contracts import ConnectorContext, ToolPlan
 from tools.capability_layer import (
+    build_capability_request,
     build_tool_usage_guidance,
     prepare_tools_for_prompt,
     resolve_agent_tool_access,
 )
 from tools.composio_client import get_tool_schemas
+from tools.tool_broker import ComposioDirectBroker, build_tool_plan
 from tools.tool_registry import (
     get_tools_by_names,
-    is_agent_allowed,
     get_tool,
 )
 from utils.logging_utils import log_event, log_exception
@@ -48,6 +50,10 @@ logger = logging.getLogger(__name__)
 # Maximum number of tool calls per single run_agent invocation.
 # Prevents runaway loops if the LLM keeps requesting tools.
 MAX_TOOL_ITERATIONS = 5
+UNVERIFIED_ACTION_PATTERN = re.compile(
+    r"\b(sent|emailed|posted|published|scheduled|created|updated|synced|logged|delivered)\b",
+    re.IGNORECASE,
+)
 
 
 
@@ -68,6 +74,17 @@ Output format: {agent['output_format']}
 
 Always stay in your role. Use the business context to make your response
 specific and relevant to this business. Never make up facts not in the context.
+When a live action or live data request is needed, think in terms of the
+required capability first (for example: email.read, email.send, calendar.schedule),
+then choose a concrete tool only from the provided tool list.
+Distinguish clearly between:
+- internal text work vs verified live system access
+- read/discovery vs draft vs execute
+- missing details that block execution vs details that can be inferred later
+Prefer read or discovery before write when the target, destination, or record is unclear.
+Never simulate inbox, Slack, calendar, CRM, spreadsheet, repository, or social-platform access.
+Never claim a live action succeeded unless the verified tool result confirms it.
+If execution is blocked, explain what is missing or what needs connection instead of pretending success.
 """
 
     # Inject agent-level tool guidance if present in the config.
@@ -128,6 +145,64 @@ def _extract_tool_call(raw_output: str | dict) -> Optional[dict]:
     return None
 
 
+def _extract_tool_plan(
+    raw_output: str | dict,
+    *,
+    agent_key: str,
+    user_input: str,
+    route_context: dict | None = None,
+    iteration: int = 1,
+) -> ToolPlan | None:
+    parsed = _extract_tool_call(raw_output)
+    if parsed is not None:
+        tool_call = parsed.get("tool_call", {})
+        return build_tool_plan(
+            agent_key,
+            user_intent=user_input,
+            concrete_tool_name=tool_call.get("name"),
+            params=tool_call.get("params", {}),
+            llm_message=parsed.get("message", ""),
+            route_decision=route_context,
+            capability_hint=tool_call.get("capability_request") or {},
+            iteration=iteration,
+            connector_context=(route_context or {}).get("connector_context"),
+        )
+
+    if isinstance(raw_output, dict):
+        parsed_dict = raw_output
+    else:
+        text = (raw_output or "").strip()
+        fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
+        if fence_match:
+            text = fence_match.group(1).strip()
+        try:
+            parsed_dict = json.loads(text)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+
+    capability_request = parsed_dict.get("capability_request")
+    if isinstance(capability_request, dict):
+        capability = build_capability_request(
+            agent_key,
+            user_input=user_input,
+            route_decision=route_context,
+            requested_tool_name=str(capability_request.get("tool_name", "") or ""),
+            capability_hint=capability_request,
+            connector_context=(route_context or {}).get("connector_context"),
+        )
+        return ToolPlan(
+            agent_key=agent_key,
+            user_intent=user_input,
+            llm_message=str(parsed_dict.get("message", "") or ""),
+            capability=capability,
+            concrete_tool_name=capability_request.get("tool_name"),
+            params=dict(capability_request.get("params", {}) or {}),
+            raw_request=parsed_dict,
+            iteration=iteration,
+        )
+    return None
+
+
 def _format_connect_required_message(
     tool_name: str,
     toolkit: str,
@@ -177,6 +252,47 @@ def _format_validation_error_message(tool_name: str, error: str, agent_name: str
     )
 
 
+def _build_verified_tool_history(tool_history: list[str]) -> str:
+    if not tool_history:
+        return "No verified tool executions."
+    return "\n\n".join(tool_history)
+
+
+def _build_followup_prompt(
+    *,
+    user_input: str,
+    tool_history: list[str],
+    tool_output_payload: dict | None,
+) -> str:
+    payload_json = json.dumps(tool_output_payload or {}, indent=2, default=str)[:3000]
+    return (
+        f"The original user request was:\n{user_input}\n\n"
+        "Verified execution history:\n\n"
+        f"{_build_verified_tool_history(tool_history)}\n\n"
+        "Latest verified tool payload:\n"
+        f"```json\n{payload_json}\n```\n\n"
+        "Ground the answer only in the verified execution results above. "
+        "If another listed tool is still required, respond with ONLY the next JSON tool_call. "
+        "Otherwise return the final user-facing answer in plain text. "
+        "Do not claim any unverified live action."
+    )
+
+
+def _looks_like_unverified_action_claim(
+    text: str,
+    *,
+    route_context: dict | None = None,
+    tool_used: str | None = None,
+) -> bool:
+    if tool_used or not text:
+        return False
+    route_operation = str((route_context or {}).get("operation", "") or "").lower()
+    route_requires_live_data = bool((route_context or {}).get("requires_live_data"))
+    if route_operation not in {"write", "schedule", "publish", "execute"} and not route_requires_live_data:
+        return False
+    return bool(UNVERIFIED_ACTION_PATTERN.search(text))
+
+
 
 
 
@@ -192,6 +308,8 @@ def run_agent(
     db=None,
     workflow_state: dict = None,
     history: list[dict] | None = None,
+    route_context: dict | None = None,
+    connector_context: ConnectorContext | dict | None = None,
 ) -> dict:
     """
     Executes a single helper.
@@ -336,6 +454,8 @@ def run_agent(
         workflow_state=workflow_state,
         history=history,
         capability_access=capability_access,
+        route_context=route_context,
+        connector_context=connector_context,
     )
 
 
@@ -353,6 +473,8 @@ def _run_with_tools(
     workflow_state: dict = None,
     history: list[dict] | None = None,
     capability_access: dict | None = None,
+    route_context: dict | None = None,
+    connector_context: ConnectorContext | dict | None = None,
 ) -> dict:
     """
     Calls the LLM with tool awareness. If the LLM requests a tool:
@@ -366,11 +488,6 @@ def _run_with_tools(
 
     Returns the same dict shape as run_agent().
     """
-    # Lazy import to avoid circular dependency at module load time.
-    # tool_executor imports from tool_registry which is fine, but we
-    # keep the import local to be explicit about the dependency.
-    from tools.tool_executor import attempt_tool_call
-
     current_prompt = user_input
     tool_used = None
     tool_output_payload = None
@@ -378,6 +495,11 @@ def _run_with_tools(
     executed_tools: list[str] = []
     # Track (tool_name, params_hash) to prevent identical repeated calls.
     seen_calls: set[tuple[str, str]] = set()
+    broker = ComposioDirectBroker()
+    connector = ConnectorContext.from_value(connector_context or (route_context or {}).get("connector_context"))
+    execution_context = dict(workflow_state or {})
+    if not connector.is_auto():
+        execution_context.setdefault("connector_context", connector.to_dict())
     resolved_access = capability_access or resolve_agent_tool_access(agent_key, agent_config=agent)
     # Build the policy-level allow-set once for fast O(1) membership tests.
     config_allowed: set[str] = set(resolved_access.get("allowed_tools", []))
@@ -387,7 +509,13 @@ def _run_with_tools(
     messages.append({"role": "user", "content": user_input})
     prompt_tools = available_tools
     try:
-        filter_result = prepare_tools_for_prompt(agent_key, available_tools, user_input)
+        filter_result = prepare_tools_for_prompt(
+            agent_key,
+            available_tools,
+            user_input,
+            route_decision=route_context,
+            connector_context=connector,
+        )
         prompt_tools = filter_result.get("tools") or available_tools
         log_event(
             logger,
@@ -453,14 +581,38 @@ def _run_with_tools(
                 "success": False,
             }
 
-        # ── Parse: is this a tool call or plain text? ─────────────────────
+        # ── Parse: capability-first plan or plain text ────────────────────
         parsed = _extract_tool_call(raw_output)
+        tool_plan = _extract_tool_plan(
+            raw_output,
+            agent_key=agent_key,
+            user_input=user_input,
+            route_context=route_context,
+            iteration=iteration + 1,
+        )
 
-        if parsed is None:
+        if tool_plan is None:
             # Normal text response — return directly
             # We trust the LLM's intelligence here. If it doesn't emit a tool call,
             # it is either responding conversationally or politely explaining
             # that it lacks the required tools/permissions to fulfill the request.
+            if _looks_like_unverified_action_claim(
+                str(raw_output),
+                route_context=route_context,
+                tool_used=tool_used,
+            ):
+                return {
+                    "agent": agent_key,
+                    "name": agent_name,
+                    "output": _format_validation_error_message(
+                        route_context.get("operation", "live_action") if isinstance(route_context, dict) else "live_action",
+                        "The response appeared to claim a live action without a verified tool result.",
+                        agent_name,
+                    ),
+                    "success": False,
+                    "mode": "validation_error",
+                    "tool_used": tool_used,
+                }
             return {
                 "agent": agent_key,
                 "name": agent_name,
@@ -470,11 +622,10 @@ def _run_with_tools(
                 "tool_output": tool_output_payload,
             }
 
-        # ── Structured tool call detected ─────────────────────────────────
-        tool_call = parsed["tool_call"]
-        tool_name = tool_call.get("name", "")
-        tool_params = tool_call.get("params", {})
-        message = parsed.get("message", "")
+        # ── Structured tool plan detected ─────────────────────────────────
+        tool_name = tool_plan.concrete_tool_name or ""
+        tool_params = tool_plan.params
+        message = tool_plan.llm_message
 
         log_event(
             logger,
@@ -482,16 +633,25 @@ def _run_with_tools(
             "agent.tool_requested",
             workspace_id=workspace_id,
             agent_name=agent_name,
-            tool_name=tool_name,
+            tool_name=tool_name or "(capability_request)",
             iteration=iteration + 1,
             max_iterations=MAX_TOOL_ITERATIONS,
+            capability_group=tool_plan.capability.capability_group,
+            action_class=tool_plan.capability.action_class,
+            execution_mode=tool_plan.capability.execution_mode,
         )
 
         # ── Guard: prevent identical duplicate tool calls ─────────────────
         try:
-            call_key = (tool_name, json.dumps(tool_params, sort_keys=True))
+            call_identity = {
+                "tool_name": tool_name,
+                "capability_group": tool_plan.capability.capability_group,
+                "action_class": tool_plan.capability.action_class,
+                "params": tool_params,
+            }
+            call_key = (tool_name or tool_plan.capability.capability_group, json.dumps(call_identity, sort_keys=True))
         except (TypeError, ValueError):
-            call_key = (tool_name, str(tool_params))
+            call_key = (tool_name or tool_plan.capability.capability_group, str(tool_params))
 
         if call_key in seen_calls:
             log_event(
@@ -506,7 +666,7 @@ def _run_with_tools(
                 "agent": agent_key,
                 "name": agent_name,
                 "output": _format_validation_error_message(
-                    tool_name,
+                    tool_name or tool_plan.capability.capability_group,
                     "The same tool call was requested more than once with identical parameters.",
                     agent_name,
                 ),
@@ -516,26 +676,33 @@ def _run_with_tools(
             }
         seen_calls.add(call_key)
 
-        # ── Gate 1: config-level allowed_tools check ──────────────────────
-        # The agent config's allowed_tools is the primary authority.
-        # Even if a tool exists in the registry, the agent can only use it
-        # if its config explicitly lists it. This prevents hallucinated
-        # tool names from slipping through.
-        if tool_name not in config_allowed:
+        resolution = broker.resolve(
+            tool_plan,
+            workspace_id=workspace_id,
+            db=db,
+            allowed_tool_names=sorted(config_allowed),
+            connector_context=connector,
+        )
+        resolved_tool_name = resolution.tool_name or tool_name
+        tool_entry = get_tool(resolved_tool_name) if resolved_tool_name else None
+
+        if resolution.status == "invalid_tool":
             log_event(
                 logger,
                 logging.WARNING,
                 "agent.tool_not_in_policy",
                 workspace_id=workspace_id,
                 agent_name=agent_name,
-                tool_name=tool_name,
+                tool_name=resolved_tool_name or tool_name,
+                capability_group=tool_plan.capability.capability_group,
             )
             return {
                 "agent": agent_key,
                 "name": agent_name,
                 "output": _format_invalid_tool_message(
-                    tool_name,
-                    (
+                    resolved_tool_name or tool_name or tool_plan.capability.capability_group,
+                    resolution.reason
+                    or (
                         "This tool is not in the agent's allowed tool policy. "
                         f"Allowed tools: {', '.join(sorted(config_allowed)) or 'none'}."
                     ),
@@ -546,46 +713,22 @@ def _run_with_tools(
                 "tool_used": tool_used,
             }
 
-        # ── Gate 2: does this tool exist in the registry? ─────────────────
-        tool_entry = get_tool(tool_name)
-        if tool_entry is None:
-            log_event(
-                logger,
-                logging.WARNING,
-                "agent.tool_unknown",
-                workspace_id=workspace_id,
-                agent_name=agent_name,
-                tool_name=tool_name,
-            )
-            return {
-                "agent": agent_key,
-                "name": agent_name,
-                "output": _format_invalid_tool_message(
-                    tool_name,
-                    "This tool does not exist in the registry.",
-                    agent_name,
-                ),
-                "success": False,
-                "mode": "invalid_tool",
-                "tool_used": tool_used,
-            }
-
-        # ── Gate 3: is this agent allowed in the registry? ────────────────
-        if not is_agent_allowed(tool_name, agent_key):
+        if resolution.status == "validation_error":
             log_event(
                 logger,
                 logging.WARNING,
                 "agent.tool_not_authorized",
                 workspace_id=workspace_id,
                 agent_name=agent_name,
-                tool_name=tool_name,
+                tool_name=resolved_tool_name or tool_name,
+                capability_group=tool_plan.capability.capability_group,
             )
             return {
                 "agent": agent_key,
                 "name": agent_name,
                 "output": _format_validation_error_message(
-                    tool_name,
-                    "This agent is not authorized to use the requested tool.",
+                    resolved_tool_name or tool_name or tool_plan.capability.capability_group,
+                    resolution.reason or "This agent is not authorized to use the requested tool.",
                     agent_name,
                 ),
                 "success": False,
@@ -593,27 +736,38 @@ def _run_with_tools(
                 "tool_used": tool_used,
             }
 
-        # ── Execute via tool_executor (validate → connect → log → exec) ──
-        result = attempt_tool_call(
-            tool_name=tool_name,
-            agent_key=agent_key,
+        execution = broker.execute(
+            resolution,
+            tool_plan,
             workspace_id=workspace_id,
             db=db,
-            input_args=tool_params,
             original_input=user_input,
-            context_json=workflow_state, # Pass workflow state here
+            context_json=execution_context,
+            connector_context=connector,
         )
-
-        status = result.get("status", "failure")
+        result = execution.to_legacy_dict()
+        status = execution.status
+        log_event(
+            logger,
+            logging.INFO,
+            "agent.tool_resolved",
+            workspace_id=workspace_id,
+            agent_name=agent_name,
+            tool_name=resolved_tool_name or tool_name,
+            approval_required=resolution.approval_requirement.required,
+            risk_level=resolution.approval_requirement.risk_level,
+            execution_mode=resolution.execution_mode,
+            idempotency_key=resolution.idempotency_key,
+        )
 
         # ── connect_required: return the Connect Link to the user ─────────
         if status == "connect_required":
-            toolkit = result.get("toolkit", tool_entry.get("toolkit", ""))
+            toolkit = execution.toolkit or (tool_entry.get("toolkit", "") if tool_entry else "")
             connect_url = result.get("connect_url")
             resume_token = result.get("resume_token", "")
 
             output_msg = _format_connect_required_message(
-                tool_name, toolkit, connect_url, agent_name,
+                resolved_tool_name or tool_name, toolkit, connect_url, agent_name,
             )
 
             return {
@@ -630,7 +784,7 @@ def _run_with_tools(
 
         # ── auth_unavailable: return failure without a link ───────────────
         if status == "auth_unavailable":
-            toolkit = result.get("toolkit", tool_entry.get("toolkit", ""))
+            toolkit = execution.toolkit or (tool_entry.get("toolkit", "") if tool_entry else "")
             error_detail = result.get("error") or (
                 f"The {toolkit} integration is unavailable, so this request was not executed."
             )
@@ -639,7 +793,7 @@ def _run_with_tools(
                 "agent": agent_key,
                 "name": agent_name,
                 "output": (
-                    f"⚠️ **{agent_name} cannot access `{tool_name}` right now.**\n\n"
+                    f"⚠️ **{agent_name} cannot access `{resolved_tool_name or tool_name}` right now.**\n\n"
                     f"{error_detail}"
                 ),
                 "success": False,
@@ -656,7 +810,7 @@ def _run_with_tools(
                 "agent": agent_key,
                 "name": agent_name,
                 "output": _format_invalid_tool_message(
-                    tool_name,
+                    resolved_tool_name or tool_name or tool_plan.capability.capability_group,
                     error_msg,
                     agent_name,
                 ),
@@ -671,7 +825,7 @@ def _run_with_tools(
                 "agent": agent_key,
                 "name": agent_name,
                 "output": _format_validation_error_message(
-                    tool_name,
+                    resolved_tool_name or tool_name or tool_plan.capability.capability_group,
                     error_msg,
                     agent_name,
                 ),
@@ -689,14 +843,14 @@ def _run_with_tools(
                 "agent.tool_failed",
                 workspace_id=workspace_id,
                 agent_name=agent_name,
-                tool_name=tool_name,
+                tool_name=resolved_tool_name or tool_name,
                 error_type=status,
             )
             return {
                 "agent": agent_key,
                 "name": agent_name,
                 "output": _format_tool_error_message(
-                    tool_name,
+                    resolved_tool_name or tool_name or tool_plan.capability.capability_group,
                     error_msg,
                     agent_name,
                 ),
@@ -707,8 +861,8 @@ def _run_with_tools(
 
         # ── success: feed tool output back into the LLM for final answer ──
         if status == "success":
-            tool_used = tool_name
-            executed_tools.append(tool_name)
+            tool_used = resolved_tool_name or tool_name
+            executed_tools.append(tool_used)
             tool_output = result.get("output", {})
             tool_output_payload = (
                 tool_output if isinstance(tool_output, dict) else {"data": tool_output}
@@ -720,7 +874,7 @@ def _run_with_tools(
                 tool_output_str = str(tool_output)
 
             tool_history.append(
-                f"Tool: {tool_name}\nResult:\n{tool_output_str[:2000]}"
+                f"Tool: {tool_used}\nResult:\n{tool_output_str[:2000]}"
             )
 
             if use_native_tool_calling:
@@ -728,8 +882,8 @@ def _run_with_tools(
                     "id": parsed.get("tool_call_id", ""),
                     "type": "function",
                     "function": {
-                        "name": tool_name,
-                        "arguments": json.dumps(tool_params, default=str),
+                        "name": tool_used,
+                        "arguments": json.dumps(resolution.normalized_params or tool_params, default=str),
                     },
                 }
                 messages.append(
@@ -747,14 +901,10 @@ def _run_with_tools(
                     }
                 )
             else:
-                current_prompt = (
-                    f"The original user request was:\n{user_input}\n\n"
-                    f"Tool execution history so far:\n\n"
-                    f"{chr(10).join(tool_history)}\n\n"
-                    "If another listed tool is still needed to fully satisfy the user's request, "
-                    "respond with ONLY the JSON tool_call for the next step. "
-                    "Otherwise, provide the final user-facing answer in plain text. "
-                    "Never claim a live action happened unless it appears in the tool execution history above."
+                current_prompt = _build_followup_prompt(
+                    user_input=user_input,
+                    tool_history=tool_history,
+                    tool_output_payload=tool_output_payload,
                 )
             continue
 
@@ -765,14 +915,14 @@ def _run_with_tools(
             "agent.tool_unexpected_status",
             workspace_id=workspace_id,
             agent_name=agent_name,
-            tool_name=tool_name,
+            tool_name=resolved_tool_name or tool_name,
             error_type=status,
         )
         return {
             "agent": agent_key,
             "name": agent_name,
             "output": _format_tool_error_message(
-                tool_name,
+                resolved_tool_name or tool_name or tool_plan.capability.capability_group,
                 f"Unexpected tool status: {status}",
                 agent_name,
             ),

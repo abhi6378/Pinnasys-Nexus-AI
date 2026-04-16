@@ -15,10 +15,10 @@ Statuses:
   validation_error  — tool_name or agent not allowed
   timeout           — tool execution timed out
 """
-from datetime import datetime
 from sqlalchemy import Column, String, Text, DateTime, JSON, Float
 
 from storage.db import Base, new_id
+from utils.time_utils import utc_now
 
 
 class ToolCallLogModel(Base):
@@ -34,7 +34,7 @@ class ToolCallLogModel(Base):
     output_json     = Column(JSON,     default=dict)         # raw response from Composio
     error_message   = Column(Text,     default="")           # human-readable error, if any
     duration_ms     = Column(Float,    default=0.0)          # execution wall-clock time
-    created_at      = Column(DateTime, default=datetime.utcnow)
+    created_at      = Column(DateTime, default=utc_now)
 
     def __repr__(self):
         return (

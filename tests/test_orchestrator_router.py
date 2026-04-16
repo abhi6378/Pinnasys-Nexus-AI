@@ -68,3 +68,19 @@ class RouterLoggingTests(unittest.TestCase):
         self.assertEqual(result["selected_agent"], "assistant")
         self.assertNotIn("intent", result)
         self.assertNotIn("agent", result)
+
+    def test_route_request_decision_returns_structured_contract_with_inferred_fields(self):
+        raw = (
+            '{"route_type":"workflow","primary_intent":"email_triage","selected_workflow":"email_triage",'
+            '"confidence":0.87,"reason":"needs inbox access","steps":[{"agent":"assistant","task":"read inbox"}],'
+            '"risk_flags":["live_action"]}'
+        )
+        with patch_attr(self.router, "generate_json", Spy(return_value=raw)):
+            result = self.router.route_request_decision("check my inbox", "ws1", object(), "ctx")
+
+        self.assertEqual(result.route_type, "workflow")
+        self.assertEqual(result.selected_workflow, "email_triage")
+        self.assertEqual(result.system_family, "email")
+        self.assertTrue(result.requires_live_data)
+        self.assertTrue(result.approval_required.required)
+        self.assertEqual(result.ordered_steps[0].agent, "assistant")

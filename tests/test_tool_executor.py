@@ -19,7 +19,16 @@ def load_tool_executor_module():
     )
     ToolConnectionModel = make_model_class(
         "ToolConnectionModel",
-        ["workspace_id", "toolkit", "status"],
+        [
+            "workspace_id",
+            "toolkit",
+            "status",
+            "connected_account_id",
+            "updated_at",
+            "last_verified_at",
+            "is_default",
+            "account_label",
+        ],
     )
     PendingToolRequestModel = make_model_class(
         "PendingToolRequestModel",
@@ -37,6 +46,7 @@ def load_tool_executor_module():
         is_available=lambda: False,
         check_connection=lambda *args, **kwargs: {},
         get_connect_link=lambda *args, **kwargs: None,
+        get_live_tool_schema=lambda *args, **kwargs: {},
         get_toolkit_auth_details=lambda *args, **kwargs: {},
         validate_tool_slug=lambda *args, **kwargs: {"available": False, "exists": False, "error": "unavailable"},
         execute_tool=lambda *args, **kwargs: {"data": {}, "error": None},
@@ -88,6 +98,14 @@ class AttemptToolCallTests(unittest.TestCase):
         }
         with patch_attr(self.tool_executor, "get_tool", Spy(return_value=tool_entry)), \
              patch_attr(self.tool_executor, "is_agent_allowed", Spy(return_value=True)), \
+             patch_attr(
+                 self.tool_executor,
+                 "validate_tool_input",
+                 Spy(return_value=(
+                     {"recipient_email": "user@example.com"},
+                     ["Missing required parameter: body"],
+                 )),
+             ), \
              patch_attr(self.tool_executor, "is_available", Spy(return_value=False)):
             result = self.tool_executor.attempt_tool_call(
                 "GMAIL_SEND_EMAIL",
@@ -145,6 +163,10 @@ class AttemptToolCallTests(unittest.TestCase):
             toolkit="GMAIL",
             status="connected",
             connected_account_id="acct-1",
+            updated_at=self.tool_executor.utc_now(),
+            last_verified_at=self.tool_executor.utc_now(),
+            is_default=True,
+            account_label="Primary Gmail",
         )
         db = FakeSession({
             self.tool_executor.ToolConnectionModel: FakeQuery(first_result=existing_connection),
@@ -160,6 +182,58 @@ class AttemptToolCallTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["output"], {"ok": True})
+
+    def test_attempt_tool_call_uses_fresh_local_connection_without_remote_check(self):
+        existing_connection = self.tool_executor.ToolConnectionModel(
+            workspace_id="ws1",
+            toolkit="GMAIL",
+            status="connected",
+            connected_account_id="acct-1",
+            updated_at=self.tool_executor.utc_now(),
+            last_verified_at=self.tool_executor.utc_now(),
+            is_default=True,
+            account_label="Primary Gmail",
+        )
+        db = FakeSession({
+            self.tool_executor.ToolConnectionModel: FakeQuery(first_result=existing_connection),
+        })
+        tool_entry = {"toolkit": "GMAIL", "expected_params": [], "requires_auth": True}
+        check_connection = Spy(return_value={"connected": True})
+        with patch_attr(self.tool_executor, "get_tool", Spy(return_value=tool_entry)), \
+             patch_attr(self.tool_executor, "is_agent_allowed", Spy(return_value=True)), \
+             patch_attr(self.tool_executor, "is_available", Spy(return_value=True)), \
+             patch_attr(self.tool_executor, "validate_tool_slug", Spy(return_value={"available": True, "exists": True, "error": None})), \
+             patch_attr(self.tool_executor, "check_connection", check_connection), \
+             patch_attr(self.tool_executor, "execute_tool", Spy(return_value={"data": {"ok": True}, "error": None})):
+            result = self.tool_executor.attempt_tool_call("GMAIL_SEND_EMAIL", "assistant", "ws1", db)
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(check_connection.calls), 0)
+
+    def test_attempt_tool_call_uses_selected_account_for_connection_check(self):
+        db = FakeSession({
+            self.tool_executor.ToolConnectionModel: FakeQuery(first_result=None),
+        })
+        tool_entry = {"toolkit": "GMAIL", "expected_params": [], "requires_auth": True}
+        check_connection = Spy(return_value={"connected": False, "status": "not_found", "error": None})
+        with patch_attr(self.tool_executor, "get_tool", Spy(return_value=tool_entry)), \
+             patch_attr(self.tool_executor, "is_agent_allowed", Spy(return_value=True)), \
+             patch_attr(self.tool_executor, "is_available", Spy(return_value=True)), \
+             patch_attr(self.tool_executor, "validate_tool_slug", Spy(return_value={"available": True, "exists": True, "error": None})), \
+             patch_attr(self.tool_executor, "check_connection", check_connection), \
+             patch_attr(self.tool_executor, "get_connect_link", Spy(return_value="https://connect.example")), \
+             patch_attr(self.tool_executor, "get_toolkit_auth_details", Spy(return_value={})):
+            result = self.tool_executor.attempt_tool_call(
+                "GMAIL_SEND_EMAIL",
+                "assistant",
+                "ws1",
+                db,
+                original_input="send it",
+                selected_account_id="acct-99",
+            )
+
+        self.assertEqual(result["status"], "connect_required")
+        self.assertEqual(check_connection.calls[0][1]["preferred_account_id"], "acct-99")
 
     def test_attempt_tool_call_returns_failure_when_executor_reports_error(self):
         db = FakeSession({
@@ -196,3 +270,67 @@ class AttemptToolCallTests(unittest.TestCase):
         self.assertEqual(result["error"], "explode")
         self.assertEqual(len(log_exception.calls), 1)
         self.assertEqual(log_exception.calls[0][0][1], "tool.execute.failed")
+
+    def test_attempt_tool_call_returns_schema_validation_error_for_invalid_email(self):
+        db = FakeSession()
+        tool_entry = {
+            "toolkit": "GMAIL",
+            "expected_params": ["recipient_email", "body"],
+            "requires_auth": True,
+            "schema": {
+                "required": ["recipient_email", "body"],
+                "properties": {
+                    "recipient_email": {"type": "string", "format": "email"},
+                    "body": {"type": "string", "min_length": 1},
+                },
+            },
+        }
+        registry_validate = Spy(return_value=({"recipient_email": "not-an-email", "body": "hi"}, ["Parameter 'recipient_email' must be a valid email address."]))
+        with patch_attr(self.tool_executor, "get_tool", Spy(return_value=tool_entry)), \
+             patch_attr(self.tool_executor, "is_agent_allowed", Spy(return_value=True)), \
+             patch_attr(self.tool_executor, "validate_tool_input", registry_validate):
+            result = self.tool_executor.attempt_tool_call(
+                "GMAIL_SEND_EMAIL",
+                "assistant",
+                "ws1",
+                db,
+                input_args={"recipient_email": "not-an-email", "body": "hi"},
+            )
+
+        self.assertEqual(result["status"], "validation_error")
+        self.assertIn("valid email address", result["error"])
+
+    def test_attempt_tool_call_combines_live_schema_validation_errors(self):
+        db = FakeSession()
+        tool_entry = {
+            "toolkit": "SLACK",
+            "expected_params": ["channel"],
+            "requires_auth": True,
+        }
+        live_schema = {
+            "function": {
+                "parameters": {
+                    "required": ["channel"],
+                    "properties": {
+                        "channel": {"type": "string"},
+                        "limit": {"type": "integer"},
+                    },
+                }
+            }
+        }
+        with patch_attr(self.tool_executor, "get_tool", Spy(return_value=tool_entry)), \
+             patch_attr(self.tool_executor, "is_agent_allowed", Spy(return_value=True)), \
+             patch_attr(self.tool_executor, "is_available", Spy(return_value=True)), \
+             patch_attr(self.tool_executor, "validate_tool_slug", Spy(return_value={"available": True, "exists": True, "error": None})), \
+             patch_attr(self.tool_executor, "validate_tool_input", Spy(return_value=({"channel": "C123", "limit": "bad"}, []))), \
+             patch_attr(self.tool_executor, "get_live_tool_schema", Spy(return_value=live_schema)):
+            result = self.tool_executor.attempt_tool_call(
+                "SLACK_FETCH_CONVERSATION_HISTORY",
+                "assistant",
+                "ws1",
+                db,
+                input_args={"channel": "C123", "limit": "bad"},
+            )
+
+        self.assertEqual(result["status"], "validation_error")
+        self.assertIn("must be an integer", result["error"])
