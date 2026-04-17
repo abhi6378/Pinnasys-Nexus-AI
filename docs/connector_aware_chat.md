@@ -53,6 +53,18 @@ The connector context flows through the existing architecture:
 7. Pending auth resumes persist `connector_context` so reconnect flows keep the original execution scope.
 8. `handle_request()` and `POST /chat` return normalized `connector_context` plus `connector_status` so the UI can reconcile stale or auto-selected account state.
 
+### Constraint Precedence
+
+Execution now follows one consistent precedence rule:
+
+1. Explicit workflow step execution constraint
+2. User-selected account for the same toolkit
+3. User manual connector selection
+4. Workflow-level capability hint
+5. Route/inferred capability
+
+This matters most for mixed-tool workflows. A manual Gmail selection no longer incorrectly forces a HubSpot or Sheets workflow step to stay inside Gmail when that step has an explicit toolkit requirement.
+
 ## Connection and Account Data
 
 Connection state is sourced from:
@@ -66,6 +78,7 @@ Connection state is sourced from:
 
 - listing workspace connectors
 - listing accounts for a connector
+- synchronizing local cache with remote Composio account state
 - validating manual connector/account selection
 - normalizing connector context
 - persisting and hydrating workspace defaults
@@ -83,27 +96,32 @@ Connection state is sourced from:
 - The UI and most preflight logic use local `tool_connections` data first.
 - Each cached connection can carry freshness metadata such as `last_verified_at` and `status_updated_at`.
 - Remote Composio account discovery is used only when needed:
-  - explicit refresh
-  - cache miss
-  - stale cache beyond TTL
-  - selected account missing from local cache
-  - execution retry after auth
+- explicit refresh
+- cache miss
+- stale cache beyond TTL
+- selected account missing from local cache
+- execution retry after auth
+- explicit post-connect synchronization
 - Connect URLs are generated lazily for the selected toolkit instead of every toolkit on every render.
 - Broker resolution no longer performs redundant remote connection checks; the executor is the final verification point before a live tool call.
+- Remote reconciliation now marks missing previously-connected accounts as `revoked` locally and re-evaluates the default active account.
 
 ## API Surface
 
 The FastAPI layer exposes:
 
 - `POST /chat` with optional `connector_context`
+- `POST /chat/approve`
 - `GET /workspace/{workspace_id}/connectors`
 - `GET /workspace/{workspace_id}/connectors/{toolkit}/accounts`
 - `GET /workspace/{workspace_id}/connectors/{toolkit}/connect-link`
+- `POST /workspace/{workspace_id}/connectors/{toolkit}/refresh`
 
 `POST /chat` responses can include:
 
 - `connector_context`: normalized effective connector scope
 - `connector_status`: resolved status, account availability, and reconnect hints
+- `approval_required`, `approval_requirement`, `resume_token`, and `pending_kind` for risky writes that require explicit confirmation
 
 Older callers that do not send `connector_context` remain fully compatible.
 
@@ -124,12 +142,21 @@ For most new connectors, do not add custom chat UI code.
 Typical onboarding path:
 
 1. Add toolkit metadata in `tools/tool_registry.py`.
-2. Add tool registry entries and capability metadata for the toolkit.
-3. Add aliases in toolkit metadata if the connector has user-facing label variants.
-4. Ensure `tools/composio_client.py` can discover connection state/accounts for that toolkit.
-5. If needed, add policy overlay metadata for aliases, approval, or auth details.
+2. Decide whether the connector is `ui_exposed` and whether it `supports_account_selection`.
+3. Add tool registry entries and capability metadata for the toolkit, including at least one real read/search flow before exposing it in the connector picker.
+4. Add aliases in toolkit metadata if the connector has user-facing label variants.
+5. Ensure `tools/composio_client.py` can discover connection state/accounts for that toolkit.
+6. If needed, add policy overlay metadata for aliases, approval, idempotency, or auth details.
 
 The UI selector and sidebar render from connector metadata and account listings, so new connectors should appear automatically once the toolkit metadata and connection discovery are available.
+
+## Approval and Idempotency
+
+- Risky writes now use registry metadata as a real system gate, not only a prompt hint.
+- Tools marked `approval_required=True` are blocked until an explicit approval resume happens.
+- Write tools also use durable idempotency records keyed by workspace, tool name, and idempotency key so reconnect/retry flows do not duplicate side effects.
+- The existing direct Composio runtime is still the default path.
+- A session-ready broker adapter exists behind `COMPOSIO_RUNTIME_MODE=session_preview` for future migration work without changing the current runtime.
 
 ## Compatibility Notes
 

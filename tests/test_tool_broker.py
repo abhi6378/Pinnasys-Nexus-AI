@@ -159,3 +159,21 @@ class ToolBrokerTests(unittest.TestCase):
 
         self.assertEqual(result.status, "validation_error")
         self.assertEqual(result.resolution_source, "connector_account_required")
+
+    def test_step_execution_constraint_overrides_manual_connector_for_explicit_tool(self):
+        broker = tool_broker.ComposioDirectBroker()
+        plan = tool_broker.build_tool_plan(
+            "sales",
+            user_intent="log this lead",
+            concrete_tool_name="HUBSPOT_CREATE_CONTACT",
+            execution_constraint={"toolkit": "HUBSPOT", "required": True, "scope": "workflow_step"},
+        )
+
+        result = broker.resolve(
+            plan,
+            allowed_tool_names=["HUBSPOT_CREATE_CONTACT"],
+            connector_context={"mode": "manual", "selected_toolkit": "GMAIL", "enforce_toolkit": True},
+        )
+
+        self.assertEqual(result.status, "resolved")
+        self.assertEqual(result.tool_name, "HUBSPOT_CREATE_CONTACT")

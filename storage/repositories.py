@@ -774,6 +774,9 @@ def upsert_tool_connection(
     account_label: str = "",
     is_default: bool = False,
     last_verified_at = None,
+    last_seen_remote_at = None,
+    revoked_at = None,
+    status_reason: str = "",
     status_updated_at = None,
     metadata_json: dict | None = None,
 ):
@@ -803,6 +806,9 @@ def upsert_tool_connection(
                 auth_mode=auth_mode,
                 metadata_json=dict(metadata_json or {}),
                 last_verified_at=last_verified_at,
+                last_seen_remote_at=last_seen_remote_at,
+                revoked_at=revoked_at,
+                status_reason=status_reason or "",
                 status_updated_at=status_updated_at or utc_now(),
                 created_at=utc_now(),
                 updated_at=utc_now(),
@@ -818,6 +824,12 @@ def upsert_tool_connection(
             row.is_default = bool(is_default or getattr(row, "is_default", False))
             if last_verified_at is not None:
                 row.last_verified_at = last_verified_at
+            if last_seen_remote_at is not None:
+                row.last_seen_remote_at = last_seen_remote_at
+            if revoked_at is not None:
+                row.revoked_at = revoked_at
+            if status_reason:
+                row.status_reason = status_reason
             merged_meta = dict(getattr(row, "metadata_json", {}) or {})
             merged_meta.update(dict(metadata_json or {}))
             row.metadata_json = merged_meta
@@ -837,6 +849,47 @@ def upsert_tool_connection(
             connected_account_id=connected_account_id,
         )
         raise
+
+
+def set_tool_connection_status(
+    db: Session,
+    workspace_id: str,
+    *,
+    toolkit: str,
+    connected_account_id: str,
+    status: str,
+    is_default: bool | None = None,
+    revoked_at = None,
+    status_reason: str = "",
+    last_seen_remote_at = None,
+):
+    from models.tool_connections import ToolConnectionModel
+
+    row = (
+        db.query(ToolConnectionModel)
+        .filter(
+            ToolConnectionModel.workspace_id == workspace_id,
+            ToolConnectionModel.toolkit == toolkit.upper(),
+            ToolConnectionModel.connected_account_id == (connected_account_id or ""),
+        )
+        .first()
+    )
+    if not row:
+        return None
+    row.status = status
+    if is_default is not None:
+        row.is_default = bool(is_default)
+    if revoked_at is not None:
+        row.revoked_at = revoked_at
+    if last_seen_remote_at is not None:
+        row.last_seen_remote_at = last_seen_remote_at
+    if status_reason:
+        row.status_reason = status_reason
+    row.status_updated_at = utc_now()
+    row.updated_at = utc_now()
+    db.commit()
+    db.refresh(row)
+    return row
 
 
 def get_workspace_connector_preference(

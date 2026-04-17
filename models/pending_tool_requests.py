@@ -17,7 +17,7 @@ Statuses:
   expired    — timed out / user never completed auth
   cancelled  — user explicitly cancelled
 """
-from sqlalchemy import Column, String, Text, DateTime, JSON
+from sqlalchemy import Boolean, Column, String, Text, DateTime, JSON
 
 from storage.db import Base, new_id
 from utils.time_utils import utc_now
@@ -35,6 +35,11 @@ class PendingToolRequestModel(Base):
     requested_toolkit = Column(String,  default="")          # parent toolkit, e.g. "GMAIL"
     resume_token     = Column(String,   nullable=False, unique=True, index=True)
     status           = Column(String,   nullable=False, default="pending")
+    pending_kind     = Column(String,   nullable=False, default="auth")  # auth | approval
+    idempotency_key  = Column(String,   default="")
+    approval_requirement_json = Column(JSON, default=dict)
+    approved         = Column(Boolean,  default=False)
+    approved_at      = Column(DateTime, nullable=True)
     context_json     = Column(JSON,     default=dict)        # brain_context snapshot, etc.
     created_at       = Column(DateTime, default=utc_now)
     updated_at       = Column(DateTime, default=utc_now, onupdate=utc_now)

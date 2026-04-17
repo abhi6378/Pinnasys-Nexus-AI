@@ -177,7 +177,18 @@ def _ensure_additive_connector_columns() -> None:
         "ALTER TABLE tool_connections ADD COLUMN IF NOT EXISTS account_label VARCHAR DEFAULT ''",
         "ALTER TABLE tool_connections ADD COLUMN IF NOT EXISTS is_default BOOLEAN DEFAULT FALSE",
         "ALTER TABLE tool_connections ADD COLUMN IF NOT EXISTS last_verified_at TIMESTAMP NULL",
+        "ALTER TABLE tool_connections ADD COLUMN IF NOT EXISTS last_seen_remote_at TIMESTAMP NULL",
+        "ALTER TABLE tool_connections ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMP NULL",
+        "ALTER TABLE tool_connections ADD COLUMN IF NOT EXISTS status_reason TEXT DEFAULT ''",
         "ALTER TABLE tool_connections ADD COLUMN IF NOT EXISTS status_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE pending_tool_requests ADD COLUMN IF NOT EXISTS pending_kind VARCHAR DEFAULT 'auth'",
+        "ALTER TABLE pending_tool_requests ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR DEFAULT ''",
+        "ALTER TABLE pending_tool_requests ADD COLUMN IF NOT EXISTS approval_requirement_json JSONB DEFAULT '{}'::jsonb",
+        "ALTER TABLE pending_tool_requests ADD COLUMN IF NOT EXISTS approved BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE pending_tool_requests ADD COLUMN IF NOT EXISTS approved_at TIMESTAMP NULL",
+        "ALTER TABLE tool_call_logs ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR DEFAULT ''",
+        "ALTER TABLE tool_call_logs ADD COLUMN IF NOT EXISTS pending_kind VARCHAR DEFAULT ''",
+        "ALTER TABLE tool_call_logs ADD COLUMN IF NOT EXISTS approval_required BOOLEAN DEFAULT FALSE",
     ]
     with engine.begin() as connection:
         for statement in statements:
@@ -193,6 +204,7 @@ def init_db():
     from models.tool_connections import ToolConnectionModel          # noqa: F401
     from models.pending_tool_requests import PendingToolRequestModel  # noqa: F401
     from models.tool_call_logs import ToolCallLogModel                # noqa: F401
+    from models.tool_idempotency_records import ToolIdempotencyRecordModel  # noqa: F401
     Base.metadata.create_all(bind=engine)
     _ensure_additive_connector_columns()
 

@@ -13,6 +13,7 @@ from tools.tool_registry import (
     get_toolkit_label,
     get_toolkit_metadata,
     list_toolkits,
+    list_ui_toolkits,
     normalize_toolkit_key,
 )
 from utils.logging_utils import log_event, log_exception
@@ -205,17 +206,41 @@ def _load_local_accounts(
     return accounts
 
 
-def _sync_remote_accounts(
+def _select_default_account(accounts: list[ConnectorAccountSummary]) -> str:
+    connected = [account for account in accounts if account.status == "connected"]
+    if not connected:
+        return ""
+    explicit_default = next((account for account in connected if account.is_default), None)
+    if explicit_default:
+        return explicit_default.connected_account_id
+    return connected[0].connected_account_id
+
+
+def synchronize_connector_accounts(
     workspace_id: str,
     toolkit: str,
     db,
     *,
     force_refresh: bool,
+    request_cache: dict | None = None,
     selected_account_id: str = "",
 ) -> list[ConnectorAccountSummary]:
+    cache_key = f"connector_sync:{workspace_id}:{toolkit}:{force_refresh}:{selected_account_id}"
+    cached = _cache_get(request_cache, cache_key)
+    if cached is not None:
+        return [ConnectorAccountSummary.from_value(item) for item in cached]
+
     started = time.perf_counter()
     remote_accounts = list_connected_accounts(workspace_id, toolkit, force_refresh=force_refresh)
     now = utc_now()
+    local_rows = repo.list_tool_connections(db, workspace_id, toolkit=toolkit)
+    local_connected_ids = {
+        str(getattr(row, "connected_account_id", "") or "")
+        for row in local_rows
+        if str(getattr(row, "status", "") or "") == "connected"
+        and str(getattr(row, "connected_account_id", "") or "")
+    }
+    seen_remote_ids: set[str] = set()
     normalized: list[ConnectorAccountSummary] = []
     for index, account in enumerate(remote_accounts):
         summary = _normalize_account_entry(
@@ -228,6 +253,7 @@ def _sync_remote_accounts(
             source="remote_refresh",
             selected_account_id=selected_account_id,
         )
+        seen_remote_ids.add(summary.connected_account_id)
         normalized.append(summary)
         repo.upsert_tool_connection(
             db,
@@ -240,9 +266,43 @@ def _sync_remote_accounts(
             account_label=summary.display_label,
             is_default=summary.is_default,
             last_verified_at=now,
+            last_seen_remote_at=now,
+            revoked_at=None,
+            status_reason="",
             status_updated_at=now,
             metadata_json={"account_alias": summary.account_alias},
         )
+
+    revoked_ids = sorted(local_connected_ids - seen_remote_ids)
+    for revoked_id in revoked_ids:
+        repo.set_tool_connection_status(
+            db,
+            workspace_id,
+            toolkit=toolkit,
+            connected_account_id=revoked_id,
+            status="revoked",
+            is_default=False,
+            revoked_at=now,
+            status_reason="No longer present in remote connector state.",
+            last_seen_remote_at=now,
+        )
+
+    effective_default_id = _select_default_account(normalized)
+    if effective_default_id:
+        for account in normalized:
+            account.is_default = account.connected_account_id == effective_default_id
+            repo.set_tool_connection_status(
+                db,
+                workspace_id,
+                toolkit=toolkit,
+                connected_account_id=account.connected_account_id,
+                status=account.status,
+                is_default=account.is_default,
+                revoked_at=None,
+                status_reason="",
+                last_seen_remote_at=now,
+            )
+
     elapsed = round((time.perf_counter() - started) * 1000, 2)
     log_event(
         logger,
@@ -252,7 +312,9 @@ def _sync_remote_accounts(
         toolkit=toolkit,
         duration_ms=elapsed,
         account_count=len(normalized),
+        revoked_count=len(revoked_ids),
     )
+    _cache_set(request_cache, cache_key, [account.to_dict() for account in normalized])
     return normalized
 
 
@@ -298,11 +360,12 @@ def list_connector_accounts(
     accounts = local_accounts
     if should_refresh and should_allow_remote:
         try:
-            accounts = _sync_remote_accounts(
+            accounts = synchronize_connector_accounts(
                 workspace_id,
                 selected_toolkit,
                 db,
                 force_refresh=refresh,
+                request_cache=request_cache,
                 selected_account_id=selected_account_id,
             )
         except Exception as exc:
@@ -341,6 +404,46 @@ def list_connector_accounts(
     return [account.to_dict() for account in accounts]
 
 
+def refresh_connector_status(
+    workspace_id: str,
+    toolkit: str,
+    db,
+    *,
+    selected_account_id: str = "",
+    request_cache: dict | None = None,
+) -> ConnectorStatusSummary:
+    normalized_toolkit = normalize_toolkit_key(toolkit)
+    if not normalized_toolkit:
+        return ConnectorStatusSummary(validation_status="invalid_toolkit")
+    synchronize_connector_accounts(
+        workspace_id,
+        normalized_toolkit,
+        db,
+        force_refresh=True,
+        request_cache=request_cache,
+        selected_account_id=selected_account_id,
+    )
+    return get_connector_status_summary(
+        workspace_id,
+        normalized_toolkit,
+        db,
+        connector_context=build_connector_context(
+            selected_toolkit=normalized_toolkit,
+            selected_account_id=selected_account_id,
+            mode="manual" if normalized_toolkit else "auto",
+            source="system_inferred",
+        ),
+        refresh=False,
+        request_cache=request_cache,
+        include_connect_url=True,
+        allow_remote=False,
+    )
+
+
+# Backward-compatible alias retained for callers/tests from the earlier connector pass.
+_sync_remote_accounts = synchronize_connector_accounts
+
+
 def _build_status_summary(
     workspace_id: str,
     toolkit: str,
@@ -373,6 +476,8 @@ def _build_status_summary(
         (account for account in connected_accounts if account.connected_account_id == connector_context.selected_account_id),
         None,
     )
+    if not effective_account:
+        effective_account = next((account for account in connected_accounts if account.is_default), None)
     validation_status = "ok"
     stale_selection = False
     status_reason = ""
@@ -473,7 +578,7 @@ def list_workspace_connectors(
 ) -> list[dict]:
     normalized_selected_toolkit = normalize_toolkit_key(selected_toolkit)
     connector_rows: list[dict] = []
-    for toolkit in list_toolkits():
+    for toolkit in list_ui_toolkits():
         summary = get_connector_status_summary(
             workspace_id,
             toolkit,
@@ -523,7 +628,7 @@ def validate_connector_context(
         connector_context=normalized,
         refresh=refresh,
         request_cache=request_cache,
-        include_connect_url=not normalized.connected,
+        include_connect_url=True,
         allow_remote=bool(normalized.selected_account_id) or refresh,
     )
     normalized.validation_status = summary.validation_status
@@ -544,6 +649,13 @@ def validate_connector_context(
         normalized.stale_selection = False
         normalized.validation_status = "ok"
         normalized.status_reason = ""
+        normalized.enforce_account = True
+    elif summary.stale_selection:
+        normalized.selected_account_id = ""
+        normalized.selected_account_alias = ""
+        normalized.effective_account_id = summary.effective_account_id
+        normalized.effective_account_alias = summary.effective_account_alias
+        normalized.enforce_account = False
 
     if summary.validation_status == "invalid_toolkit":
         return normalized, summary, f"Selected connector '{toolkit_key}' is not supported."

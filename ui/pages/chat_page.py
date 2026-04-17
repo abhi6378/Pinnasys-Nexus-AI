@@ -15,7 +15,11 @@ from storage import repositories as repo
 from orchestrator.handler import handle_request
 from helpers.configs import list_agents, AGENTS
 from brain.quiz_engine import get_next_question, save_answer, quiz_progress
-from tools.connector_service import list_workspace_connectors, persist_connector_context
+from tools.connector_service import (
+    list_workspace_connectors,
+    persist_connector_context,
+    refresh_connector_status,
+)
 from ui.connector_state import build_connector_context, ensure_connector_state, set_connector_selection
 
 
@@ -246,6 +250,22 @@ def _render_validation_error_card(msg: dict):
     st.markdown(msg.get("content", ""))
 
 
+def _render_approval_card(msg: dict, msg_idx: int):
+    if not msg.get("approval_required"):
+        return
+    st.info("This live write action is waiting for explicit approval before execution.")
+    requirement = msg.get("approval_requirement") or {}
+    reason = str(requirement.get("reason", "") or "").strip()
+    if reason:
+        st.caption(reason)
+    if msg.get("resume_token"):
+        if st.button("Approve & Run", key=f"approve_retry_{msg_idx}", use_container_width=True):
+            st.session_state.pending_tool_approval = {
+                "resume_token": msg.get("resume_token", ""),
+            }
+            st.rerun()
+
+
 def _render_workflow_state(msg: dict):
     if msg.get("workflow_paused"):
         step_label = msg.get("step_label", "Current step")
@@ -321,6 +341,24 @@ def _render_connector_controls(workspace_id: str, db) -> dict:
                     selected_row["connect_url"],
                     use_container_width=True,
                 )
+        if st.button(
+            f"Refresh {selected_row['label']}",
+            key=f"chat_refresh_{selected_connector}",
+            use_container_width=True,
+        ):
+            refreshed = refresh_connector_status(workspace_id, selected_connector, db, request_cache={})
+            effective_account_id = str(refreshed.effective_account_id or current_account_id or "")
+            effective_account_alias = str(refreshed.effective_account_alias or current_account_alias or "")
+            set_connector_selection(
+                st.session_state,
+                mode="manual",
+                selected_toolkit=selected_connector,
+                selected_account_id=effective_account_id,
+                selected_account_alias=effective_account_alias,
+                source="chat_input",
+            )
+            persist_connector_context(workspace_id, st.session_state.connector_context, db)
+            st.rerun()
 
     with account_col:
         if accounts:
@@ -386,6 +424,7 @@ def _render_connector_controls(workspace_id: str, db) -> dict:
 def render_chat():
     ws_id = st.session_state.workspace_id
     ensure_connector_state(st.session_state)
+    st.session_state.setdefault("pending_tool_approval", None)
 
     st.markdown(f"## 💬 Chat — {st.session_state.workspace_name}")
 
@@ -519,6 +558,8 @@ def render_chat():
 
                         if msg.get("validation_error"):
                             _render_validation_error_card(msg)
+                        if msg.get("approval_required"):
+                            _render_approval_card(msg, msg_idx)
 
                         # ── Connect-required card ─────────────────────────────
                         if msg.get("connect_required"):
@@ -550,6 +591,50 @@ def render_chat():
                                 st.rerun()
 
         # ── Handle pending retry (from connect_required → Retry button) ───────
+        pending_approval = st.session_state.get("pending_tool_approval")
+        if pending_approval:
+            resume_token = pending_approval.get("resume_token", "")
+            st.session_state.pending_tool_approval = None
+            if resume_token:
+                from tools.tool_executor import (
+                    get_pending_request,
+                    mark_request_approved,
+                    mark_request_resumed,
+                    mark_request_completed,
+                )
+
+                pending = get_pending_request(db, resume_token)
+                if pending:
+                    mark_request_approved(db, resume_token)
+                    mark_request_resumed(db, resume_token)
+                    context = dict(getattr(pending, "context_json", {}) or {})
+                    context["approval_granted"] = True
+                    approved_keys = list(context.get("approved_idempotency_keys", []) or [])
+                    if getattr(pending, "idempotency_key", "") and pending.idempotency_key not in approved_keys:
+                        approved_keys.append(pending.idempotency_key)
+                    context["approved_idempotency_keys"] = approved_keys
+                    workflow_key = context.get("workflow_key")
+                    retry_connector_context = context.get("connector_context") or build_connector_context(st.session_state)
+                    with st.spinner("✅ Approval recorded. Running action..."):
+                        result = handle_request(
+                            pending.original_input,
+                            ws_id,
+                            db,
+                            force_agent=pending.agent_key if (pending.agent_key and not workflow_key) else None,
+                            force_workflow=workflow_key,
+                            resume_state=context,
+                            connector_context=retry_connector_context,
+                        )
+                    if result.get("mode") not in {
+                        "connect_required", "auth_unavailable", "invalid_tool",
+                        "validation_error", "tool_error"
+                    } and not result.get("error", False):
+                        mark_request_completed(db, resume_token)
+                    if result.get("connector_context"):
+                        st.session_state.connector_context = result["connector_context"]
+                    _append_result_to_history(result, original_input=pending.original_input)
+                    st.rerun()
+
         pending_retry = st.session_state.get("pending_tool_retry")
         if pending_retry:
             retry_input = pending_retry["original_input"]
@@ -578,6 +663,8 @@ def render_chat():
 
                     pending = get_pending_request(db, resume_token)
                     if pending:
+                        if getattr(pending, "requested_toolkit", ""):
+                            refresh_connector_status(ws_id, pending.requested_toolkit, db, request_cache={})
                         mark_request_resumed(db, resume_token)
                         context = pending.context_json or {}
                         workflow_key = context.get("workflow_key")
@@ -703,6 +790,10 @@ def _append_result_to_history(result: dict, original_input: str = "") -> None:
     if result.get("mode") == "validation_error":
         entry["validation_error"] = True
         entry["original_input"] = original_input
+        entry["approval_required"] = result.get("approval_required", False)
+        entry["approval_requirement"] = result.get("approval_requirement")
+        entry["resume_token"] = result.get("resume_token", "")
+        entry["pending_kind"] = result.get("pending_kind", "")
 
     # If connect_required, attach extra fields for the connector card
     if result.get("mode") == "connect_required":

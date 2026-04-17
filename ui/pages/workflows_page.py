@@ -157,6 +157,52 @@ def render_workflows():
                                 elif result.get("mode") == "validation_error":
                                     st.error(f"❌ **Validation Error** at step: {result.get('step_label')}")
                                     st.markdown(result["output"])
+                                    if result.get("approval_required") and result.get("resume_token"):
+                                        st.info("This workflow step is waiting for explicit approval.")
+                                        if st.button("Approve & Run Step", key=f"wf_approve_{key}", type="primary"):
+                                            from tools.tool_executor import (
+                                                get_pending_request,
+                                                mark_request_approved,
+                                                mark_request_resumed,
+                                                mark_request_completed,
+                                            )
+                                            pending = get_pending_request(db, result["resume_token"])
+                                            if pending:
+                                                mark_request_approved(db, result["resume_token"])
+                                                mark_request_resumed(db, result["resume_token"])
+                                                context = dict(getattr(pending, "context_json", {}) or {})
+                                                context["approval_granted"] = True
+                                                approved_keys = list(context.get("approved_idempotency_keys", []) or [])
+                                                if getattr(pending, "idempotency_key", "") and pending.idempotency_key not in approved_keys:
+                                                    approved_keys.append(pending.idempotency_key)
+                                                context["approved_idempotency_keys"] = approved_keys
+                                                rerun_result = handle_request(
+                                                    pending.original_input,
+                                                    ws_id,
+                                                    db,
+                                                    force_agent=pending.agent_key if (pending.agent_key and not context.get("workflow_key")) else None,
+                                                    force_workflow=context.get("workflow_key"),
+                                                    resume_state=context,
+                                                    connector_context=context.get("connector_context"),
+                                                )
+                                                if rerun_result.get("mode") not in {
+                                                    "connect_required", "auth_unavailable", "invalid_tool",
+                                                    "validation_error", "tool_error"
+                                                } and not rerun_result.get("error", False):
+                                                    mark_request_completed(db, result["resume_token"])
+                                                st.session_state.chat_history.append({
+                                                    "role": "user",
+                                                    "content": f"[{meta['title']} Workflow] {user_input}",
+                                                })
+                                                st.session_state.chat_history.append({
+                                                    "role": "assistant",
+                                                    "content": rerun_result["output"],
+                                                    "label": f"Workflow: {meta['title']}",
+                                                    "icon": meta["icon"],
+                                                    "steps": rerun_result.get("steps", []),
+                                                    "workflow_resumed": rerun_result.get("workflow_resumed", False),
+                                                })
+                                                st.rerun()
                                     st.stop()
 
                                 if result.get("workflow_resumed"):

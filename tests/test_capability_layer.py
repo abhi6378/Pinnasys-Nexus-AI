@@ -242,3 +242,22 @@ class CapabilityLayerTests(unittest.TestCase):
         )
 
         self.assertIn("HUBSPOT_LIST_DEALS", result["candidate_tools"])
+
+    def test_execution_constraint_overrides_manual_connector_for_workflow_steps(self):
+        request = build_capability_request(
+            "assistant",
+            user_input="show my ongoing deals",
+            route_decision={"system_family": "crm", "operation": "read", "route_type": "single_agent"},
+            connector_context={"mode": "manual", "selected_toolkit": "GMAIL", "enforce_toolkit": True},
+            execution_constraint={"toolkit": "HUBSPOT", "required": True, "scope": "workflow_step"},
+        )
+
+        result = resolve_capability_request(
+            "assistant",
+            request,
+            allowed_tool_names=["GMAIL_FETCH_EMAILS", "HUBSPOT_LIST_DEALS"],
+            connector_context={"mode": "manual", "selected_toolkit": "GMAIL", "enforce_toolkit": True},
+        )
+
+        self.assertIn("HUBSPOT_LIST_DEALS", result["candidate_tools"])
+        self.assertNotIn("GMAIL_FETCH_EMAILS", result["candidate_tools"])

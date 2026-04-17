@@ -24,6 +24,9 @@ TOOLKIT_METADATA: dict[str, dict[str, str]] = {
         "auth_mode": "oauth2",
         "schema_source": "composio_live",
         "connection_mode": "managed_account",
+        "ui_exposed": True,
+        "supports_account_selection": True,
+        "minimum_read_support": True,
     },
     "GITHUB": {
         "slug": "github",
@@ -33,6 +36,9 @@ TOOLKIT_METADATA: dict[str, dict[str, str]] = {
         "auth_mode": "oauth2",
         "schema_source": "composio_live",
         "connection_mode": "managed_account",
+        "ui_exposed": True,
+        "supports_account_selection": True,
+        "minimum_read_support": True,
     },
     "SLACK": {
         "slug": "slack",
@@ -42,6 +48,9 @@ TOOLKIT_METADATA: dict[str, dict[str, str]] = {
         "auth_mode": "oauth2",
         "schema_source": "composio_live",
         "connection_mode": "managed_account",
+        "ui_exposed": True,
+        "supports_account_selection": True,
+        "minimum_read_support": True,
     },
     "HUBSPOT": {
         "slug": "hubspot",
@@ -51,6 +60,9 @@ TOOLKIT_METADATA: dict[str, dict[str, str]] = {
         "auth_mode": "oauth2",
         "schema_source": "composio_live",
         "connection_mode": "managed_account",
+        "ui_exposed": True,
+        "supports_account_selection": True,
+        "minimum_read_support": True,
     },
     "GOOGLE_CALENDAR": {
         "slug": "googlecalendar",
@@ -60,6 +72,9 @@ TOOLKIT_METADATA: dict[str, dict[str, str]] = {
         "auth_mode": "oauth2",
         "schema_source": "composio_live",
         "connection_mode": "managed_account",
+        "ui_exposed": True,
+        "supports_account_selection": True,
+        "minimum_read_support": True,
     },
     "GOOGLE_SHEETS": {
         "slug": "googlesheets",
@@ -69,6 +84,9 @@ TOOLKIT_METADATA: dict[str, dict[str, str]] = {
         "auth_mode": "oauth2",
         "schema_source": "composio_live",
         "connection_mode": "managed_account",
+        "ui_exposed": True,
+        "supports_account_selection": True,
+        "minimum_read_support": True,
     },
     "TAVILY": {
         "slug": "tavily",
@@ -79,6 +97,9 @@ TOOLKIT_METADATA: dict[str, dict[str, str]] = {
         "schema_source": "composio_live",
         "connection_mode": "custom_key",
         "setup_message": "Add the Tavily API key in Composio before connecting.",
+        "ui_exposed": False,
+        "supports_account_selection": False,
+        "minimum_read_support": True,
     },
     "TWITTER": {
         "slug": "twitter",
@@ -89,6 +110,9 @@ TOOLKIT_METADATA: dict[str, dict[str, str]] = {
         "schema_source": "composio_live",
         "connection_mode": "custom_key",
         "setup_message": "Configure Twitter developer credentials in Composio before connecting.",
+        "ui_exposed": False,
+        "supports_account_selection": False,
+        "minimum_read_support": True,
     },
     "LINKEDIN": {
         "slug": "linkedin",
@@ -98,6 +122,9 @@ TOOLKIT_METADATA: dict[str, dict[str, str]] = {
         "auth_mode": "oauth2",
         "schema_source": "composio_live",
         "connection_mode": "managed_account",
+        "ui_exposed": True,
+        "supports_account_selection": True,
+        "minimum_read_support": True,
     },
 }
 
@@ -970,6 +997,14 @@ def list_all_tools() -> list[dict]:
 
 def list_toolkits() -> list[str]:
     return sorted({entry["toolkit"] for entry in TOOL_REGISTRY.values()})
+
+
+def list_ui_toolkits() -> list[str]:
+    return [
+        toolkit
+        for toolkit in list_toolkits()
+        if bool(get_toolkit_metadata(toolkit).get("ui_exposed", False))
+    ]
 
 
 def _build_toolkit_alias_map() -> dict[str, str]:

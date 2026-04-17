@@ -19,8 +19,14 @@ Columns:
   toolkit              — Composio toolkit / app name, e.g. "GMAIL"
   status               — connected | pending | revoked | error
   connected_account_id — Composio's opaque account ID once OAuth completes
+  account_label        — UI-safe label / alias for the connected account
+  is_default           — whether this is the preferred active account
   auth_mode            — oauth2 | api_key | jwt | none
   metadata_json        — Arbitrary JSON blob for extra data (scopes, labels, …)
+  last_verified_at     — last time the connection was verified locally/remotely
+  last_seen_remote_at  — last time this account was observed in remote Composio state
+  revoked_at           — when a previously-known account was reconciled as revoked
+  status_reason        — UI-safe explanation for pending/revoked/error states
   created_at           — Row creation timestamp
   updated_at           — Last status/metadata change
 """
@@ -45,6 +51,9 @@ class ToolConnectionModel(Base):
     auth_mode            = Column(String, default="oauth2")         # oauth2 | api_key | jwt | none
     metadata_json        = Column(JSON,   default=dict)
     last_verified_at     = Column(DateTime, nullable=True)
+    last_seen_remote_at  = Column(DateTime, nullable=True)
+    revoked_at           = Column(DateTime, nullable=True)
+    status_reason        = Column(String, default="")
     status_updated_at    = Column(DateTime, default=utc_now, onupdate=utc_now)
     created_at           = Column(DateTime, default=utc_now)
     updated_at           = Column(DateTime, default=utc_now, onupdate=utc_now)

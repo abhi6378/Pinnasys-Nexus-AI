@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any, Optional
 
 from dotenv import load_dotenv
@@ -41,6 +42,10 @@ _clients: dict[str, Any] = {}
 # A default (entity-less) Composio client for catalog / admin operations.
 _default_client: Any = None
 _schema_cache: dict[tuple[str, str], dict] = {}
+_schema_cache_times: dict[tuple[str, str], float] = {}
+_catalog_validation_cache: dict[str, tuple[float, dict]] = {}
+SCHEMA_CACHE_TTL_SECONDS = int(os.getenv("COMPOSIO_SCHEMA_CACHE_TTL_SECONDS", "1800") or "1800")
+CATALOG_CACHE_TTL_SECONDS = int(os.getenv("COMPOSIO_CATALOG_CACHE_TTL_SECONDS", "1800") or "1800")
 
 
 def _entity_id(workspace_id: str) -> str:
@@ -194,6 +199,14 @@ def invalidate_session(user_id: str) -> None:
     stale_keys = [cache_key for cache_key in _schema_cache if cache_key[0] == _entity_id(user_id)]
     for cache_key in stale_keys:
         _schema_cache.pop(cache_key, None)
+        _schema_cache_times.pop(cache_key, None)
+
+
+def _is_cache_fresh(cache_key: tuple[str, str]) -> bool:
+    cached_at = _schema_cache_times.get(cache_key)
+    if cached_at is None:
+        return False
+    return (time.time() - cached_at) <= SCHEMA_CACHE_TTL_SECONDS
 
 
 def get_session(user_id: str, force_refresh: bool = False) -> Any | None:
@@ -627,12 +640,23 @@ def get_tool_schemas(user_id: str, tool_names: list[str] | None = None) -> list[
         return []
 
     entity_id = _entity_id(user_id)
+    cached_results: dict[str, dict] = {}
+    missing_actions: list[str] = []
+    for action in actions:
+        cache_key = (entity_id, action)
+        if cache_key in _schema_cache and _is_cache_fresh(cache_key):
+            cached_results[action] = dict(_schema_cache[cache_key])
+        else:
+            missing_actions.append(action)
+
+    if not missing_actions:
+        return [dict(cached_results[action]) for action in actions if action in cached_results]
 
     try:
         tools = _coerce_sequence(
-            client.tools.get(user_id=entity_id, tools=actions)
+            client.tools.get(user_id=entity_id, tools=missing_actions)
         )
-        schemas: list[dict] = []
+        fetched_results: dict[str, dict] = {}
         for tool in tools:
             normalized = _normalize_sdk_payload(tool)
             if isinstance(normalized, dict):
@@ -644,11 +668,13 @@ def get_tool_schemas(user_id: str, tool_names: list[str] | None = None) -> list[
                 )
                 if tool_name:
                     _schema_cache[(entity_id, tool_name)] = normalized
-                schemas.append(normalized)
-        return schemas
+                    _schema_cache_times[(entity_id, tool_name)] = time.time()
+                    fetched_results[tool_name] = normalized
+        merged_results = {**cached_results, **fetched_results}
+        return [dict(merged_results[action]) for action in actions if action in merged_results]
     except Exception as exc:
         logger.error("get_tool_schemas failed for user_id=%s: %s", user_id, exc)
-        return []
+        return [dict(cached_results[action]) for action in actions if action in cached_results]
 
 
 def get_live_tool_schema(user_id: str, tool_name: str, force_refresh: bool = False) -> dict:
@@ -656,7 +682,7 @@ def get_live_tool_schema(user_id: str, tool_name: str, force_refresh: bool = Fal
         return {}
     entity_id = _entity_id(user_id or "__catalog__")
     cache_key = (entity_id, tool_name)
-    if not force_refresh and cache_key in _schema_cache:
+    if not force_refresh and cache_key in _schema_cache and _is_cache_fresh(cache_key):
         return dict(_schema_cache[cache_key])
     schemas = get_tool_schemas(user_id or "__catalog__", [tool_name])
     for schema in schemas:
@@ -682,19 +708,27 @@ def validate_tool_slug(tool_name: str) -> dict:
             "error": _import_error or "Composio client not available",
         }
 
+    cached = _catalog_validation_cache.get(tool_name)
+    if cached and (time.time() - cached[0]) <= CATALOG_CACHE_TTL_SECONDS:
+        return dict(cached[1])
+
     try:
         schemas = get_tool_schemas("__catalog__", [tool_name])
-        return {
+        result = {
             "available": True,
             "exists": bool(schemas),
             "error": None,
         }
+        _catalog_validation_cache[tool_name] = (time.time(), dict(result))
+        return result
     except Exception as exc:
-        return {
+        result = {
             "available": False,
             "exists": False,
             "error": str(exc),
         }
+        _catalog_validation_cache[tool_name] = (time.time(), dict(result))
+        return result
 
 
 def execute_tool(

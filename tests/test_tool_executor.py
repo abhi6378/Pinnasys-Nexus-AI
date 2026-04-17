@@ -15,7 +15,7 @@ from tests.support import (
 def load_tool_executor_module():
     ToolCallLogModel = make_model_class(
         "ToolCallLogModel",
-        ["workspace_id", "agent_key", "tool_name", "toolkit", "status"],
+        ["workspace_id", "agent_key", "tool_name", "toolkit", "status", "idempotency_key", "pending_kind", "approval_required"],
     )
     ToolConnectionModel = make_model_class(
         "ToolConnectionModel",
@@ -28,17 +28,58 @@ def load_tool_executor_module():
             "last_verified_at",
             "is_default",
             "account_label",
+            "last_seen_remote_at",
+            "revoked_at",
+            "status_reason",
         ],
     )
     PendingToolRequestModel = make_model_class(
         "PendingToolRequestModel",
-        ["workspace_id", "agent_key", "original_input", "requested_tool", "requested_toolkit", "status", "resume_token"],
+        [
+            "workspace_id",
+            "agent_key",
+            "original_input",
+            "requested_tool",
+            "requested_toolkit",
+            "status",
+            "resume_token",
+            "pending_kind",
+            "idempotency_key",
+            "approval_requirement_json",
+            "approved",
+            "approved_at",
+            "context_json",
+            "conversation_id",
+            "id",
+        ],
+    )
+    ToolIdempotencyRecordModel = make_model_class(
+        "ToolIdempotencyRecordModel",
+        ["workspace_id", "tool_name", "idempotency_key", "status", "pending_request_id", "input_hash", "output_json", "id"],
     )
     stubs = {}
     stubs.update(make_sqlalchemy_stubs())
     stubs["tools.tool_registry"] = make_module(
         "tools.tool_registry",
         get_tool=lambda tool_name: None,
+        get_tool_approval_requirement=lambda tool_name: type(
+            "ApprovalRequirement",
+            (),
+            {
+                "required": False,
+                "risk_level": "low",
+                "reason": "",
+                "mode": "auto",
+                "to_dict": lambda self: {
+                    "required": False,
+                    "risk_level": "low",
+                    "reason": "",
+                    "categories": [],
+                    "mode": "auto",
+                },
+            },
+        )(),
+        get_tool_idempotency_fields=lambda tool_name: (),
         is_agent_allowed=lambda tool_name, agent_key: True,
     )
     stubs["tools.composio_client"] = make_module(
@@ -62,6 +103,10 @@ def load_tool_executor_module():
     stubs["models.pending_tool_requests"] = make_module(
         "models.pending_tool_requests",
         PendingToolRequestModel=PendingToolRequestModel,
+    )
+    stubs["models.tool_idempotency_records"] = make_module(
+        "models.tool_idempotency_records",
+        ToolIdempotencyRecordModel=ToolIdempotencyRecordModel,
     )
     return import_fresh("tools.tool_executor", stubs)
 
@@ -334,3 +379,86 @@ class AttemptToolCallTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "validation_error")
         self.assertIn("must be an integer", result["error"])
+
+    def test_attempt_tool_call_blocks_unapproved_high_risk_write(self):
+        db = FakeSession({
+            self.tool_executor.PendingToolRequestModel: FakeQuery(first_result=None),
+            self.tool_executor.ToolIdempotencyRecordModel: FakeQuery(first_result=None),
+        })
+        tool_entry = {
+            "toolkit": "GMAIL",
+            "expected_params": ["recipient_email", "body"],
+            "requires_auth": False,
+            "write_action": True,
+        }
+        approval_requirement = type(
+            "ApprovalRequirement",
+            (),
+            {
+                "required": True,
+                "risk_level": "high",
+                "reason": "Sends a real email.",
+                "mode": "confirm_or_explicit_execute",
+                "to_dict": lambda self: {
+                    "required": True,
+                    "risk_level": "high",
+                    "reason": "Sends a real email.",
+                    "categories": ["email"],
+                    "mode": "confirm_or_explicit_execute",
+                },
+            },
+        )()
+        with patch_attr(self.tool_executor, "get_tool", Spy(return_value=tool_entry)), \
+             patch_attr(self.tool_executor, "is_agent_allowed", Spy(return_value=True)), \
+             patch_attr(self.tool_executor, "get_tool_approval_requirement", Spy(return_value=approval_requirement)), \
+             patch_attr(self.tool_executor, "get_tool_idempotency_fields", Spy(return_value=("recipient_email", "body"))):
+            result = self.tool_executor.attempt_tool_call(
+                "GMAIL_SEND_EMAIL",
+                "assistant",
+                "ws1",
+                db,
+                input_args={"recipient_email": "user@example.com", "body": "hi"},
+                original_input="send it",
+            )
+
+        self.assertEqual(result["status"], "validation_error")
+        self.assertTrue(result["approval_required"])
+        self.assertEqual(result["pending_kind"], "approval")
+        self.assertTrue(result["resume_token"])
+
+    def test_attempt_tool_call_replays_successful_idempotent_write_without_reexecution(self):
+        existing_record = self.tool_executor.ToolIdempotencyRecordModel(
+            workspace_id="ws1",
+            tool_name="GMAIL_SEND_EMAIL",
+            idempotency_key="abc123",
+            status="success",
+            input_hash="",
+            output_json={"ok": True},
+        )
+        db = FakeSession({
+            self.tool_executor.ToolIdempotencyRecordModel: FakeQuery(first_result=existing_record),
+        })
+        tool_entry = {
+            "toolkit": "GMAIL",
+            "expected_params": ["recipient_email", "body"],
+            "requires_auth": False,
+            "write_action": True,
+        }
+        execute_tool = Spy(return_value={"data": {"ok": False}, "error": None})
+        with patch_attr(self.tool_executor, "get_tool", Spy(return_value=tool_entry)), \
+             patch_attr(self.tool_executor, "is_agent_allowed", Spy(return_value=True)), \
+             patch_attr(self.tool_executor, "get_tool_idempotency_fields", Spy(return_value=("recipient_email", "body"))), \
+             patch_attr(self.tool_executor, "execute_tool", execute_tool):
+            result = self.tool_executor.attempt_tool_call(
+                "GMAIL_SEND_EMAIL",
+                "assistant",
+                "ws1",
+                db,
+                input_args={"recipient_email": "user@example.com", "body": "hi"},
+                context_json={"idempotency_key": "abc123"},
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["output"], {"ok": True})
+        self.assertTrue(result["idempotent_replay"])
+        self.assertEqual(len(execute_tool.calls), 0)

@@ -21,7 +21,11 @@ from workflows.engine import run_workflow, WORKFLOWS
 from storage import repositories as repo
 from llm.client import generate_json
 from orchestrator.router import route_request
-from tools.connector_service import normalize_connector_context, validate_connector_context
+from tools.connector_service import (
+    normalize_connector_context,
+    refresh_connector_status,
+    validate_connector_context,
+)
 from utils.logging_utils import log_event, log_exception, request_context
 
 logger = logging.getLogger(__name__)
@@ -266,7 +270,7 @@ def _exec_single_agent(agent_key: str, user_input: str,
         }
 
     if agent_result.get("mode") == "validation_error":
-        return {
+        result = {
             "mode":    "validation_error",
             "agent":   agent_key,
             "name":    agent_result.get("name", agent_key),
@@ -274,6 +278,10 @@ def _exec_single_agent(agent_key: str, user_input: str,
             "steps":   [],
             "error":   True,
         }
+        for field in ("approval_required", "approval_requirement", "resume_token", "pending_kind"):
+            if field in agent_result:
+                result[field] = agent_result.get(field)
+        return result
 
     if agent_result.get("mode") == "tool_error":
         return {
@@ -336,6 +344,9 @@ def _exec_workflow(workflow_key: str, user_input: str,
             "workflow_paused":  True,
             "step_label":       wf_result.get("step_label"),
             "error":            interrupt_mode != "connect_required",
+            "approval_required": interrupt.get("approval_required", False),
+            "approval_requirement": interrupt.get("approval_requirement"),
+            "pending_kind": interrupt.get("pending_kind", ""),
         }
 
     if wf_result.get("error") and wf_result.get("mode") in {
@@ -356,6 +367,10 @@ def _exec_workflow(workflow_key: str, user_input: str,
             "is_workflow": True,
             "workflow_paused": mode in {"auth_unavailable", "invalid_tool", "validation_error"},
             "step_label": wf_result.get("step_label"),
+            "approval_required": wf_result.get("approval_required", False),
+            "approval_requirement": wf_result.get("approval_requirement"),
+            "resume_token": wf_result.get("resume_token", ""),
+            "pending_kind": wf_result.get("pending_kind", ""),
         }
 
     # ── Normal workflow response ──────────────────────────────────────

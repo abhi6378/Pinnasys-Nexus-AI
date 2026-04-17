@@ -9,6 +9,7 @@ def load_connector_service_module():
     stubs["storage.repositories"] = make_module(
         "storage.repositories",
         upsert_tool_connection=lambda *args, **kwargs: None,
+        set_tool_connection_status=lambda *args, **kwargs: None,
         list_tool_connections=lambda *args, **kwargs: [],
         get_workspace_connector_preference=lambda *args, **kwargs: None,
         upsert_workspace_connector_preference=lambda *args, **kwargs: None,
@@ -23,6 +24,7 @@ def load_connector_service_module():
         get_toolkit_label=lambda toolkit: toolkit.title(),
         get_toolkit_metadata=lambda toolkit: {"label": toolkit.title(), "slug": toolkit.lower(), "auth_mode": "oauth2"},
         list_toolkits=lambda: [],
+        list_ui_toolkits=lambda: [],
         normalize_toolkit_key=lambda toolkit: str(toolkit or "").upper(),
     )
     stubs["utils.time_utils"] = make_module(
@@ -42,7 +44,7 @@ class ConnectorServiceTests(unittest.TestCase):
         self.connector_service = load_connector_service_module()
 
     def test_list_workspace_connectors_is_local_first_and_lazy_about_connect_urls(self):
-        with patch_attr(self.connector_service, "list_toolkits", lambda: ["GMAIL", "HUBSPOT"]), \
+        with patch_attr(self.connector_service, "list_ui_toolkits", lambda: ["GMAIL", "HUBSPOT"]), \
              patch_attr(
                  self.connector_service,
                  "list_connector_accounts",
@@ -188,3 +190,40 @@ class ConnectorServiceTests(unittest.TestCase):
         self.assertEqual(loaded.selected_toolkit, "HUBSPOT")
         self.assertEqual(loaded.selected_account_id, "acct-9")
         self.assertEqual(loaded.source, "sidebar")
+
+    def test_synchronize_connector_accounts_revokes_missing_local_accounts(self):
+        revoked = Spy()
+        with patch_attr(
+            self.connector_service.repo,
+            "list_tool_connections",
+            lambda db, workspace_id, toolkit="": [
+                type(
+                    "Row",
+                    (),
+                    {
+                        "connected_account_id": "acct-old",
+                        "status": "connected",
+                    },
+                )()
+            ],
+        ), \
+             patch_attr(self.connector_service.repo, "upsert_tool_connection", Spy()), \
+             patch_attr(self.connector_service.repo, "set_tool_connection_status", revoked), \
+             patch_attr(
+                 self.connector_service,
+                 "list_connected_accounts",
+                 lambda workspace_id, toolkit, force_refresh=False: [
+                     {"connected_account_id": "acct-new", "account_alias": "Primary HubSpot", "status": "connected"},
+                 ],
+             ):
+            accounts = self.connector_service.synchronize_connector_accounts(
+                "ws-1",
+                "HUBSPOT",
+                object(),
+                force_refresh=True,
+                request_cache={},
+            )
+
+        self.assertEqual(accounts[0].connected_account_id, "acct-new")
+        self.assertEqual(revoked.calls[0][1]["connected_account_id"], "acct-old")
+        self.assertEqual(revoked.calls[0][1]["status"], "revoked")

@@ -30,7 +30,7 @@ from typing import Optional
 
 from helpers.configs import get_agent
 from llm.client import generate, generate_with_tool_awareness
-from models.contracts import ConnectorContext, ToolPlan
+from models.contracts import ConnectorContext, ExecutionConstraint, ToolPlan
 from tools.capability_layer import (
     build_capability_request,
     build_tool_usage_guidance,
@@ -38,7 +38,7 @@ from tools.capability_layer import (
     resolve_agent_tool_access,
 )
 from tools.composio_client import get_tool_schemas
-from tools.tool_broker import ComposioDirectBroker, build_tool_plan
+from tools.tool_broker import build_tool_plan, get_tool_broker
 from tools.tool_registry import (
     get_tools_by_names,
     get_tool,
@@ -152,6 +152,9 @@ def _extract_tool_plan(
     user_input: str,
     route_context: dict | None = None,
     iteration: int = 1,
+    default_capability_hint: dict | None = None,
+    execution_constraint: ExecutionConstraint | dict | None = None,
+    connector_context: ConnectorContext | dict | None = None,
 ) -> ToolPlan | None:
     parsed = _extract_tool_call(raw_output)
     if parsed is not None:
@@ -163,9 +166,13 @@ def _extract_tool_plan(
             params=tool_call.get("params", {}),
             llm_message=parsed.get("message", ""),
             route_decision=route_context,
-            capability_hint=tool_call.get("capability_request") or {},
+            capability_hint=_merge_capability_hint(
+                default_capability_hint,
+                tool_call.get("capability_request") or {},
+            ),
             iteration=iteration,
-            connector_context=(route_context or {}).get("connector_context"),
+            connector_context=connector_context or (route_context or {}).get("connector_context"),
+            execution_constraint=execution_constraint,
         )
 
     if isinstance(raw_output, dict):
@@ -182,25 +189,42 @@ def _extract_tool_plan(
 
     capability_request = parsed_dict.get("capability_request")
     if isinstance(capability_request, dict):
+        merged_hint = _merge_capability_hint(default_capability_hint, capability_request)
         capability = build_capability_request(
             agent_key,
             user_input=user_input,
             route_decision=route_context,
-            requested_tool_name=str(capability_request.get("tool_name", "") or ""),
-            capability_hint=capability_request,
-            connector_context=(route_context or {}).get("connector_context"),
+            requested_tool_name=str(merged_hint.get("tool_name", "") or ""),
+            capability_hint=merged_hint,
+            connector_context=connector_context or (route_context or {}).get("connector_context"),
+            execution_constraint=execution_constraint,
         )
         return ToolPlan(
             agent_key=agent_key,
             user_intent=user_input,
             llm_message=str(parsed_dict.get("message", "") or ""),
             capability=capability,
-            concrete_tool_name=capability_request.get("tool_name"),
-            params=dict(capability_request.get("params", {}) or {}),
+            concrete_tool_name=merged_hint.get("tool_name"),
+            params=dict(merged_hint.get("params", {}) or capability_request.get("params", {}) or {}),
             raw_request=parsed_dict,
             iteration=iteration,
+            execution_constraint=ExecutionConstraint.from_value(execution_constraint),
         )
     return None
+
+
+def _merge_capability_hint(
+    default_hint: dict | None,
+    request_hint: dict | None,
+) -> dict:
+    merged = dict(default_hint or {})
+    incoming = dict(request_hint or {})
+    incoming_params = dict(incoming.pop("params", {}) or {})
+    existing_params = dict(merged.get("params", {}) or {})
+    merged.update(incoming)
+    if existing_params or incoming_params:
+        merged["params"] = {**existing_params, **incoming_params}
+    return merged
 
 
 def _format_connect_required_message(
@@ -495,11 +519,27 @@ def _run_with_tools(
     executed_tools: list[str] = []
     # Track (tool_name, params_hash) to prevent identical repeated calls.
     seen_calls: set[tuple[str, str]] = set()
-    broker = ComposioDirectBroker()
+    broker = get_tool_broker()
     connector = ConnectorContext.from_value(connector_context or (route_context or {}).get("connector_context"))
     execution_context = dict(workflow_state or {})
     if not connector.is_auto():
         execution_context.setdefault("connector_context", connector.to_dict())
+    workflow_capability_hint = dict(execution_context.get("capability_hint", {}) or {})
+    step_execution_constraint = ExecutionConstraint.from_value(
+        execution_context.get("step_execution_constraint")
+    )
+    prompt_connector = connector
+    if step_execution_constraint.toolkit and step_execution_constraint.toolkit != connector.selected_toolkit:
+        prompt_connector = ConnectorContext(
+            mode="manual",
+            selected_toolkit=step_execution_constraint.toolkit,
+            selected_connector_key=step_execution_constraint.toolkit,
+            selected_account_id=step_execution_constraint.account_id if step_execution_constraint.toolkit == connector.selected_toolkit else "",
+            selected_account_alias=step_execution_constraint.account_alias if step_execution_constraint.toolkit == connector.selected_toolkit else "",
+            enforce_toolkit=True,
+            enforce_account=bool(step_execution_constraint.account_id and step_execution_constraint.toolkit == connector.selected_toolkit),
+            source=step_execution_constraint.source or "workflow_step",
+        )
     resolved_access = capability_access or resolve_agent_tool_access(agent_key, agent_config=agent)
     # Build the policy-level allow-set once for fast O(1) membership tests.
     config_allowed: set[str] = set(resolved_access.get("allowed_tools", []))
@@ -508,13 +548,24 @@ def _run_with_tools(
         messages.extend(history[-10:])
     messages.append({"role": "user", "content": user_input})
     prompt_tools = available_tools
+    workflow_capability_request = None
+    if workflow_capability_hint or not step_execution_constraint.is_empty():
+        workflow_capability_request = build_capability_request(
+            agent_key,
+            user_input=user_input,
+            route_decision=route_context,
+            capability_hint=workflow_capability_hint,
+            connector_context=connector,
+            execution_constraint=step_execution_constraint,
+        )
     try:
         filter_result = prepare_tools_for_prompt(
             agent_key,
             available_tools,
             user_input,
             route_decision=route_context,
-            connector_context=connector,
+            capability_request=workflow_capability_request,
+            connector_context=prompt_connector,
         )
         prompt_tools = filter_result.get("tools") or available_tools
         log_event(
@@ -589,6 +640,9 @@ def _run_with_tools(
             user_input=user_input,
             route_context=route_context,
             iteration=iteration + 1,
+            default_capability_hint=workflow_capability_hint,
+            execution_constraint=step_execution_constraint,
+            connector_context=connector,
         )
 
         if tool_plan is None:
@@ -821,7 +875,7 @@ def _run_with_tools(
 
         if status == "validation_error":
             error_msg = result.get("error", "Invalid tool request")
-            return {
+            response = {
                 "agent": agent_key,
                 "name": agent_name,
                 "output": _format_validation_error_message(
@@ -833,6 +887,10 @@ def _run_with_tools(
                 "mode": "validation_error",
                 "tool_used": tool_used,
             }
+            for field in ("approval_required", "approval_requirement", "resume_token", "pending_kind"):
+                if field in result:
+                    response[field] = result.get(field)
+            return response
 
         # ── failure: stop cleanly instead of falling back to generic text ─
         if status in ("failure", "timeout"):

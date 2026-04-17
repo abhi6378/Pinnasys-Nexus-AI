@@ -3,7 +3,7 @@ ui/sidebar.py  —  Workspace selector + navigation sidebar
 """
 import streamlit as st
 from storage.db import SessionLocal
-from tools.connector_service import list_workspace_connectors, persist_connector_context
+from tools.connector_service import list_workspace_connectors, persist_connector_context, refresh_connector_status
 from ui.connector_state import default_connector_context, ensure_connector_state, set_connector_selection
 from workspace.manager import list_workspaces, create_workspace, get_workspace_context
 
@@ -166,6 +166,22 @@ def render_sidebar():
                                 selected_toolkit=toolkit,
                                 selected_account_id=selected_account["connected_account_id"],
                                 selected_account_alias=selected_account["account_alias"],
+                                source="sidebar",
+                            )
+                            persist_connector_context(st.session_state.workspace_id, st.session_state.connector_context, db)
+                            st.rerun()
+                        if st.button(
+                            f"Refresh {connector['label']}",
+                            key=f"sidebar_refresh_{toolkit}",
+                            use_container_width=True,
+                        ):
+                            refreshed = refresh_connector_status(st.session_state.workspace_id, toolkit, db, request_cache={})
+                            set_connector_selection(
+                                st.session_state,
+                                mode="manual",
+                                selected_toolkit=toolkit,
+                                selected_account_id=str(refreshed.effective_account_id or current_account_id or ""),
+                                selected_account_alias=str(refreshed.effective_account_alias or ""),
                                 source="sidebar",
                             )
                             persist_connector_context(st.session_state.workspace_id, st.session_state.connector_context, db)

@@ -134,6 +134,7 @@ def load_handler_module():
             selected_toolkit=str((value or {}).get("selected_toolkit", "") or ""),
             selected_account_id=str((value or {}).get("selected_account_id", "") or ""),
         ),
+        refresh_connector_status=lambda *args, **kwargs: StubConnectorStatus(),
         validate_connector_context=lambda connector, workspace_id, db, **kwargs: (
             connector,
             StubConnectorStatus(),
@@ -409,3 +410,31 @@ class HandleRequestTests(unittest.TestCase):
         self.assertEqual(result["output"], "Bad connector")
         self.assertEqual(result["connector_status"]["validation_status"], "invalid_toolkit")
         self.assertEqual(len(self.handler.repo.save_conversation.calls), 0)
+
+    def test_exec_single_agent_preserves_approval_metadata_on_validation_error(self):
+        with patch_attr(
+            self.handler,
+            "run_agent",
+            Spy(return_value={
+                "mode": "validation_error",
+                "name": "Assistant",
+                "output": "Approval required before send.",
+                "success": False,
+                "approval_required": True,
+                "approval_requirement": {"required": True, "risk_level": "high"},
+                "resume_token": "resume-1",
+                "pending_kind": "approval",
+            }),
+        ):
+            result = self.handler._exec_single_agent(
+                "assistant",
+                "send it",
+                "ctx",
+                workspace_id="ws1",
+                db=object(),
+            )
+
+        self.assertEqual(result["mode"], "validation_error")
+        self.assertTrue(result["approval_required"])
+        self.assertEqual(result["resume_token"], "resume-1")
+        self.assertEqual(result["pending_kind"], "approval")

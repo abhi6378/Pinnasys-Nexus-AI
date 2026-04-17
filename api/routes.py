@@ -14,7 +14,11 @@ from workspace.manager import create_workspace, list_workspaces, get_workspace_c
 from brain.quiz_engine import get_next_question, save_answer, quiz_progress
 from orchestrator.handler import handle_request
 from helpers.configs import list_agents
-from tools.connector_service import list_connector_accounts, list_workspace_connectors
+from tools.connector_service import (
+    list_connector_accounts,
+    list_workspace_connectors,
+    refresh_connector_status,
+)
 from tools.composio_client import get_connect_link
 from utils.logging_utils import configure_logging
 
@@ -46,6 +50,10 @@ class ChatRequest(BaseModel):
     connector_context: Optional[dict] = None
 
 class ResumeRequest(BaseModel):
+    resume_token: str
+    workspace_id: str
+
+class ApproveRequest(BaseModel):
     resume_token: str
     workspace_id: str
 
@@ -129,6 +137,13 @@ def api_chat_resume(req: ResumeRequest, db: Session = Depends(get_db)):
     # Invalidate stale Composio session so fresh connection state is picked up
     from tools.composio_client import invalidate_session
     invalidate_session(req.workspace_id)
+    if getattr(pending, "requested_toolkit", ""):
+        refresh_connector_status(
+            req.workspace_id,
+            pending.requested_toolkit,
+            db,
+            request_cache={},
+        )
 
     # Determine if this was a workflow resume
     context = pending.context_json or {}
@@ -142,6 +157,51 @@ def api_chat_resume(req: ResumeRequest, db: Session = Depends(get_db)):
         db,
         force_agent=pending.agent_key if (pending.agent_key and not wf_key) else None,
         force_workflow=wf_key,
+        resume_state=context,
+        connector_context=connector_context,
+    )
+    if result.get("mode") not in {
+        "connect_required", "auth_unavailable", "invalid_tool",
+        "validation_error", "tool_error"
+    } and not result.get("error", False):
+        mark_request_completed(db, req.resume_token)
+    return result
+
+
+@app.post("/chat/approve")
+def api_chat_approve(req: ApproveRequest, db: Session = Depends(get_db)):
+    from tools.tool_executor import (
+        get_pending_request,
+        mark_request_approved,
+        mark_request_resumed,
+        mark_request_completed,
+    )
+
+    pending = get_pending_request(db, req.resume_token)
+    if not pending:
+        raise HTTPException(
+            status_code=404,
+            detail="Resume token not found or already used.",
+        )
+
+    mark_request_approved(db, req.resume_token)
+    mark_request_resumed(db, req.resume_token)
+
+    context = dict(getattr(pending, "context_json", {}) or {})
+    context["approval_granted"] = True
+    approved_keys = list(context.get("approved_idempotency_keys", []) or [])
+    if getattr(pending, "idempotency_key", "") and pending.idempotency_key not in approved_keys:
+        approved_keys.append(pending.idempotency_key)
+    context["approved_idempotency_keys"] = approved_keys
+    workflow_key = context.get("workflow_key")
+    connector_context = context.get("connector_context")
+
+    result = handle_request(
+        pending.original_input,
+        req.workspace_id,
+        db,
+        force_agent=pending.agent_key if (pending.agent_key and not workflow_key) else None,
+        force_workflow=workflow_key,
         resume_state=context,
         connector_context=connector_context,
     )
@@ -242,6 +302,12 @@ def api_list_connector_accounts(workspace_id: str, toolkit: str, refresh: bool =
 @app.get("/workspace/{workspace_id}/connectors/{toolkit}/connect-link")
 def api_get_connector_link(workspace_id: str, toolkit: str):
     return {"connect_url": get_connect_link(workspace_id, toolkit)}
+
+
+@app.post("/workspace/{workspace_id}/connectors/{toolkit}/refresh")
+def api_refresh_connector(workspace_id: str, toolkit: str, db: Session = Depends(get_db)):
+    summary = refresh_connector_status(workspace_id, toolkit, db, request_cache={})
+    return summary.to_dict()
 
 
 # ── Ideas Inbox ───────────────────────────────────────────────────────────────

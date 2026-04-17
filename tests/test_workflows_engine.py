@@ -65,3 +65,32 @@ class WorkflowEngineTests(unittest.TestCase):
 
         self.assertIn("HubSpot: ✅ Synced", result["final_output"])
         self.assertIn("Google Sheets: ✅ Logged", result["final_output"])
+
+    def test_workflow_step_connector_hints_override_manual_connector_per_step(self):
+        step_connectors = []
+
+        def fake_run_agent(agent_key, user_input, brain_context="", **kwargs):
+            step_connectors.append(
+                (
+                    kwargs.get("workflow_state", {}).get("current_step"),
+                    kwargs.get("connector_context", {}),
+                )
+            )
+            return {
+                "name": agent_key.title(),
+                "output": "done",
+                "success": True,
+            }
+
+        with patch_attr(engine, "run_agent", Spy(side_effect=fake_run_agent)):
+            engine.lead_capture_workflow(
+                "Jane Doe jane@example.com",
+                "ctx",
+                connector_context={"mode": "manual", "selected_toolkit": "GMAIL", "selected_account_id": "acct-1"},
+            )
+
+        step_map = {step: connector for step, connector in step_connectors}
+        self.assertEqual(step_map["Extract Lead"]["selected_toolkit"], "GMAIL")
+        self.assertEqual(step_map["Log to HubSpot"]["selected_toolkit"], "HUBSPOT")
+        self.assertEqual(step_map["Log to HubSpot"]["selected_account_id"], "")
+        self.assertEqual(step_map["Log to Sheets"]["selected_toolkit"], "GOOGLE_SHEETS")

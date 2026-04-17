@@ -15,7 +15,7 @@ Statuses:
   validation_error  — tool_name or agent not allowed
   timeout           — tool execution timed out
 """
-from sqlalchemy import Column, String, Text, DateTime, JSON, Float
+from sqlalchemy import Boolean, Column, String, Text, DateTime, JSON, Float
 
 from storage.db import Base, new_id
 from utils.time_utils import utc_now
@@ -30,6 +30,9 @@ class ToolCallLogModel(Base):
     tool_name       = Column(String,   nullable=False)       # tool slug
     toolkit         = Column(String,   default="")           # parent toolkit
     status          = Column(String,   nullable=False)       # success | failure | connect_required | …
+    idempotency_key = Column(String,   default="")
+    pending_kind    = Column(String,   default="")
+    approval_required = Column(Boolean, default=False)
     input_json      = Column(JSON,     default=dict)         # arguments sent to the tool
     output_json     = Column(JSON,     default=dict)         # raw response from Composio
     error_message   = Column(Text,     default="")           # human-readable error, if any

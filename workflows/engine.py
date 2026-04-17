@@ -8,7 +8,13 @@ except Exception:  # pragma: no cover - fallback for constrained test environmen
     Session = object
 
 from helpers.executor import run_agent
-from models.contracts import CapabilityRequest, WorkflowStepResult, WorkflowStepSpec
+from models.contracts import (
+    CapabilityRequest,
+    ConnectorContext,
+    ExecutionConstraint,
+    WorkflowStepResult,
+    WorkflowStepSpec,
+)
 
 
 @dataclass(frozen=True)
@@ -78,6 +84,63 @@ def _find_step(steps: list[dict], label: str) -> dict:
     return {}
 
 
+def _build_step_execution_constraint(
+    label: str,
+    *,
+    capability_hint: CapabilityRequest | None = None,
+    connector_context: dict | None = None,
+) -> tuple[ExecutionConstraint, ConnectorContext]:
+    user_connector = ConnectorContext.from_value(connector_context)
+    hinted_toolkit = str((capability_hint.toolkit_family if capability_hint else "") or "").upper()
+    if hinted_toolkit:
+        preserve_user_account = user_connector.selected_toolkit == hinted_toolkit
+        return (
+            ExecutionConstraint(
+                toolkit=hinted_toolkit,
+                account_id=user_connector.selected_account_id if preserve_user_account else "",
+                account_alias=user_connector.selected_account_alias if preserve_user_account else "",
+                source="workflow_step",
+                scope="workflow_step",
+                required=True,
+                reason=f"Workflow step '{label}' requires toolkit {hinted_toolkit}.",
+            ),
+            ConnectorContext(
+                mode="manual",
+                selected_toolkit=hinted_toolkit,
+                selected_connector_key=hinted_toolkit,
+                selected_account_id=user_connector.selected_account_id if preserve_user_account else "",
+                selected_account_alias=user_connector.selected_account_alias if preserve_user_account else "",
+                enforce_toolkit=True,
+                enforce_account=bool(preserve_user_account and user_connector.selected_account_id),
+                source="workflow_step",
+                display_label=user_connector.display_label if preserve_user_account else "",
+                validation_status=user_connector.validation_status if preserve_user_account else "ok",
+                stale_selection=user_connector.stale_selection if preserve_user_account else False,
+                status_reason=user_connector.status_reason if preserve_user_account else "",
+                available_account_count=user_connector.available_account_count if preserve_user_account else 0,
+                effective_account_id=user_connector.effective_account_id if preserve_user_account else "",
+                effective_account_alias=user_connector.effective_account_alias if preserve_user_account else "",
+                connected=user_connector.connected if preserve_user_account else False,
+            ),
+        )
+
+    if user_connector.is_auto():
+        return ExecutionConstraint(), ConnectorContext()
+
+    return (
+        ExecutionConstraint(
+            toolkit=user_connector.selected_toolkit,
+            account_id=user_connector.selected_account_id,
+            account_alias=user_connector.selected_account_alias,
+            source=user_connector.source or "chat_input",
+            scope="request",
+            required=True,
+            reason="User-selected connector constraint.",
+        ),
+        user_connector,
+    )
+
+
 def _step(
     label: str,
     agent_key: str,
@@ -98,6 +161,11 @@ def _step(
         if prev.get("step") == label:
             return prev
 
+    step_constraint, effective_connector = _build_step_execution_constraint(
+        label,
+        capability_hint=capability_hint,
+        connector_context=connector_context,
+    )
     workflow_state = {
         "workflow_key": current_workflow_key,
         "completed_steps": completed_steps,
@@ -106,6 +174,8 @@ def _step(
     }
     if capability_hint:
         workflow_state["capability_hint"] = capability_hint.to_dict()
+    if not step_constraint.is_empty():
+        workflow_state["step_execution_constraint"] = step_constraint.to_dict()
 
     result = run_agent(
         agent_key,
@@ -114,7 +184,7 @@ def _step(
         workspace_id=workspace_id,
         db=db,
         workflow_state=workflow_state,
-        connector_context=connector_context,
+        connector_context=effective_connector.to_dict(),
     )
 
     interrupt_modes = {

@@ -19,6 +19,8 @@ Execution contract (per call):
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import time
@@ -34,6 +36,8 @@ except Exception:  # pragma: no cover - fallback for constrained test environmen
 try:
     from tools.tool_registry import (
         get_tool,
+        get_tool_approval_requirement,
+        get_tool_idempotency_fields,
         get_tool_schema,
         get_toolkit_runtime_config,
         is_agent_allowed,
@@ -60,6 +64,22 @@ except ImportError:
         tool_entry = get_tool(tool_name) or {}
         return dict(tool_entry.get("schema", {}))
 
+    def get_tool_approval_requirement(tool_name: str):
+        return type(
+            "ApprovalRequirement",
+            (),
+            {"required": False, "risk_level": "low", "reason": "", "mode": "auto", "to_dict": lambda self: {
+                "required": False,
+                "risk_level": "low",
+                "reason": "",
+                "categories": [],
+                "mode": "auto",
+            }},
+        )()
+
+    def get_tool_idempotency_fields(tool_name: str) -> tuple[str, ...]:
+        return ()
+
     def get_toolkit_runtime_config(toolkit: str) -> dict:
         return {}
 from tools.composio_client import (
@@ -74,6 +94,7 @@ from tools.composio_client import (
 from models.tool_call_logs import ToolCallLogModel
 from models.tool_connections import ToolConnectionModel
 from models.pending_tool_requests import PendingToolRequestModel
+from models.tool_idempotency_records import ToolIdempotencyRecordModel
 from utils.logging_utils import log_event, log_exception
 from utils.time_utils import utc_now
 
@@ -191,6 +212,151 @@ def _validate_against_live_schema(input_args: dict, live_schema: dict) -> list[s
     return errors
 
 
+def _get_runtime_schema_cache(context_json: dict | None) -> dict:
+    if not isinstance(context_json, dict):
+        return {}
+    return context_json.setdefault("tool_schema_cache", {})
+
+
+def _get_cached_live_schema(context_json: dict | None, cache_key: str) -> dict:
+    schema_cache = _get_runtime_schema_cache(context_json)
+    cached = schema_cache.get(cache_key)
+    if isinstance(cached, dict):
+        return dict(cached)
+    return {}
+
+
+def _set_cached_live_schema(context_json: dict | None, cache_key: str, schema: dict) -> dict:
+    schema_cache = _get_runtime_schema_cache(context_json)
+    schema_cache[cache_key] = dict(schema or {})
+    return dict(schema or {})
+
+
+def _serialize_idempotency_payload(tool_name: str, input_args: dict, context_json: dict | None = None) -> tuple[str, str]:
+    explicit_key = str((context_json or {}).get("idempotency_key", "") or "").strip()
+    fields = tuple(get_tool_idempotency_fields(tool_name) or ())
+    if fields:
+        payload = {field: input_args.get(field) for field in fields if field in input_args}
+    else:
+        payload = dict(input_args or {})
+    normalized = json.dumps(payload, sort_keys=True, default=str)
+    computed_key = hashlib.sha256(f"{tool_name}:{normalized}".encode("utf-8")).hexdigest()[:24]
+    return explicit_key or computed_key, hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _get_idempotency_record(
+    db: DBSession,
+    workspace_id: str,
+    tool_name: str,
+    idempotency_key: str,
+) -> ToolIdempotencyRecordModel | None:
+    if not idempotency_key:
+        return None
+    try:
+        return (
+            db.query(ToolIdempotencyRecordModel)
+            .filter(
+                ToolIdempotencyRecordModel.workspace_id == workspace_id,
+                ToolIdempotencyRecordModel.tool_name == tool_name,
+                ToolIdempotencyRecordModel.idempotency_key == idempotency_key,
+            )
+            .first()
+        )
+    except Exception:
+        return None
+
+
+def _upsert_idempotency_record(
+    db: DBSession,
+    workspace_id: str,
+    tool_name: str,
+    idempotency_key: str,
+    *,
+    input_hash: str = "",
+    status: str = "",
+    pending_request_id: str = "",
+    tool_call_log_id: str = "",
+    output_json: dict | None = None,
+    error_message: str = "",
+    completed: bool = False,
+) -> ToolIdempotencyRecordModel | None:
+    if not idempotency_key:
+        return None
+    try:
+        row = _get_idempotency_record(db, workspace_id, tool_name, idempotency_key)
+        if not row:
+            row = ToolIdempotencyRecordModel(
+                id=str(uuid.uuid4()),
+                workspace_id=workspace_id,
+                tool_name=tool_name,
+                idempotency_key=idempotency_key,
+                input_hash=input_hash,
+                status=status or "pending",
+                pending_request_id=pending_request_id,
+                tool_call_log_id=tool_call_log_id,
+                output_json=dict(output_json or {}),
+                error_message=error_message,
+                created_at=utc_now(),
+                updated_at=utc_now(),
+                completed_at=utc_now() if completed else None,
+            )
+            db.add(row)
+        else:
+            if input_hash:
+                row.input_hash = input_hash
+            if status:
+                row.status = status
+            if pending_request_id:
+                row.pending_request_id = pending_request_id
+            if tool_call_log_id:
+                row.tool_call_log_id = tool_call_log_id
+            if output_json is not None:
+                row.output_json = dict(output_json or {})
+            if error_message:
+                row.error_message = error_message
+            row.updated_at = utc_now()
+            if completed:
+                row.completed_at = utc_now()
+        db.commit()
+        return row
+    except Exception as exc:
+        log_exception(
+            logger,
+            "tool.idempotency_upsert_failed",
+            exc,
+            workspace_id=workspace_id,
+            tool_name=tool_name,
+            idempotency_key=idempotency_key,
+        )
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None
+
+
+def _get_pending_request_by_id(db: DBSession, request_id: str) -> PendingToolRequestModel | None:
+    if not request_id:
+        return None
+    try:
+        return (
+            db.query(PendingToolRequestModel)
+            .filter(PendingToolRequestModel.id == request_id)
+            .first()
+        )
+    except Exception:
+        return None
+
+
+def _approval_granted(context_json: dict | None, idempotency_key: str = "") -> bool:
+    if not isinstance(context_json, dict):
+        return False
+    if bool(context_json.get("approval_granted")):
+        return True
+    granted_keys = set(str(item or "") for item in list(context_json.get("approved_idempotency_keys", []) or []))
+    return bool(idempotency_key and idempotency_key in granted_keys)
+
+
 # ── Logging helper ────────────────────────────────────────────────────────────
 
 def _log_attempt(
@@ -204,6 +370,9 @@ def _log_attempt(
     output_json: dict | None = None,
     error_message: str = "",
     duration_ms: float = 0.0,
+    idempotency_key: str = "",
+    pending_kind: str = "",
+    approval_required: bool = False,
 ) -> ToolCallLogModel:
     """
     Write one row to tool_call_logs. Called for EVERY attempt, regardless
@@ -217,6 +386,9 @@ def _log_attempt(
             tool_name=tool_name,
             toolkit=toolkit,
             status=status,
+            idempotency_key=idempotency_key,
+            pending_kind=pending_kind,
+            approval_required=bool(approval_required),
             input_json=input_json,
             output_json=output_json or {},
             error_message=error_message,
@@ -256,6 +428,10 @@ def _save_pending_request(
     resume_token: str,
     conversation_id: str = "",
     context_json: dict | None = None,
+    pending_kind: str = "auth",
+    idempotency_key: str = "",
+    approval_requirement: dict | None = None,
+    approved: bool = False,
 ) -> PendingToolRequestModel | None:
     """
     Persist the original request so it can be resumed after auth completes.
@@ -269,6 +445,7 @@ def _save_pending_request(
                 PendingToolRequestModel.original_input == original_input,
                 PendingToolRequestModel.requested_tool == tool_name,
                 PendingToolRequestModel.requested_toolkit == toolkit,
+                PendingToolRequestModel.pending_kind == pending_kind,
                 PendingToolRequestModel.status.in_(["pending", "resumed"]),
             )
             .first()
@@ -277,6 +454,11 @@ def _save_pending_request(
             existing.resume_token = resume_token
             existing.context_json = context_json or {}
             existing.conversation_id = conversation_id or existing.conversation_id
+            existing.pending_kind = pending_kind
+            existing.idempotency_key = idempotency_key or getattr(existing, "idempotency_key", "")
+            existing.approval_requirement_json = dict(approval_requirement or getattr(existing, "approval_requirement_json", {}) or {})
+            existing.approved = bool(approved)
+            existing.approved_at = utc_now() if approved else getattr(existing, "approved_at", None)
             existing.updated_at = utc_now()
             db.commit()
             return existing
@@ -291,6 +473,11 @@ def _save_pending_request(
             requested_toolkit=toolkit,
             resume_token=resume_token,
             status="pending",
+            pending_kind=pending_kind,
+            idempotency_key=idempotency_key or "",
+            approval_requirement_json=dict(approval_requirement or {}),
+            approved=bool(approved),
+            approved_at=utc_now() if approved else None,
             context_json=context_json or {},
             created_at=utc_now(),
             updated_at=utc_now(),
@@ -489,6 +676,11 @@ def attempt_tool_call(
 
     toolkit = tool_entry["toolkit"]
     input_args = normalize_tool_input(tool_name, input_args or {})
+    approval_requirement = get_tool_approval_requirement(tool_name)
+    write_action = bool(tool_entry.get("write_action"))
+    idempotency_key = ""
+    input_hash = ""
+    is_retry = bool(context_json and context_json.get("is_retry"))
 
     # ── Step 2: Validate agent permission ─────────────────────────────────
     if not is_agent_allowed(tool_name, agent_key):
@@ -528,7 +720,11 @@ def attempt_tool_call(
     # ── Step 4: Validate parameters using local schema and live schema ────
     input_args, validation_errors = validate_tool_input(tool_name, input_args)
     if is_available():
-        live_schema = get_live_tool_schema(workspace_id, tool_name) or get_live_tool_schema("__catalog__", tool_name)
+        schema_cache_key = f"{workspace_id}:{tool_name}"
+        live_schema = _get_cached_live_schema(context_json, schema_cache_key)
+        if not live_schema:
+            live_schema = get_live_tool_schema(workspace_id, tool_name) or get_live_tool_schema("__catalog__", tool_name)
+            _set_cached_live_schema(context_json, schema_cache_key, live_schema)
         validation_errors.extend(_validate_against_live_schema(input_args, live_schema))
     else:
         live_schema = {}
@@ -545,14 +741,78 @@ def attempt_tool_call(
         )
         return result
 
+    # ── Step 4.5: Prepare durable idempotency for external writes ────────
+    idempotency_record = None
+    if write_action:
+        idempotency_key, input_hash = _serialize_idempotency_payload(tool_name, input_args, context_json)
+        idempotency_record = _get_idempotency_record(db, workspace_id, tool_name, idempotency_key)
+        if idempotency_record and getattr(idempotency_record, "input_hash", "") and idempotency_record.input_hash != input_hash:
+            error_message = "The same idempotency key was reused for a different write payload."
+            _log_attempt(
+                db, workspace_id, agent_key, tool_name, toolkit,
+                "validation_error", input_args, error_message=error_message,
+                idempotency_key=idempotency_key,
+                approval_required=approval_requirement.required,
+            )
+            return _fail("validation_error", error_message)
+
+        if idempotency_record and getattr(idempotency_record, "status", "") == "success":
+            cached_output = dict(getattr(idempotency_record, "output_json", {}) or {})
+            log_event(
+                logger,
+                logging.INFO,
+                "tool.idempotency_replay",
+                workspace_id=workspace_id,
+                agent_name=agent_key,
+                tool_name=tool_name,
+                idempotency_key=idempotency_key,
+            )
+            return {
+                **_ok(cached_output, 0.0),
+                "toolkit": toolkit,
+                "idempotency_key": idempotency_key,
+                "idempotent_replay": True,
+            }
+
+        if idempotency_record and getattr(idempotency_record, "status", "") in {"pending_auth", "pending_approval", "in_progress"}:
+            pending_request = _get_pending_request_by_id(db, getattr(idempotency_record, "pending_request_id", "") or "")
+            pending_status = getattr(idempotency_record, "status", "")
+            if pending_status == "pending_auth" and not is_retry and pending_request:
+                return {
+                    **_connect_required(
+                        toolkit,
+                        get_connect_link(workspace_id, toolkit, callback_url),
+                        getattr(pending_request, "resume_token", ""),
+                    ),
+                    "pending_kind": getattr(pending_request, "pending_kind", "auth"),
+                    "idempotency_key": idempotency_key,
+                }
+            if pending_status == "pending_approval" and not _approval_granted(context_json, idempotency_key) and pending_request:
+                return {
+                    "status": "validation_error",
+                    "output": None,
+                    "error": "Approval is still required before this action can run.",
+                    "toolkit": toolkit,
+                    "resume_token": getattr(pending_request, "resume_token", ""),
+                    "approval_required": True,
+                    "approval_requirement": dict(getattr(pending_request, "approval_requirement_json", {}) or approval_requirement.to_dict()),
+                    "pending_kind": "approval",
+                    "idempotency_key": idempotency_key,
+                }
+
+        _upsert_idempotency_record(
+            db,
+            workspace_id,
+            tool_name,
+            idempotency_key,
+            input_hash=input_hash,
+            status="in_progress",
+        )
 
     # ── Step 5: Check connection (local cache, then remote live check) ───
     requires_auth = tool_entry.get("requires_auth", True)
     conn_info: dict = {}
     selected_account_id = str(selected_account_id or "")
-
-    # Detect retry: if coming from a resume path, force fresh connection check
-    is_retry = bool(context_json and context_json.get("is_retry"))
 
     if not requires_auth:
         # Tool does not require dynamic OAuth
@@ -629,13 +889,27 @@ def attempt_tool_call(
             error_detail = _build_auth_unavailable_error(toolkit, auth_details, conn_info)
 
         # Persist only resumable requests.
+        pending_row = None
         if connect_url:
-            _save_pending_request(
+            pending_row = _save_pending_request(
                 db, workspace_id, agent_key, original_input,
                 tool_name, toolkit, resume_token,
                 conversation_id=conversation_id,
                 context_json=context_json,
+                pending_kind="auth",
+                idempotency_key=idempotency_key,
+                approval_requirement=approval_requirement.to_dict(),
             )
+            if write_action and pending_row is not None:
+                _upsert_idempotency_record(
+                    db,
+                    workspace_id,
+                    tool_name,
+                    idempotency_key,
+                    input_hash=input_hash,
+                    status="pending_auth",
+                    pending_request_id=getattr(pending_row, "id", ""),
+                )
 
         elapsed = (time.time() - start) * 1000
         missing_status = "connect_required" if connect_url else "auth_unavailable"
@@ -644,7 +918,20 @@ def attempt_tool_call(
             missing_status, input_args,
             error_message=error_detail or conn_info.get("error") or f"Auth required for {toolkit}",
             duration_ms=elapsed,
+            idempotency_key=idempotency_key,
+            pending_kind="auth" if connect_url else "",
+            approval_required=approval_requirement.required,
         )
+        if write_action and not connect_url:
+            _upsert_idempotency_record(
+                db,
+                workspace_id,
+                tool_name,
+                idempotency_key,
+                input_hash=input_hash,
+                status="failure",
+                error_message=error_detail or conn_info.get("error") or f"Auth unavailable for {toolkit}",
+            )
 
         return _connect_required(
             toolkit,
@@ -652,6 +939,61 @@ def attempt_tool_call(
             resume_token,
             error=error_detail,
         )
+
+    # ── Step 6.5: Approval gate for risky writes ────────────────────────
+    if write_action and approval_requirement.required and not _approval_granted(context_json, idempotency_key):
+        resume_token = str(uuid.uuid4())
+        approval_payload = approval_requirement.to_dict()
+        pending_row = _save_pending_request(
+            db,
+            workspace_id,
+            agent_key,
+            original_input,
+            tool_name,
+            toolkit,
+            resume_token,
+            conversation_id=conversation_id,
+            context_json=context_json,
+            pending_kind="approval",
+            idempotency_key=idempotency_key,
+            approval_requirement=approval_payload,
+        )
+        _upsert_idempotency_record(
+            db,
+            workspace_id,
+            tool_name,
+            idempotency_key,
+            input_hash=input_hash,
+            status="pending_approval",
+            pending_request_id=getattr(pending_row, "id", "") if pending_row else "",
+        )
+        elapsed = (time.time() - start) * 1000
+        _log_attempt(
+            db,
+            workspace_id,
+            agent_key,
+            tool_name,
+            toolkit,
+            "validation_error",
+            input_args,
+            error_message="Approval required before executing this action.",
+            duration_ms=elapsed,
+            idempotency_key=idempotency_key,
+            pending_kind="approval",
+            approval_required=True,
+        )
+        return {
+            "status": "validation_error",
+            "output": None,
+            "error": "Approval required before executing this action.",
+            "duration_ms": elapsed,
+            "toolkit": toolkit,
+            "resume_token": resume_token,
+            "approval_required": True,
+            "approval_requirement": approval_payload,
+            "pending_kind": "approval",
+            "idempotency_key": idempotency_key,
+        }
 
     # ── Step 7: Connected → execute tool via Composio ────────────────────
     try:
@@ -669,13 +1011,27 @@ def attempt_tool_call(
         error_text = exec_result.get("error")
 
         if error_text:
-            _log_attempt(
+            call_log = _log_attempt(
                 db, workspace_id, agent_key, tool_name, toolkit,
                 "failure", input_args,
                 output_json=output_data if isinstance(output_data, dict) else {"data": output_data},
                 error_message=str(error_text),
                 duration_ms=elapsed,
+                idempotency_key=idempotency_key,
+                approval_required=approval_requirement.required,
             )
+            if write_action:
+                _upsert_idempotency_record(
+                    db,
+                    workspace_id,
+                    tool_name,
+                    idempotency_key,
+                    input_hash=input_hash,
+                    status="failure",
+                    tool_call_log_id=getattr(call_log, "id", ""),
+                    output_json=output_data if isinstance(output_data, dict) else {"data": output_data},
+                    error_message=str(error_text),
+                )
             return _fail("failure", str(error_text), elapsed)
 
         response_len = len(str(output_data))
@@ -693,14 +1049,32 @@ def attempt_tool_call(
             output_length=response_len,
         )
 
-        _log_attempt(
+        call_log = _log_attempt(
             db, workspace_id, agent_key, tool_name, toolkit,
             "success", input_args,
             output_json=output_data if isinstance(output_data, dict) else {"data": output_data},
             duration_ms=elapsed,
+            idempotency_key=idempotency_key,
+            approval_required=approval_requirement.required,
         )
+        if write_action:
+            _upsert_idempotency_record(
+                db,
+                workspace_id,
+                tool_name,
+                idempotency_key,
+                input_hash=input_hash,
+                status="success",
+                tool_call_log_id=getattr(call_log, "id", ""),
+                output_json=output_data if isinstance(output_data, dict) else {"data": output_data},
+                completed=True,
+            )
 
-        return _ok(output_data if isinstance(output_data, dict) else {"data": output_data}, elapsed)
+        return {
+            **_ok(output_data if isinstance(output_data, dict) else {"data": output_data}, elapsed),
+            "toolkit": toolkit,
+            "idempotency_key": idempotency_key,
+        }
 
     except Exception as exc:
         elapsed = (time.time() - start) * 1000
@@ -718,12 +1092,25 @@ def attempt_tool_call(
             toolkit=toolkit,
             duration_ms=round(elapsed, 2),
         )
-        _log_attempt(
+        call_log = _log_attempt(
             db, workspace_id, agent_key, tool_name, toolkit,
             "failure", input_args,
             error_message=error_str,
             duration_ms=elapsed,
+            idempotency_key=idempotency_key,
+            approval_required=approval_requirement.required,
         )
+        if write_action:
+            _upsert_idempotency_record(
+                db,
+                workspace_id,
+                tool_name,
+                idempotency_key,
+                input_hash=input_hash,
+                status="failure",
+                tool_call_log_id=getattr(call_log, "id", ""),
+                error_message=error_str,
+            )
 
         return _fail("failure", error_str, elapsed)
 
@@ -756,6 +1143,8 @@ def mark_request_resumed(db: DBSession, resume_token: str) -> None:
             .first()
         )
         if row:
+            if getattr(row, "pending_kind", "auth") == "approval" and not getattr(row, "approved", False):
+                return
             row.status = "resumed"
             row.updated_at = utc_now()
             db.commit()
@@ -788,6 +1177,40 @@ def mark_request_completed(db: DBSession, resume_token: str) -> None:
         log_exception(
             logger,
             "tool.pending_request_complete_failed",
+            exc,
+            resume_token=resume_token,
+        )
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
+def mark_request_approved(db: DBSession, resume_token: str) -> None:
+    """Mark a pending approval request as explicitly approved."""
+    try:
+        row = (
+            db.query(PendingToolRequestModel)
+            .filter(PendingToolRequestModel.resume_token == resume_token)
+            .first()
+        )
+        if row:
+            row.approved = True
+            row.approved_at = utc_now()
+            row.updated_at = utc_now()
+            context_json = dict(getattr(row, "context_json", {}) or {})
+            context_json["approval_granted"] = True
+            granted = list(context_json.get("approved_idempotency_keys", []) or [])
+            idempotency_key = str(getattr(row, "idempotency_key", "") or "")
+            if idempotency_key and idempotency_key not in granted:
+                granted.append(idempotency_key)
+            context_json["approved_idempotency_keys"] = granted
+            row.context_json = context_json
+            db.commit()
+    except Exception as exc:
+        log_exception(
+            logger,
+            "tool.pending_request_approve_failed",
             exc,
             resume_token=resume_token,
         )

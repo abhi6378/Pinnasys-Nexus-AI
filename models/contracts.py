@@ -128,6 +128,47 @@ class CapabilityRequest:
 
 
 @dataclass
+class ExecutionConstraint:
+    toolkit: str = ""
+    account_id: str = ""
+    account_alias: str = ""
+    source: str = "system_inferred"
+    scope: str = "request"
+    required: bool = False
+    reason: str = ""
+
+    @classmethod
+    def from_value(cls, value: Any) -> "ExecutionConstraint":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            return cls(
+                toolkit=str(value.get("toolkit", "") or "").upper(),
+                account_id=str(value.get("account_id", "") or ""),
+                account_alias=str(value.get("account_alias", "") or ""),
+                source=str(value.get("source", "system_inferred") or "system_inferred"),
+                scope=str(value.get("scope", "request") or "request"),
+                required=bool(value.get("required", False)),
+                reason=str(value.get("reason", "") or ""),
+            )
+        return cls()
+
+    def is_empty(self) -> bool:
+        return not any(
+            (
+                self.toolkit,
+                self.account_id,
+                self.account_alias,
+                self.reason,
+                self.required,
+            )
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class ToolPlan:
     """Agent plan for external actions or live data access."""
 
@@ -140,6 +181,7 @@ class ToolPlan:
     raw_request: dict[str, Any] = field(default_factory=dict)
     iteration: int = 1
     idempotency_key: str = ""
+    execution_constraint: ExecutionConstraint = field(default_factory=ExecutionConstraint)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -152,6 +194,7 @@ class ToolPlan:
             "raw_request": dict(self.raw_request),
             "iteration": self.iteration,
             "idempotency_key": self.idempotency_key,
+            "execution_constraint": self.execution_constraint.to_dict(),
         }
 
 
@@ -213,6 +256,10 @@ class ToolExecutionResult:
             "resume_token": self.resume_token,
             "verified": self.verified,
             "idempotency_key": self.idempotency_key,
+            "approval_required": self.approval_requirement.required,
+            "approval_requirement": self.approval_requirement.to_dict(),
+            "pending_kind": str(self.raw_response.get("pending_kind", "") or ""),
+            "idempotent_replay": bool(self.raw_response.get("idempotent_replay", False)),
         }
 
 

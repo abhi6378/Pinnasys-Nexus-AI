@@ -9,7 +9,14 @@ This module keeps tool execution conservative:
 """
 from __future__ import annotations
 
-from models.contracts import ApprovalRequirement, CapabilityRequest, ConnectorContext, RouteDecision, RouteStepSkeleton
+from models.contracts import (
+    ApprovalRequirement,
+    CapabilityRequest,
+    ConnectorContext,
+    ExecutionConstraint,
+    RouteDecision,
+    RouteStepSkeleton,
+)
 from helpers.agent_capabilities import get_capability_policy
 from tools.tool_registry import (
     get_capability_group_metadata,
@@ -248,9 +255,11 @@ def build_capability_request(
     requested_tool_name: str = "",
     capability_hint: dict | None = None,
     connector_context: ConnectorContext | dict | None = None,
+    execution_constraint: ExecutionConstraint | dict | None = None,
 ) -> CapabilityRequest:
     route = _coerce_route_decision(route_decision)
     connector = ConnectorContext.from_value(connector_context)
+    constraint = ExecutionConstraint.from_value(execution_constraint)
     tool_entry = get_tool(requested_tool_name) if requested_tool_name else None
     hint = dict(capability_hint or {})
 
@@ -273,7 +282,9 @@ def build_capability_request(
         or (tool_entry or {}).get("toolkit", "")
         or route_toolkit_family
     )
-    if not connector.is_auto() and connector.selected_toolkit:
+    if constraint.toolkit:
+        toolkit_family = normalize_toolkit_key(constraint.toolkit) or constraint.toolkit
+    elif not connector.is_auto() and connector.selected_toolkit:
         toolkit_family = normalize_toolkit_key(connector.selected_toolkit) or connector.selected_toolkit
     action_class = (
         hint.get("action_class")
@@ -323,6 +334,7 @@ def build_capability_request(
             "agent_key": agent_key,
             "route_intent": route.intent if route else "",
             "connector_context": connector.to_dict(),
+            "execution_constraint": constraint.to_dict(),
         },
     )
 
@@ -335,8 +347,13 @@ def resolve_capability_request(
     connector_context: ConnectorContext | dict | None = None,
 ) -> dict:
     connector = ConnectorContext.from_value(connector_context or capability_request.metadata.get("connector_context"))
+    constraint = ExecutionConstraint.from_value(
+        capability_request.metadata.get("execution_constraint")
+    )
     toolkit_family = capability_request.toolkit_family
-    if not connector.is_auto() and connector.selected_toolkit:
+    if constraint.toolkit:
+        toolkit_family = normalize_toolkit_key(constraint.toolkit) or constraint.toolkit
+    elif not connector.is_auto() and connector.selected_toolkit:
         toolkit_family = normalize_toolkit_key(connector.selected_toolkit) or connector.selected_toolkit
     allowed_entries = get_tools_for_capability_request(
         agent_key,
@@ -365,6 +382,12 @@ def resolve_capability_request(
 
     resolution_reason = "capability_metadata" if candidates else "no_candidate_match"
     if (
+        not constraint.is_empty()
+        and constraint.toolkit
+        and not candidates
+    ):
+        resolution_reason = "step_constraint_no_match"
+    elif (
         not connector.is_auto()
         and connector.selected_toolkit
         and not candidates

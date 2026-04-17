@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from typing import Protocol
 
-from models.contracts import ConnectorContext, ToolExecutionResult, ToolPlan, ToolResolution
+from models.contracts import ConnectorContext, ExecutionConstraint, ToolExecutionResult, ToolPlan, ToolResolution
 from tools.capability_layer import build_capability_request, resolve_capability_request
-from tools.composio_client import get_live_tool_schema, get_tool_schemas
 from tools.tool_registry import (
     get_tool,
     get_tool_approval_requirement,
@@ -48,7 +48,11 @@ class ToolBroker(Protocol):
         callback_url: str = "",
         connector_context: ConnectorContext | dict | None = None,
     ) -> ToolExecutionResult:
-        ...
+        ... 
+
+
+def get_runtime_mode() -> str:
+    return str(os.getenv("COMPOSIO_RUNTIME_MODE", "direct") or "direct").strip().lower()
 
 
 class ComposioDirectBroker:
@@ -76,14 +80,34 @@ class ComposioDirectBroker:
     ) -> ToolResolution:
         allowed_set = set(allowed_tool_names or [])
         connector = ConnectorContext.from_value(connector_context or plan.capability.metadata.get("connector_context"))
+        constraint = ExecutionConstraint.from_value(
+            plan.execution_constraint or plan.capability.metadata.get("execution_constraint")
+        )
         requested_tool_name = resolve_tool_name(plan.concrete_tool_name or "")
 
         if requested_tool_name:
             requested_entry = get_tool(requested_tool_name)
             if (
+                requested_entry
+                and constraint.toolkit
+                and str(requested_entry.get("toolkit", "")).upper() != constraint.toolkit
+            ):
+                return ToolResolution(
+                    status="invalid_tool",
+                    tool_name=requested_tool_name,
+                    candidate_tools=[requested_tool_name],
+                    approval_requirement=get_tool_approval_requirement(requested_tool_name),
+                    resolution_source="step_constraint",
+                    reason=(
+                        f"This workflow step requires connector {constraint.toolkit}, so "
+                        f"{requested_tool_name} cannot be used here."
+                    ),
+                )
+            if (
                 not connector.is_auto()
                 and connector.selected_toolkit
                 and requested_entry
+                and not constraint.toolkit
                 and str(requested_entry.get("toolkit", "")).upper() != connector.selected_toolkit
             ):
                 return ToolResolution(
@@ -115,7 +139,11 @@ class ComposioDirectBroker:
                 candidate_tools=[],
                 approval_requirement=get_tool_approval_requirement(plan.concrete_tool_name or ""),
                 resolution_source=resolution_source,
-                reason="No tool candidates matched the requested capability.",
+                reason=(
+                    f"The selected connector {connector.selected_toolkit} cannot satisfy this request."
+                    if resolution_source == "connector_constraint_no_match" and connector.selected_toolkit
+                    else "No tool candidates matched the requested capability."
+                ),
             )
 
         tool_name = candidate_tools[0]
@@ -155,11 +183,18 @@ class ComposioDirectBroker:
         idempotency_key = ""
         if tool_entry.get("write_action"):
             idempotency_key = self._build_idempotency_key(plan, tool_name, normalized_params)
-        effective_account_id = connector.effective_account_id or connector.selected_account_id
+        constraint_toolkit = constraint.toolkit or ""
+        effective_account_id = ""
+        available_account_count = 0
+        if constraint.account_id and (not constraint_toolkit or constraint_toolkit == str(tool_entry.get("toolkit", "")).upper()):
+            effective_account_id = constraint.account_id
+        elif connector.selected_toolkit == str(tool_entry.get("toolkit", "")).upper():
+            effective_account_id = connector.effective_account_id or connector.selected_account_id
+            available_account_count = connector.available_account_count
         if (
             not connector.is_auto()
             and tool_entry.get("requires_auth")
-            and connector.available_account_count > 1
+            and available_account_count > 1
             and not effective_account_id
         ):
             return ToolResolution(
@@ -178,13 +213,6 @@ class ComposioDirectBroker:
         connection_ready = connector.connected if tool_entry.get("requires_auth") else True
 
         schema = get_tool_schema(tool_name)
-        if workspace_id:
-            live_schema = get_live_tool_schema(workspace_id, tool_name)
-            if not live_schema:
-                live_schemas = get_tool_schemas(workspace_id, [tool_name])
-                live_schema = live_schemas[0] if live_schemas else {}
-            if live_schema:
-                schema["live_schema"] = live_schema
 
         return ToolResolution(
             status="resolved",
@@ -215,9 +243,16 @@ class ComposioDirectBroker:
         connector_context: ConnectorContext | dict | None = None,
         ) -> ToolExecutionResult:
         connector = ConnectorContext.from_value(connector_context or plan.capability.metadata.get("connector_context"))
+        constraint = ExecutionConstraint.from_value(
+            plan.execution_constraint or plan.capability.metadata.get("execution_constraint")
+        )
         execution_context = dict(context_json or {})
         if not connector.is_auto():
             execution_context.setdefault("connector_context", connector.to_dict())
+        if resolution.idempotency_key:
+            execution_context.setdefault("idempotency_key", resolution.idempotency_key)
+        execution_context.setdefault("requested_tool_name", resolution.tool_name or "")
+        execution_context.setdefault("requested_toolkit", resolution.toolkit or "")
         if resolution.status != "resolved" or not resolution.tool_name:
             return ToolExecutionResult(
                 status=resolution.status,
@@ -239,7 +274,11 @@ class ComposioDirectBroker:
             conversation_id=conversation_id,
             context_json=execution_context,
             callback_url=callback_url,
-            selected_account_id=connector.effective_account_id or connector.selected_account_id,
+            selected_account_id=(
+                constraint.account_id
+                if constraint.account_id and (not constraint.toolkit or constraint.toolkit == resolution.toolkit)
+                else connector.effective_account_id or connector.selected_account_id
+            ),
         )
 
         return ToolExecutionResult(
@@ -258,6 +297,53 @@ class ComposioDirectBroker:
         )
 
 
+class SessionPreviewBroker(ComposioDirectBroker):
+    """Feature-flagged broker that preserves current behavior while emitting session-ready runtime context."""
+
+    def execute(
+        self,
+        resolution: ToolResolution,
+        plan: ToolPlan,
+        *,
+        workspace_id: str,
+        db,
+        original_input: str = "",
+        conversation_id: str = "",
+        context_json: dict | None = None,
+        callback_url: str = "",
+        connector_context: ConnectorContext | dict | None = None,
+    ) -> ToolExecutionResult:
+        execution_context = dict(context_json or {})
+        connector = ConnectorContext.from_value(connector_context or plan.capability.metadata.get("connector_context"))
+        execution_context.setdefault(
+            "composio_runtime",
+            {
+                "mode": "session_preview",
+                "toolkit": connector.selected_toolkit,
+                "account_id": connector.effective_account_id or connector.selected_account_id,
+                "account_alias": connector.effective_account_alias or connector.selected_account_alias,
+            },
+        )
+        return super().execute(
+            resolution,
+            plan,
+            workspace_id=workspace_id,
+            db=db,
+            original_input=original_input,
+            conversation_id=conversation_id,
+            context_json=execution_context,
+            callback_url=callback_url,
+            connector_context=connector,
+        )
+
+
+def get_tool_broker() -> ToolBroker:
+    runtime_mode = get_runtime_mode()
+    if runtime_mode == "session_preview":
+        return SessionPreviewBroker()
+    return ComposioDirectBroker()
+
+
 def build_tool_plan(
     agent_key: str,
     *,
@@ -269,7 +355,9 @@ def build_tool_plan(
     capability_hint: dict | None = None,
     iteration: int = 1,
     connector_context: ConnectorContext | dict | None = None,
+    execution_constraint: ExecutionConstraint | dict | None = None,
 ) -> ToolPlan:
+    constraint = ExecutionConstraint.from_value(execution_constraint)
     capability = build_capability_request(
         agent_key,
         user_input=user_intent,
@@ -277,6 +365,7 @@ def build_tool_plan(
         requested_tool_name=concrete_tool_name or "",
         capability_hint=capability_hint,
         connector_context=connector_context,
+        execution_constraint=constraint,
     )
     return ToolPlan(
         agent_key=agent_key,
@@ -288,4 +377,5 @@ def build_tool_plan(
         raw_request=dict(capability_hint or {}),
         iteration=iteration,
         idempotency_key="",
+        execution_constraint=constraint,
     )
