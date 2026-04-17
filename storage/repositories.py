@@ -1,9 +1,12 @@
 """
 storage/repositories.py  —  CRUD helpers for every table
 """
-import uuid
 import logging
-from typing import Optional
+import os
+import uuid
+from datetime import timedelta
+from types import SimpleNamespace
+from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
@@ -18,6 +21,9 @@ from utils.time_utils import utc_now
 
 
 logger = logging.getLogger(__name__)
+PENDING_REQUEST_TTL_HOURS = int(os.getenv("SINTRA_PENDING_REQUEST_TTL_HOURS", "72") or "72")
+_TABLE_COLUMN_CACHE: dict[tuple[int, str], set[str] | None] = {}
+_REFLECTED_TABLE_CACHE: dict[tuple[int, str], Any] = {}
 
 
 def _id():
@@ -43,25 +49,303 @@ def _merge_unique_strings(existing: list | None, incoming: list | None, *, limit
     return merged
 
 
+def _is_integrity_error(exc: Exception) -> bool:
+    try:
+        from sqlalchemy.exc import IntegrityError
+    except Exception:
+        return False
+    return isinstance(exc, IntegrityError)
+
+
+def _is_missing_column_error(exc: Exception) -> bool:
+    message = str(getattr(exc, "orig", exc) or "")
+    lowered = message.lower()
+    return (
+        "undefinedcolumn" in lowered
+        or ("column" in lowered and "does not exist" in lowered)
+    )
+
+
+def _pending_request_expiry():
+    return utc_now() + timedelta(hours=PENDING_REQUEST_TTL_HOURS)
+
+
+def _safe_rollback(db: Session) -> None:
+    rollback = getattr(db, "rollback", None)
+    if callable(rollback):
+        try:
+            rollback()
+        except Exception:
+            pass
+
+
+def _get_bind(db: Session):
+    getter = getattr(db, "get_bind", None)
+    if callable(getter):
+        try:
+            return getter()
+        except Exception:
+            pass
+    return getattr(db, "bind", None)
+
+
+def _get_table_columns(db: Session, table_name: str) -> set[str] | None:
+    bind = _get_bind(db)
+    if bind is None:
+        return None
+    engine = getattr(bind, "engine", bind)
+    cache_key = (id(engine), table_name)
+    if cache_key in _TABLE_COLUMN_CACHE:
+        return _TABLE_COLUMN_CACHE[cache_key]
+    try:
+        from sqlalchemy import inspect as sa_inspect
+
+        inspector = sa_inspect(bind)
+        columns = {str(column["name"]) for column in inspector.get_columns(table_name)}
+    except Exception:
+        columns = None
+    _TABLE_COLUMN_CACHE[cache_key] = columns
+    return columns
+
+
+def _table_has_column(db: Session, table_name: str, column_name: str) -> bool:
+    columns = _get_table_columns(db, table_name)
+    if columns is None:
+        return True
+    return column_name in columns
+
+
+def _get_reflected_table(db: Session, table_name: str):
+    bind = _get_bind(db)
+    if bind is None:
+        return None
+    engine = getattr(bind, "engine", bind)
+    cache_key = (id(engine), table_name)
+    if cache_key in _REFLECTED_TABLE_CACHE:
+        return _REFLECTED_TABLE_CACHE[cache_key]
+    try:
+        from sqlalchemy import MetaData, Table
+
+        table = Table(table_name, MetaData(), autoload_with=bind)
+    except Exception:
+        table = None
+    _REFLECTED_TABLE_CACHE[cache_key] = table
+    return table
+
+
+def _model_instance(model_cls, **values):
+    try:
+        return model_cls(**values)
+    except Exception:
+        return SimpleNamespace(**values)
+
+
+def _workspace_from_mapping(values: dict[str, Any]):
+    return _model_instance(
+        WorkspaceModel,
+        id=values.get("id", ""),
+        name=values.get("name", ""),
+        owner_user_id=values.get("owner_user_id"),
+        created_at=values.get("created_at"),
+    )
+
+
+def _conversation_from_mapping(values: dict[str, Any]):
+    return _model_instance(
+        ConversationModel,
+        id=values.get("id", ""),
+        workspace_id=values.get("workspace_id", ""),
+        helper=values.get("helper", ""),
+        input=values.get("input", ""),
+        output=values.get("output", ""),
+        request_id=values.get("request_id", "") or "",
+        metadata_json=dict(values.get("metadata_json", {}) or {}),
+        created_at=values.get("created_at"),
+    )
+
+
+def _workflow_run_from_mapping(values: dict[str, Any]):
+    return _model_instance(
+        WorkflowRunModel,
+        id=values.get("id", ""),
+        workspace_id=values.get("workspace_id", ""),
+        workflow_name=values.get("workflow_name", ""),
+        steps=list(values.get("steps", []) or []),
+        final_output=values.get("final_output", "") or "",
+        status=values.get("status", "completed") or "completed",
+        request_id=values.get("request_id", "") or "",
+        metadata_json=dict(values.get("metadata_json", {}) or {}),
+        created_at=values.get("created_at"),
+        updated_at=values.get("updated_at") or values.get("created_at"),
+    )
+
+
+def _tool_connection_from_mapping(values: dict[str, Any]):
+    raw_metadata = values.get("metadata_json", {}) or {}
+    metadata_json = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+    account_label = values.get("account_label", "") or metadata_json.get("account_label", "") or metadata_json.get("account_alias", "") or ""
+    return _model_instance(
+        _get_tool_connection_model_cls(),
+        id=values.get("id", ""),
+        workspace_id=values.get("workspace_id", ""),
+        user_id=values.get("user_id", "") or values.get("workspace_id", ""),
+        tool_name=values.get("tool_name", "*") or "*",
+        toolkit=values.get("toolkit", "") or "",
+        status=values.get("status", "pending") or "pending",
+        connected_account_id=values.get("connected_account_id", "") or "",
+        account_label=account_label,
+        is_default=bool(values.get("is_default", False)),
+        auth_mode=values.get("auth_mode", "oauth2") or "oauth2",
+        metadata_json=metadata_json,
+        last_verified_at=values.get("last_verified_at") or values.get("updated_at"),
+        last_seen_remote_at=values.get("last_seen_remote_at"),
+        revoked_at=values.get("revoked_at"),
+        status_reason=values.get("status_reason", "") or "",
+        status_updated_at=values.get("status_updated_at") or values.get("updated_at"),
+        created_at=values.get("created_at"),
+        updated_at=values.get("updated_at"),
+    )
+
+
+def _pending_tool_request_from_mapping(values: dict[str, Any]):
+    context_json = dict(values.get("context_json", {}) or {})
+    return _model_instance(
+        _get_pending_tool_request_model_cls(),
+        id=values.get("id", ""),
+        workspace_id=values.get("workspace_id", ""),
+        conversation_id=values.get("conversation_id", "") or "",
+        agent_key=values.get("agent_key", "") or "",
+        original_input=values.get("original_input", "") or "",
+        requested_tool=values.get("requested_tool", "") or "",
+        requested_toolkit=values.get("requested_toolkit", "") or "",
+        resume_token=values.get("resume_token", "") or "",
+        status=values.get("status", "pending") or "pending",
+        pending_kind=values.get("pending_kind", context_json.get("pending_kind", "auth")) or "auth",
+        idempotency_key=values.get("idempotency_key", context_json.get("idempotency_key", "")) or "",
+        approval_requirement_json=dict(
+            values.get("approval_requirement_json", context_json.get("approval_requirement_json", {})) or {}
+        ),
+        approved=bool(values.get("approved", context_json.get("approved", False))),
+        approved_at=values.get("approved_at"),
+        expires_at=values.get("expires_at"),
+        context_json=context_json,
+        created_at=values.get("created_at"),
+        updated_at=values.get("updated_at"),
+    )
+
+
+def _get_pending_tool_request_model_cls():
+    model = globals().get("_pending_tool_request_model")
+    if model is not None:
+        return model
+    from models.pending_tool_requests import PendingToolRequestModel
+    return PendingToolRequestModel
+
+
+def _get_tool_connection_model_cls():
+    model = globals().get("_tool_connection_model")
+    if model is not None:
+        return model
+    from models.tool_connections import ToolConnectionModel
+    return ToolConnectionModel
+
+
+def _get_tool_idempotency_model_cls():
+    model = globals().get("_tool_idempotency_model")
+    if model is not None:
+        return model
+    from models.tool_idempotency_records import ToolIdempotencyRecordModel
+    return ToolIdempotencyRecordModel
+
+
 # ── Workspace ─────────────────────────────────────────────────────────────────
 
 def create_workspace(db: Session, name: str) -> WorkspaceModel:
-    ws = WorkspaceModel(id=_id(), name=name, created_at=utc_now())
-    db.add(ws)
-    # seed empty brain profile
-    bp = BrainProfileModel(workspace_id=ws.id)
-    db.add(bp)
-    db.commit()
-    db.refresh(ws)
-    return ws
+    ws_id = _id()
+    created_at = utc_now()
+    try:
+        ws = WorkspaceModel(id=ws_id, name=name, created_at=created_at)
+        db.add(ws)
+        # seed empty brain profile
+        bp = BrainProfileModel(workspace_id=ws.id)
+        db.add(bp)
+        db.commit()
+        db.refresh(ws)
+        return ws
+    except Exception as exc:
+        if not _is_missing_column_error(exc):
+            raise
+        db.rollback()
+        table = _get_reflected_table(db, "workspaces")
+        if table is None:
+            raise
+        insert_values = {"id": ws_id, "name": name}
+        if "created_at" in table.c:
+            insert_values["created_at"] = created_at
+        db.execute(table.insert().values(**insert_values))
+        bp = BrainProfileModel(workspace_id=ws_id)
+        db.add(bp)
+        db.commit()
+        return _workspace_from_mapping(
+            {
+                "id": ws_id,
+                "name": name,
+                "created_at": created_at,
+                "owner_user_id": None,
+            }
+        )
 
 
 def get_workspace(db: Session, workspace_id: str) -> Optional[WorkspaceModel]:
-    return db.query(WorkspaceModel).filter(WorkspaceModel.id == workspace_id).first()
+    try:
+        return db.query(WorkspaceModel).filter(WorkspaceModel.id == workspace_id).first()
+    except Exception as exc:
+        if not _is_missing_column_error(exc):
+            raise
+        _safe_rollback(db)
+        table = _get_reflected_table(db, "workspaces")
+        if table is None:
+            raise
+        row = (
+            db.execute(
+                table.select()
+                .with_only_columns(*[
+                    table.c.id,
+                    table.c.name,
+                    table.c.created_at,
+                ])
+                .where(table.c.id == workspace_id)
+            )
+            .mappings()
+            .first()
+        )
+        return _workspace_from_mapping(dict(row)) if row else None
 
 
 def list_workspaces(db: Session):
-    return db.query(WorkspaceModel).order_by(WorkspaceModel.created_at).all()
+    try:
+        return db.query(WorkspaceModel).order_by(WorkspaceModel.created_at).all()
+    except Exception as exc:
+        if not _is_missing_column_error(exc):
+            raise
+        _safe_rollback(db)
+        table = _get_reflected_table(db, "workspaces")
+        if table is None:
+            raise
+        rows = (
+            db.execute(
+                table.select()
+                .with_only_columns(*[
+                    table.c.id,
+                    table.c.name,
+                    table.c.created_at,
+                ])
+                .order_by(table.c.created_at)
+            )
+            .mappings()
+            .all()
+        )
+        return [_workspace_from_mapping(dict(row)) for row in rows]
 
 
 # ── Brain Profile ─────────────────────────────────────────────────────────────
@@ -357,24 +641,35 @@ def upsert_memory_record(
     try:
         existing = get_memory_record_by_canonical_key(db, workspace_id, canonical_key) if canonical_key else None
         if not existing:
-            return add_memory_record(
-                db,
-                workspace_id,
-                memory_type=memory_type,
-                title=title,
-                content=content,
-                summary=summary,
-                source_kind=source_kind,
-                source_reference_id=source_reference_id,
-                tags=tags,
-                entity_tags=entity_tags,
-                tool_tags=tool_tags,
-                importance_score=importance_score,
-                confidence_score=confidence_score,
-                pinned=pinned,
-                canonical_key=canonical_key,
-                metadata_json=metadata_json,
-            )
+            try:
+                return add_memory_record(
+                    db,
+                    workspace_id,
+                    memory_type=memory_type,
+                    title=title,
+                    content=content,
+                    summary=summary,
+                    source_kind=source_kind,
+                    source_reference_id=source_reference_id,
+                    tags=tags,
+                    entity_tags=entity_tags,
+                    tool_tags=tool_tags,
+                    importance_score=importance_score,
+                    confidence_score=confidence_score,
+                    pinned=pinned,
+                    canonical_key=canonical_key,
+                    metadata_json=metadata_json,
+                )
+            except Exception as exc:
+                if not canonical_key or not _is_integrity_error(exc):
+                    raise
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                existing = get_memory_record_by_canonical_key(db, workspace_id, canonical_key)
+                if not existing:
+                    raise
 
         if title:
             existing.title = _clean_text(title, 240)
@@ -549,6 +844,20 @@ def upsert_memory_embedding(
         db.refresh(row)
         return row
     except Exception as exc:
+        if _is_integrity_error(exc):
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            row = get_memory_embedding(db, memory_record_id, model_name=model_name)
+            if row:
+                row.content_hash = content_hash
+                row.vector_json = list(vector_json or [])
+                row.dimensions = len(vector_json or [])
+                row.updated_at = utc_now()
+                db.commit()
+                db.refresh(row)
+                return row
         log_exception(
             logger,
             "storage.memory_embedding_upsert_failed",
@@ -597,12 +906,22 @@ def get_quiz_answers(db: Session, workspace_id: str):
 
 # ── Conversations ─────────────────────────────────────────────────────────────
 
-def save_conversation(db: Session, workspace_id: str,
-                      helper: str, input_: str, output: str) -> ConversationModel:
+def save_conversation(
+    db: Session,
+    workspace_id: str,
+    helper: str,
+    input_: str,
+    output: str,
+    *,
+    request_id: str = "",
+    metadata_json: dict | None = None,
+) -> ConversationModel:
     try:
         conv = ConversationModel(
             id=_id(), workspace_id=workspace_id,
             helper=helper, input=input_, output=output,
+            request_id=request_id or "",
+            metadata_json=dict(metadata_json or {}),
             created_at=utc_now()
         )
         db.add(conv)
@@ -616,6 +935,34 @@ def save_conversation(db: Session, workspace_id: str,
         )
         return conv
     except Exception as exc:
+        if _is_missing_column_error(exc):
+            _safe_rollback(db)
+            table = _get_reflected_table(db, "conversations")
+            if table is None:
+                raise
+            conv_id = _id()
+            created_at = utc_now()
+            values = {
+                "id": conv_id,
+                "workspace_id": workspace_id,
+                "helper": helper,
+                "input": input_,
+                "output": output,
+                "created_at": created_at,
+            }
+            if "request_id" in table.c:
+                values["request_id"] = request_id or ""
+            if "metadata_json" in table.c:
+                values["metadata_json"] = dict(metadata_json or {})
+            db.execute(table.insert().values(**values))
+            db.commit()
+            return _conversation_from_mapping(
+                {
+                    **values,
+                    "request_id": request_id or "",
+                    "metadata_json": dict(metadata_json or {}),
+                }
+            )
         log_exception(
             logger,
             "storage.conversation_save_failed",
@@ -641,6 +988,28 @@ def get_conversations(db: Session, workspace_id: str, limit: int = 20):
         )
         return result
     except Exception as exc:
+        if _is_missing_column_error(exc):
+            _safe_rollback(db)
+            table = _get_reflected_table(db, "conversations")
+            if table is None:
+                raise
+            column_names = ["id", "workspace_id", "helper", "input", "output", "created_at"]
+            if "request_id" in table.c:
+                column_names.append("request_id")
+            if "metadata_json" in table.c:
+                column_names.append("metadata_json")
+            rows = (
+                db.execute(
+                    table.select()
+                    .with_only_columns(*[table.c[name] for name in column_names])
+                    .where(table.c.workspace_id == workspace_id)
+                    .order_by(table.c.created_at.desc())
+                    .limit(limit)
+                )
+                .mappings()
+                .all()
+            )
+            return [_conversation_from_mapping(dict(row)) for row in rows]
         log_exception(
             logger,
             "storage.conversation_fetch_failed",
@@ -653,13 +1022,27 @@ def get_conversations(db: Session, workspace_id: str, limit: int = 20):
 
 # ── Workflow Runs ─────────────────────────────────────────────────────────────
 
-def save_workflow_run(db: Session, workspace_id: str, workflow_name: str,
-                      steps: list, final_output: str) -> WorkflowRunModel:
+def save_workflow_run(
+    db: Session,
+    workspace_id: str,
+    workflow_name: str,
+    steps: list,
+    final_output: str,
+    *,
+    status: str = "completed",
+    request_id: str = "",
+    metadata_json: dict | None = None,
+) -> WorkflowRunModel:
     try:
         run = WorkflowRunModel(
             id=_id(), workspace_id=workspace_id,
             workflow_name=workflow_name, steps=steps,
-            final_output=final_output, created_at=utc_now()
+            final_output=final_output,
+            status=status or "completed",
+            request_id=request_id or "",
+            metadata_json=dict(metadata_json or {}),
+            created_at=utc_now(),
+            updated_at=utc_now(),
         )
         db.add(run)
         db.commit()
@@ -673,6 +1056,41 @@ def save_workflow_run(db: Session, workspace_id: str, workflow_name: str,
         )
         return run
     except Exception as exc:
+        if _is_missing_column_error(exc):
+            _safe_rollback(db)
+            table = _get_reflected_table(db, "workflow_runs")
+            if table is None:
+                raise
+            run_id = _id()
+            created_at = utc_now()
+            updated_at = utc_now()
+            values = {
+                "id": run_id,
+                "workspace_id": workspace_id,
+                "workflow_name": workflow_name,
+                "steps": steps,
+                "final_output": final_output,
+                "created_at": created_at,
+            }
+            if "status" in table.c:
+                values["status"] = status or "completed"
+            if "request_id" in table.c:
+                values["request_id"] = request_id or ""
+            if "metadata_json" in table.c:
+                values["metadata_json"] = dict(metadata_json or {})
+            if "updated_at" in table.c:
+                values["updated_at"] = updated_at
+            db.execute(table.insert().values(**values))
+            db.commit()
+            return _workflow_run_from_mapping(
+                {
+                    **values,
+                    "status": status or "completed",
+                    "request_id": request_id or "",
+                    "metadata_json": dict(metadata_json or {}),
+                    "updated_at": updated_at,
+                }
+            )
         log_exception(
             logger,
             "storage.workflow_save_failed",
@@ -684,9 +1102,33 @@ def save_workflow_run(db: Session, workspace_id: str, workflow_name: str,
 
 
 def get_workflow_runs(db: Session, workspace_id: str, limit: int = 10):
-    return db.query(WorkflowRunModel).filter(
-        WorkflowRunModel.workspace_id == workspace_id
-    ).order_by(WorkflowRunModel.created_at.desc()).limit(limit).all()
+    try:
+        return db.query(WorkflowRunModel).filter(
+            WorkflowRunModel.workspace_id == workspace_id
+        ).order_by(WorkflowRunModel.created_at.desc()).limit(limit).all()
+    except Exception as exc:
+        if not _is_missing_column_error(exc):
+            raise
+        _safe_rollback(db)
+        table = _get_reflected_table(db, "workflow_runs")
+        if table is None:
+            raise
+        column_names = ["id", "workspace_id", "workflow_name", "steps", "final_output", "created_at"]
+        for name in ("status", "request_id", "metadata_json", "updated_at"):
+            if name in table.c:
+                column_names.append(name)
+        rows = (
+            db.execute(
+                table.select()
+                .with_only_columns(*[table.c[name] for name in column_names])
+                .where(table.c.workspace_id == workspace_id)
+                .order_by(table.c.created_at.desc())
+                .limit(limit)
+            )
+            .mappings()
+            .all()
+        )
+        return [_workflow_run_from_mapping(dict(row)) for row in rows]
 
 
 # ── Ideas Inbox ───────────────────────────────────────────────────────────────
@@ -727,18 +1169,40 @@ def list_pending_tool_requests(db: Session, workspace_id: str, limit: int = 5):
     This powers UI refresh/resume without requiring a schema change in the
     conversation table.
     """
-    from models.pending_tool_requests import PendingToolRequestModel
+    PendingToolRequestModel = _get_pending_tool_request_model_cls()
 
-    return (
-        db.query(PendingToolRequestModel)
-        .filter(
-            PendingToolRequestModel.workspace_id == workspace_id,
-            PendingToolRequestModel.status.in_(["pending", "resumed"]),
+    try:
+        return (
+            db.query(PendingToolRequestModel)
+            .filter(
+                PendingToolRequestModel.workspace_id == workspace_id,
+                PendingToolRequestModel.status.in_(["pending", "resumed"]),
+            )
+            .order_by(PendingToolRequestModel.updated_at.desc())
+            .limit(limit)
+            .all()
         )
-        .order_by(PendingToolRequestModel.updated_at.desc())
-        .limit(limit)
-        .all()
-    )
+    except Exception as exc:
+        if not _is_missing_column_error(exc):
+            raise
+        _safe_rollback(db)
+        table = _get_reflected_table(db, "pending_tool_requests")
+        if table is None:
+            raise
+        rows = (
+            db.execute(
+                table.select()
+                .where(
+                    table.c.workspace_id == workspace_id,
+                    table.c.status.in_(["pending", "resumed"]),
+                )
+                .order_by(table.c.updated_at.desc())
+                .limit(limit)
+            )
+            .mappings()
+            .all()
+        )
+        return [_pending_tool_request_from_mapping(dict(row)) for row in rows]
 
 
 # ── Tool Connections ──────────────────────────────────────────────────────────
@@ -750,16 +1214,75 @@ def list_tool_connections(
     toolkit: str = "",
     status: str = "",
 ):
-    from models.tool_connections import ToolConnectionModel
+    ToolConnectionModel = _get_tool_connection_model_cls()
 
-    query = db.query(ToolConnectionModel).filter(
-        ToolConnectionModel.workspace_id == workspace_id
-    )
-    if toolkit:
-        query = query.filter(ToolConnectionModel.toolkit == toolkit.upper())
-    if status:
-        query = query.filter(ToolConnectionModel.status == status)
-    return query.order_by(ToolConnectionModel.is_default.desc(), ToolConnectionModel.updated_at.desc()).all()
+    try:
+        query = db.query(ToolConnectionModel).filter(
+            ToolConnectionModel.workspace_id == workspace_id
+        )
+        if toolkit:
+            query = query.filter(ToolConnectionModel.toolkit == toolkit.upper())
+        if status:
+            query = query.filter(ToolConnectionModel.status == status)
+        return query.order_by(ToolConnectionModel.is_default.desc(), ToolConnectionModel.updated_at.desc()).all()
+    except Exception as exc:
+        if not _is_missing_column_error(exc):
+            raise
+        _safe_rollback(db)
+        table = _get_reflected_table(db, "tool_connections")
+        if table is None:
+            raise
+        stmt = table.select().where(table.c.workspace_id == workspace_id)
+        if toolkit:
+            stmt = stmt.where(table.c.toolkit == toolkit.upper())
+        if status:
+            stmt = stmt.where(table.c.status == status)
+        order_columns = []
+        if "is_default" in table.c:
+            order_columns.append(table.c.is_default.desc())
+        if "updated_at" in table.c:
+            order_columns.append(table.c.updated_at.desc())
+        if order_columns:
+            stmt = stmt.order_by(*order_columns)
+        rows = db.execute(stmt).mappings().all()
+        return [_tool_connection_from_mapping(dict(row)) for row in rows]
+
+
+def get_tool_connection(
+    db: Session,
+    workspace_id: str,
+    *,
+    toolkit: str,
+    connected_account_id: str = "",
+    status: str = "",
+):
+    ToolConnectionModel = _get_tool_connection_model_cls()
+
+    try:
+        query = db.query(ToolConnectionModel).filter(
+            ToolConnectionModel.workspace_id == workspace_id,
+            ToolConnectionModel.toolkit == toolkit.upper(),
+        )
+        if status:
+            query = query.filter(ToolConnectionModel.status == status)
+        query = query.filter(ToolConnectionModel.connected_account_id == (connected_account_id or ""))
+        return query.first()
+    except Exception as exc:
+        if not _is_missing_column_error(exc):
+            raise
+        _safe_rollback(db)
+        table = _get_reflected_table(db, "tool_connections")
+        if table is None:
+            raise
+        stmt = table.select().where(
+            table.c.workspace_id == workspace_id,
+            table.c.toolkit == toolkit.upper(),
+            table.c.connected_account_id == (connected_account_id or ""),
+        )
+        if status:
+            stmt = stmt.where(table.c.status == status)
+        row = db.execute(stmt).mappings().first()
+        return _tool_connection_from_mapping(dict(row)) if row else None
 
 
 def upsert_tool_connection(
@@ -780,31 +1303,33 @@ def upsert_tool_connection(
     status_updated_at = None,
     metadata_json: dict | None = None,
 ):
-    from models.tool_connections import ToolConnectionModel
+    ToolConnectionModel = _get_tool_connection_model_cls()
 
     try:
-        query = db.query(ToolConnectionModel).filter(
-            ToolConnectionModel.workspace_id == workspace_id,
-            ToolConnectionModel.toolkit == toolkit.upper(),
+        normalized_toolkit = toolkit.upper()
+        normalized_account_id = connected_account_id or ""
+        row = get_tool_connection(
+            db,
+            workspace_id,
+            toolkit=normalized_toolkit,
+            connected_account_id=normalized_account_id,
         )
-        if connected_account_id:
-            query = query.filter(ToolConnectionModel.connected_account_id == connected_account_id)
-        else:
-            query = query.filter(ToolConnectionModel.connected_account_id == "")
-        row = query.first()
+        existing_metadata = dict(getattr(row, "metadata_json", {}) or {}) if row else {}
+        merged_metadata = dict(existing_metadata)
+        merged_metadata.update(dict(metadata_json or {}))
         if not row:
             row = ToolConnectionModel(
                 id=_id(),
                 workspace_id=workspace_id,
                 user_id=workspace_id,
                 tool_name=tool_name or "*",
-                toolkit=toolkit.upper(),
+                toolkit=normalized_toolkit,
                 status=status,
-                connected_account_id=connected_account_id or "",
+                connected_account_id=normalized_account_id,
                 account_label=account_label or "",
                 is_default=bool(is_default),
                 auth_mode=auth_mode,
-                metadata_json=dict(metadata_json or {}),
+                metadata_json=merged_metadata,
                 last_verified_at=last_verified_at,
                 last_seen_remote_at=last_seen_remote_at,
                 revoked_at=revoked_at,
@@ -819,7 +1344,7 @@ def upsert_tool_connection(
             row.tool_name = tool_name or row.tool_name
             row.status = status
             row.auth_mode = auth_mode or row.auth_mode
-            row.connected_account_id = connected_account_id or row.connected_account_id
+            row.connected_account_id = normalized_account_id or row.connected_account_id
             row.account_label = account_label or row.account_label
             row.is_default = bool(is_default or getattr(row, "is_default", False))
             if last_verified_at is not None:
@@ -830,16 +1355,141 @@ def upsert_tool_connection(
                 row.revoked_at = revoked_at
             if status_reason:
                 row.status_reason = status_reason
-            merged_meta = dict(getattr(row, "metadata_json", {}) or {})
-            merged_meta.update(dict(metadata_json or {}))
-            row.metadata_json = merged_meta
+            row.metadata_json = merged_metadata
             if previous_status != status or status_updated_at is not None:
                 row.status_updated_at = status_updated_at or utc_now()
             row.updated_at = utc_now()
+        if row.is_default:
+            for sibling in db.query(ToolConnectionModel).filter(
+                ToolConnectionModel.workspace_id == workspace_id,
+                ToolConnectionModel.toolkit == normalized_toolkit,
+            ).all():
+                if getattr(sibling, "connected_account_id", "") != normalized_account_id:
+                    sibling.is_default = False
+                    sibling.updated_at = utc_now()
         db.commit()
         db.refresh(row)
         return row
     except Exception as exc:
+        if _is_missing_column_error(exc):
+            _safe_rollback(db)
+            table = _get_reflected_table(db, "tool_connections")
+            if table is None:
+                raise
+            normalized_toolkit = toolkit.upper()
+            normalized_account_id = connected_account_id or ""
+            existing_row = db.execute(
+                table.select().where(
+                    table.c.workspace_id == workspace_id,
+                    table.c.toolkit == normalized_toolkit,
+                    table.c.connected_account_id == normalized_account_id,
+                )
+            ).mappings().first()
+            base_metadata = dict((existing_row or {}).get("metadata_json", {}) or {})
+            merged_metadata = dict(base_metadata)
+            merged_metadata.update(dict(metadata_json or {}))
+            if account_label:
+                merged_metadata.setdefault("account_label", account_label)
+            if is_default:
+                merged_metadata["requested_is_default"] = True
+            if status_reason:
+                merged_metadata["status_reason"] = status_reason
+            if last_verified_at is not None:
+                merged_metadata["last_verified_at"] = str(last_verified_at)
+            if last_seen_remote_at is not None:
+                merged_metadata["last_seen_remote_at"] = str(last_seen_remote_at)
+            values = {
+                "workspace_id": workspace_id,
+                "user_id": workspace_id,
+                "tool_name": tool_name or "*",
+                "toolkit": normalized_toolkit,
+                "status": status,
+                "connected_account_id": normalized_account_id,
+                "auth_mode": auth_mode,
+                "metadata_json": merged_metadata,
+            }
+            if "account_label" in table.c:
+                values["account_label"] = account_label or base_metadata.get("account_label", "")
+            if "is_default" in table.c:
+                values["is_default"] = bool(is_default)
+            if "last_verified_at" in table.c and last_verified_at is not None:
+                values["last_verified_at"] = last_verified_at
+            if "last_seen_remote_at" in table.c and last_seen_remote_at is not None:
+                values["last_seen_remote_at"] = last_seen_remote_at
+            if "revoked_at" in table.c:
+                values["revoked_at"] = revoked_at
+            if "status_reason" in table.c:
+                values["status_reason"] = status_reason or ""
+            if "status_updated_at" in table.c:
+                values["status_updated_at"] = status_updated_at or utc_now()
+            if "updated_at" in table.c:
+                values["updated_at"] = utc_now()
+            if existing_row:
+                db.execute(
+                    table.update()
+                    .where(table.c.id == existing_row["id"])
+                    .values(**{key: value for key, value in values.items() if key in table.c})
+                )
+            else:
+                insert_values = {"id": _id(), "created_at": utc_now(), **values}
+                db.execute(
+                    table.insert().values(
+                        **{key: value for key, value in insert_values.items() if key in table.c}
+                    )
+                )
+            if is_default and "is_default" in table.c:
+                sibling_update_values = {"is_default": False}
+                if "updated_at" in table.c:
+                    sibling_update_values["updated_at"] = utc_now()
+                db.execute(
+                    table.update()
+                    .where(
+                        table.c.workspace_id == workspace_id,
+                        table.c.toolkit == normalized_toolkit,
+                        table.c.connected_account_id != normalized_account_id,
+                    )
+                    .values(**sibling_update_values)
+                )
+            db.commit()
+            refreshed = db.execute(
+                table.select().where(
+                    table.c.workspace_id == workspace_id,
+                    table.c.toolkit == normalized_toolkit,
+                    table.c.connected_account_id == normalized_account_id,
+                )
+            ).mappings().first()
+            return _tool_connection_from_mapping(dict(refreshed)) if refreshed else None
+        if _is_integrity_error(exc):
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            row = get_tool_connection(
+                db,
+                workspace_id,
+                toolkit=toolkit,
+                connected_account_id=connected_account_id,
+            )
+            if row:
+                if account_label:
+                    row.account_label = account_label
+                if metadata_json:
+                    merged = dict(getattr(row, "metadata_json", {}) or {})
+                    merged.update(dict(metadata_json or {}))
+                    row.metadata_json = merged
+                if last_verified_at is not None:
+                    row.last_verified_at = last_verified_at
+                if last_seen_remote_at is not None:
+                    row.last_seen_remote_at = last_seen_remote_at
+                if revoked_at is not None:
+                    row.revoked_at = revoked_at
+                row.status = status
+                row.status_reason = status_reason or row.status_reason
+                row.updated_at = utc_now()
+                row.status_updated_at = status_updated_at or utc_now()
+                db.commit()
+                db.refresh(row)
+                return row
         log_exception(
             logger,
             "storage.tool_connection_upsert_failed",
@@ -863,33 +1513,87 @@ def set_tool_connection_status(
     status_reason: str = "",
     last_seen_remote_at = None,
 ):
-    from models.tool_connections import ToolConnectionModel
+    ToolConnectionModel = _get_tool_connection_model_cls()
 
-    row = (
-        db.query(ToolConnectionModel)
-        .filter(
-            ToolConnectionModel.workspace_id == workspace_id,
-            ToolConnectionModel.toolkit == toolkit.upper(),
-            ToolConnectionModel.connected_account_id == (connected_account_id or ""),
+    try:
+        row = (
+            db.query(ToolConnectionModel)
+            .filter(
+                ToolConnectionModel.workspace_id == workspace_id,
+                ToolConnectionModel.toolkit == toolkit.upper(),
+                ToolConnectionModel.connected_account_id == (connected_account_id or ""),
+            )
+            .first()
         )
-        .first()
-    )
-    if not row:
-        return None
-    row.status = status
-    if is_default is not None:
-        row.is_default = bool(is_default)
-    if revoked_at is not None:
-        row.revoked_at = revoked_at
-    if last_seen_remote_at is not None:
-        row.last_seen_remote_at = last_seen_remote_at
-    if status_reason:
-        row.status_reason = status_reason
-    row.status_updated_at = utc_now()
-    row.updated_at = utc_now()
-    db.commit()
-    db.refresh(row)
-    return row
+        if not row:
+            return None
+        row.status = status
+        if is_default is not None:
+            row.is_default = bool(is_default)
+        elif status != "connected":
+            row.is_default = False
+        if revoked_at is not None:
+            row.revoked_at = revoked_at
+        if last_seen_remote_at is not None:
+            row.last_seen_remote_at = last_seen_remote_at
+        if status_reason:
+            row.status_reason = status_reason
+        row.status_updated_at = utc_now()
+        row.updated_at = utc_now()
+        db.commit()
+        db.refresh(row)
+        return row
+    except Exception as exc:
+        if not _is_missing_column_error(exc):
+            raise
+        _safe_rollback(db)
+        table = _get_reflected_table(db, "tool_connections")
+        if table is None:
+            raise
+        existing_row = db.execute(
+            table.select().where(
+                table.c.workspace_id == workspace_id,
+                table.c.toolkit == toolkit.upper(),
+                table.c.connected_account_id == (connected_account_id or ""),
+            )
+        ).mappings().first()
+        if not existing_row:
+            return None
+        merged_metadata = dict(existing_row.get("metadata_json", {}) or {})
+        if status_reason:
+            merged_metadata["status_reason"] = status_reason
+        if revoked_at is not None:
+            merged_metadata["revoked_at"] = str(revoked_at)
+        if last_seen_remote_at is not None:
+            merged_metadata["last_seen_remote_at"] = str(last_seen_remote_at)
+        update_values = {
+            "status": status,
+            "metadata_json": merged_metadata,
+        }
+        if "is_default" in table.c:
+            update_values["is_default"] = bool(is_default) if is_default is not None else status == "connected" and bool(existing_row.get("is_default", False))
+            if status != "connected" and is_default is None:
+                update_values["is_default"] = False
+        if "revoked_at" in table.c and revoked_at is not None:
+            update_values["revoked_at"] = revoked_at
+        if "last_seen_remote_at" in table.c and last_seen_remote_at is not None:
+            update_values["last_seen_remote_at"] = last_seen_remote_at
+        if "status_reason" in table.c and status_reason:
+            update_values["status_reason"] = status_reason
+        if "status_updated_at" in table.c:
+            update_values["status_updated_at"] = utc_now()
+        if "updated_at" in table.c:
+            update_values["updated_at"] = utc_now()
+        db.execute(
+            table.update()
+            .where(table.c.id == existing_row["id"])
+            .values(**update_values)
+        )
+        db.commit()
+        refreshed = db.execute(
+            table.select().where(table.c.id == existing_row["id"])
+        ).mappings().first()
+        return _tool_connection_from_mapping(dict(refreshed)) if refreshed else None
 
 
 def get_workspace_connector_preference(
@@ -943,3 +1647,408 @@ def upsert_workspace_connector_preference(
             workspace_id=workspace_id,
         )
         raise
+
+
+# ── Pending Requests / Approval / Idempotency ────────────────────────────────
+
+def get_pending_tool_request_by_resume_token(db: Session, resume_token: str):
+    PendingToolRequestModel = _get_pending_tool_request_model_cls()
+
+    try:
+        return (
+            db.query(PendingToolRequestModel)
+            .filter(PendingToolRequestModel.resume_token == resume_token)
+            .first()
+        )
+    except Exception as exc:
+        if not _is_missing_column_error(exc):
+            raise
+        _safe_rollback(db)
+        table = _get_reflected_table(db, "pending_tool_requests")
+        if table is None:
+            raise
+        row = (
+            db.execute(
+                table.select().where(table.c.resume_token == resume_token)
+            )
+            .mappings()
+            .first()
+        )
+        return _pending_tool_request_from_mapping(dict(row)) if row else None
+
+
+def get_pending_tool_request_by_id(db: Session, request_id: str):
+    PendingToolRequestModel = _get_pending_tool_request_model_cls()
+
+    try:
+        return (
+            db.query(PendingToolRequestModel)
+            .filter(PendingToolRequestModel.id == request_id)
+            .first()
+        )
+    except Exception as exc:
+        if not _is_missing_column_error(exc):
+            raise
+        _safe_rollback(db)
+        table = _get_reflected_table(db, "pending_tool_requests")
+        if table is None:
+            raise
+        row = (
+            db.execute(
+                table.select().where(table.c.id == request_id)
+            )
+            .mappings()
+            .first()
+        )
+        return _pending_tool_request_from_mapping(dict(row)) if row else None
+
+
+def save_pending_tool_request(
+    db: Session,
+    workspace_id: str,
+    *,
+    agent_key: str,
+    original_input: str,
+    requested_tool: str,
+    requested_toolkit: str,
+    resume_token: str,
+    conversation_id: str = "",
+    context_json: dict | None = None,
+    pending_kind: str = "auth",
+    idempotency_key: str = "",
+    approval_requirement_json: dict | None = None,
+    approved: bool = False,
+    expires_at=None,
+):
+    PendingToolRequestModel = _get_pending_tool_request_model_cls()
+
+    try:
+        row = (
+            db.query(PendingToolRequestModel)
+            .filter(
+                PendingToolRequestModel.workspace_id == workspace_id,
+                PendingToolRequestModel.agent_key == agent_key,
+                PendingToolRequestModel.original_input == original_input,
+                PendingToolRequestModel.requested_tool == requested_tool,
+                PendingToolRequestModel.requested_toolkit == requested_toolkit,
+                PendingToolRequestModel.pending_kind == pending_kind,
+                PendingToolRequestModel.status.in_(["pending", "resumed"]),
+            )
+            .first()
+        )
+        if not row:
+            row = PendingToolRequestModel(
+                id=_id(),
+                workspace_id=workspace_id,
+                conversation_id=conversation_id,
+                agent_key=agent_key,
+                original_input=original_input,
+                requested_tool=requested_tool,
+                requested_toolkit=requested_toolkit,
+                resume_token=resume_token,
+                status="pending",
+                pending_kind=pending_kind,
+                idempotency_key=idempotency_key or "",
+                approval_requirement_json=dict(approval_requirement_json or {}),
+                approved=bool(approved),
+                approved_at=utc_now() if approved else None,
+                expires_at=expires_at or _pending_request_expiry(),
+                context_json=dict(context_json or {}),
+                created_at=utc_now(),
+                updated_at=utc_now(),
+            )
+            db.add(row)
+        else:
+            row.resume_token = resume_token
+            row.conversation_id = conversation_id or row.conversation_id
+            row.context_json = dict(context_json or {})
+            row.pending_kind = pending_kind
+            row.idempotency_key = idempotency_key or getattr(row, "idempotency_key", "")
+            row.approval_requirement_json = dict(approval_requirement_json or getattr(row, "approval_requirement_json", {}) or {})
+            row.approved = bool(approved)
+            row.approved_at = utc_now() if approved else getattr(row, "approved_at", None)
+            row.expires_at = expires_at or getattr(row, "expires_at", None) or _pending_request_expiry()
+            row.updated_at = utc_now()
+        db.commit()
+        return row
+    except Exception as exc:
+        if not _is_missing_column_error(exc):
+            raise
+        _safe_rollback(db)
+        table = _get_reflected_table(db, "pending_tool_requests")
+        if table is None:
+            raise
+        existing_row = (
+            db.execute(
+                table.select().where(
+                    table.c.workspace_id == workspace_id,
+                    table.c.agent_key == agent_key,
+                    table.c.original_input == original_input,
+                    table.c.requested_tool == requested_tool,
+                    table.c.requested_toolkit == requested_toolkit,
+                    table.c.status.in_(["pending", "resumed"]),
+                )
+            )
+            .mappings()
+            .first()
+        )
+        legacy_context = dict(context_json or {})
+        legacy_context.setdefault("pending_kind", pending_kind)
+        legacy_context.setdefault("idempotency_key", idempotency_key or "")
+        legacy_context.setdefault("approval_requirement_json", dict(approval_requirement_json or {}))
+        legacy_context.setdefault("approved", bool(approved))
+        values = {
+            "conversation_id": conversation_id,
+            "agent_key": agent_key,
+            "original_input": original_input,
+            "requested_tool": requested_tool,
+            "requested_toolkit": requested_toolkit,
+            "resume_token": resume_token,
+            "status": "pending",
+            "context_json": legacy_context,
+            "updated_at": utc_now(),
+        }
+        if existing_row:
+            db.execute(
+                table.update()
+                .where(table.c.id == existing_row["id"])
+                .values(**{key: value for key, value in values.items() if key in table.c})
+            )
+            row_id = existing_row["id"]
+            created_at = existing_row.get("created_at")
+        else:
+            row_id = _id()
+            created_at = utc_now()
+            insert_values = {
+                "id": row_id,
+                "workspace_id": workspace_id,
+                "created_at": created_at,
+                **values,
+            }
+            db.execute(
+                table.insert().values(
+                    **{key: value for key, value in insert_values.items() if key in table.c}
+                )
+            )
+        db.commit()
+        return _pending_tool_request_from_mapping(
+            {
+                "id": row_id,
+                "workspace_id": workspace_id,
+                "conversation_id": conversation_id,
+                "agent_key": agent_key,
+                "original_input": original_input,
+                "requested_tool": requested_tool,
+                "requested_toolkit": requested_toolkit,
+                "resume_token": resume_token,
+                "status": "pending",
+                "pending_kind": pending_kind,
+                "idempotency_key": idempotency_key or "",
+                "approval_requirement_json": dict(approval_requirement_json or {}),
+                "approved": bool(approved),
+                "approved_at": utc_now() if approved else None,
+                "expires_at": expires_at or _pending_request_expiry(),
+                "context_json": legacy_context,
+                "created_at": created_at,
+                "updated_at": values["updated_at"],
+            }
+        )
+
+
+def transition_pending_tool_request(
+    db: Session,
+    resume_token: str,
+    *,
+    to_status: str,
+    allowed_statuses: tuple[str, ...] = ("pending", "resumed"),
+    require_approved: bool = False,
+    context_updates: dict | None = None,
+):
+    row = get_pending_tool_request_by_resume_token(db, resume_token)
+    if not row:
+        return None
+    if allowed_statuses and getattr(row, "status", "") not in allowed_statuses:
+        return row
+    if require_approved and not getattr(row, "approved", False):
+        return row
+    try:
+        row.status = to_status
+        if context_updates:
+            merged = dict(getattr(row, "context_json", {}) or {})
+            merged.update(dict(context_updates or {}))
+            row.context_json = merged
+        row.updated_at = utc_now()
+        db.commit()
+        return row
+    except Exception as exc:
+        if not _is_missing_column_error(exc):
+            raise
+        _safe_rollback(db)
+        table = _get_reflected_table(db, "pending_tool_requests")
+        if table is None:
+            raise
+        update_values = {"status": to_status, "updated_at": utc_now()}
+        if context_updates:
+            merged = dict(getattr(row, "context_json", {}) or {})
+            merged.update(dict(context_updates or {}))
+            update_values["context_json"] = merged
+        db.execute(
+            table.update()
+            .where(table.c.resume_token == resume_token)
+            .values(**{key: value for key, value in update_values.items() if key in table.c})
+        )
+        db.commit()
+        return _pending_tool_request_from_mapping({**row.__dict__, **update_values})
+
+
+def approve_pending_tool_request(db: Session, resume_token: str):
+    row = get_pending_tool_request_by_resume_token(db, resume_token)
+    if not row:
+        return None
+    try:
+        row.approved = True
+        row.approved_at = utc_now()
+        context_json = dict(getattr(row, "context_json", {}) or {})
+        context_json["approval_granted"] = True
+        granted = list(context_json.get("approved_idempotency_keys", []) or [])
+        idempotency_key = str(getattr(row, "idempotency_key", "") or "")
+        if idempotency_key and idempotency_key not in granted:
+            granted.append(idempotency_key)
+        context_json["approved_idempotency_keys"] = granted
+        row.context_json = context_json
+        row.updated_at = utc_now()
+        db.commit()
+        return row
+    except Exception as exc:
+        if not _is_missing_column_error(exc):
+            raise
+        _safe_rollback(db)
+        table = _get_reflected_table(db, "pending_tool_requests")
+        if table is None:
+            raise
+        context_json = dict(getattr(row, "context_json", {}) or {})
+        context_json["approval_granted"] = True
+        granted = list(context_json.get("approved_idempotency_keys", []) or [])
+        idempotency_key = str(getattr(row, "idempotency_key", "") or context_json.get("idempotency_key", "") or "")
+        if idempotency_key and idempotency_key not in granted:
+            granted.append(idempotency_key)
+        context_json["approved_idempotency_keys"] = granted
+        update_values = {"context_json": context_json, "updated_at": utc_now()}
+        if "approved" in table.c:
+            update_values["approved"] = True
+        if "approved_at" in table.c:
+            update_values["approved_at"] = utc_now()
+        db.execute(
+            table.update()
+            .where(table.c.resume_token == resume_token)
+            .values(**{key: value for key, value in update_values.items() if key in table.c})
+        )
+        db.commit()
+        return _pending_tool_request_from_mapping({**row.__dict__, **update_values, "approved": True})
+
+
+def get_tool_idempotency_record(
+    db: Session,
+    workspace_id: str,
+    tool_name: str,
+    idempotency_key: str,
+):
+    ToolIdempotencyRecordModel = _get_tool_idempotency_model_cls()
+
+    if not idempotency_key:
+        return None
+    return (
+        db.query(ToolIdempotencyRecordModel)
+        .filter(
+            ToolIdempotencyRecordModel.workspace_id == workspace_id,
+            ToolIdempotencyRecordModel.tool_name == tool_name,
+            ToolIdempotencyRecordModel.idempotency_key == idempotency_key,
+        )
+        .first()
+    )
+
+
+def claim_tool_idempotency_record(
+    db: Session,
+    workspace_id: str,
+    tool_name: str,
+    idempotency_key: str,
+    *,
+    input_hash: str = "",
+    status: str = "pending",
+):
+    ToolIdempotencyRecordModel = _get_tool_idempotency_model_cls()
+
+    existing = get_tool_idempotency_record(db, workspace_id, tool_name, idempotency_key)
+    if existing:
+        return existing
+
+    row = ToolIdempotencyRecordModel(
+        id=_id(),
+        workspace_id=workspace_id,
+        tool_name=tool_name,
+        idempotency_key=idempotency_key,
+        input_hash=input_hash,
+        status=status,
+        output_json={},
+        error_message="",
+        created_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    db.add(row)
+    try:
+        db.commit()
+        return row
+    except Exception as exc:
+        if not _is_integrity_error(exc):
+            raise
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return get_tool_idempotency_record(db, workspace_id, tool_name, idempotency_key)
+
+
+def update_tool_idempotency_record(
+    db: Session,
+    workspace_id: str,
+    tool_name: str,
+    idempotency_key: str,
+    *,
+    input_hash: str = "",
+    status: str = "",
+    pending_request_id: str = "",
+    tool_call_log_id: str = "",
+    output_json: dict | None = None,
+    error_message: str = "",
+    completed: bool = False,
+):
+    row = get_tool_idempotency_record(db, workspace_id, tool_name, idempotency_key)
+    if not row:
+        row = claim_tool_idempotency_record(
+            db,
+            workspace_id,
+            tool_name,
+            idempotency_key,
+            input_hash=input_hash,
+            status=status or "pending",
+        )
+    if not row:
+        return None
+    if input_hash:
+        row.input_hash = input_hash
+    if status:
+        row.status = status
+    if pending_request_id:
+        row.pending_request_id = pending_request_id
+    if tool_call_log_id:
+        row.tool_call_log_id = tool_call_log_id
+    if output_json is not None:
+        row.output_json = dict(output_json or {})
+    if error_message:
+        row.error_message = error_message
+    row.updated_at = utc_now()
+    if completed:
+        row.completed_at = utc_now()
+    db.commit()
+    return row

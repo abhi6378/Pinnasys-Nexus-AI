@@ -95,11 +95,19 @@ from models.tool_call_logs import ToolCallLogModel
 from models.tool_connections import ToolConnectionModel
 from models.pending_tool_requests import PendingToolRequestModel
 from models.tool_idempotency_records import ToolIdempotencyRecordModel
+try:
+    from storage import repositories as repo
+except Exception:  # pragma: no cover - isolated unit tests may stub model modules only
+    repo = None
 from utils.logging_utils import log_event, log_exception
 from utils.time_utils import utc_now
 
 logger = logging.getLogger(__name__)
 CONNECTOR_STATUS_TTL_SECONDS = int(os.getenv("CONNECTOR_STATUS_TTL_SECONDS", "900") or "900")
+
+
+def _can_use_repo_helpers(db: DBSession) -> bool:
+    return repo is not None and hasattr(db, "bind")
 
 
 # ── Result builders ───────────────────────────────────────────────────────────
@@ -253,6 +261,11 @@ def _get_idempotency_record(
     if not idempotency_key:
         return None
     try:
+        if _can_use_repo_helpers(db):
+            try:
+                return repo.get_tool_idempotency_record(db, workspace_id, tool_name, idempotency_key)
+            except Exception:
+                pass
         return (
             db.query(ToolIdempotencyRecordModel)
             .filter(
@@ -283,6 +296,23 @@ def _upsert_idempotency_record(
     if not idempotency_key:
         return None
     try:
+        if _can_use_repo_helpers(db):
+            try:
+                return repo.update_tool_idempotency_record(
+                    db,
+                    workspace_id,
+                    tool_name,
+                    idempotency_key,
+                    input_hash=input_hash,
+                    status=status,
+                    pending_request_id=pending_request_id,
+                    tool_call_log_id=tool_call_log_id,
+                    output_json=output_json,
+                    error_message=error_message,
+                    completed=completed,
+                )
+            except Exception:
+                pass
         row = _get_idempotency_record(db, workspace_id, tool_name, idempotency_key)
         if not row:
             row = ToolIdempotencyRecordModel(
@@ -339,6 +369,11 @@ def _get_pending_request_by_id(db: DBSession, request_id: str) -> PendingToolReq
     if not request_id:
         return None
     try:
+        if _can_use_repo_helpers(db):
+            try:
+                return repo.get_pending_tool_request_by_id(db, request_id)
+            except Exception:
+                pass
         return (
             db.query(PendingToolRequestModel)
             .filter(PendingToolRequestModel.id == request_id)
@@ -437,6 +472,25 @@ def _save_pending_request(
     Persist the original request so it can be resumed after auth completes.
     """
     try:
+        if _can_use_repo_helpers(db):
+            try:
+                return repo.save_pending_tool_request(
+                    db,
+                    workspace_id,
+                    agent_key=agent_key,
+                    original_input=original_input,
+                    requested_tool=tool_name,
+                    requested_toolkit=toolkit,
+                    resume_token=resume_token,
+                    conversation_id=conversation_id,
+                    context_json=context_json,
+                    pending_kind=pending_kind,
+                    idempotency_key=idempotency_key,
+                    approval_requirement_json=approval_requirement,
+                    approved=approved,
+                )
+            except Exception:
+                pass
         existing = (
             db.query(PendingToolRequestModel)
             .filter(
@@ -462,7 +516,6 @@ def _save_pending_request(
             existing.updated_at = utc_now()
             db.commit()
             return existing
-
         row = PendingToolRequestModel(
             id=str(uuid.uuid4()),
             workspace_id=workspace_id,
@@ -509,6 +562,20 @@ def _get_local_connection(
 ) -> Optional[ToolConnectionModel]:
     """Check local DB cache for an active connection."""
     try:
+        if _can_use_repo_helpers(db):
+            try:
+                if preferred_account_id:
+                    return repo.get_tool_connection(
+                        db,
+                        workspace_id,
+                        toolkit=toolkit,
+                        connected_account_id=preferred_account_id,
+                        status="connected",
+                    )
+                rows = repo.list_tool_connections(db, workspace_id, toolkit=toolkit, status="connected")
+                return rows[0] if rows else None
+            except Exception:
+                pass
         query = (
             db.query(ToolConnectionModel)
             .filter(
@@ -562,6 +629,25 @@ def _save_local_connection(
 ) -> None:
     """Upsert local connection state after a live Composio connection check."""
     try:
+        if _can_use_repo_helpers(db):
+            try:
+                repo.upsert_tool_connection(
+                    db,
+                    workspace_id,
+                    toolkit=toolkit,
+                    connected_account_id=connected_account_id,
+                    tool_name="*",
+                    status=status,
+                    auth_mode=auth_mode,
+                    account_label=account_label,
+                    is_default=is_default,
+                    last_verified_at=utc_now(),
+                    status_updated_at=utc_now(),
+                    metadata_json={},
+                )
+                return
+            except Exception:
+                pass
         query = (
             db.query(ToolConnectionModel)
             .filter(
@@ -586,8 +672,8 @@ def _save_local_connection(
             row = ToolConnectionModel(
                 id=str(uuid.uuid4()),
                 workspace_id=workspace_id,
-                user_id=workspace_id,  # user_id == workspace_id for now
-                tool_name="*",         # toolkit-level connection
+                user_id=workspace_id,
+                tool_name="*",
                 toolkit=toolkit.upper(),
                 status=status,
                 connected_account_id=connected_account_id,
@@ -746,6 +832,28 @@ def attempt_tool_call(
     if write_action:
         idempotency_key, input_hash = _serialize_idempotency_payload(tool_name, input_args, context_json)
         idempotency_record = _get_idempotency_record(db, workspace_id, tool_name, idempotency_key)
+        if not idempotency_record:
+            if _can_use_repo_helpers(db):
+                try:
+                    idempotency_record = repo.claim_tool_idempotency_record(
+                        db,
+                        workspace_id,
+                        tool_name,
+                        idempotency_key,
+                        input_hash=input_hash,
+                        status="in_progress",
+                    )
+                except Exception:
+                    idempotency_record = None
+            if not idempotency_record:
+                idempotency_record = _upsert_idempotency_record(
+                    db,
+                    workspace_id,
+                    tool_name,
+                    idempotency_key,
+                    input_hash=input_hash,
+                    status="in_progress",
+                )
         if idempotency_record and getattr(idempotency_record, "input_hash", "") and idempotency_record.input_hash != input_hash:
             error_message = "The same idempotency key was reused for a different write payload."
             _log_attempt(
@@ -799,15 +907,15 @@ def attempt_tool_call(
                     "pending_kind": "approval",
                     "idempotency_key": idempotency_key,
                 }
-
-        _upsert_idempotency_record(
-            db,
-            workspace_id,
-            tool_name,
-            idempotency_key,
-            input_hash=input_hash,
-            status="in_progress",
-        )
+        elif idempotency_record and getattr(idempotency_record, "status", "") not in {"success", "pending_auth", "pending_approval", "in_progress"}:
+            _upsert_idempotency_record(
+                db,
+                workspace_id,
+                tool_name,
+                idempotency_key,
+                input_hash=input_hash,
+                status="in_progress",
+            )
 
     # ── Step 5: Check connection (local cache, then remote live check) ───
     requires_auth = tool_entry.get("requires_auth", True)
@@ -1122,14 +1230,24 @@ def get_pending_request(
 ) -> Optional[PendingToolRequestModel]:
     """Look up a pending request by its resume token."""
     try:
-        return (
-            db.query(PendingToolRequestModel)
-            .filter(
-                PendingToolRequestModel.resume_token == resume_token,
-                PendingToolRequestModel.status.in_(["pending", "resumed"]),
+        row = None
+        if _can_use_repo_helpers(db):
+            try:
+                row = repo.get_pending_tool_request_by_resume_token(db, resume_token)
+            except Exception:
+                row = None
+        if row is None:
+            row = (
+                db.query(PendingToolRequestModel)
+                .filter(
+                    PendingToolRequestModel.resume_token == resume_token,
+                    PendingToolRequestModel.status.in_(["pending", "resumed"]),
+                )
+                .first()
             )
-            .first()
-        )
+        if row and getattr(row, "status", "") in {"pending", "resumed"}:
+            return row
+        return None
     except Exception:
         return None
 
@@ -1137,14 +1255,33 @@ def get_pending_request(
 def mark_request_resumed(db: DBSession, resume_token: str) -> None:
     """Mark a pending request as resumed (auth completed, re-executing)."""
     try:
-        row = (
-            db.query(PendingToolRequestModel)
-            .filter(PendingToolRequestModel.resume_token == resume_token)
-            .first()
-        )
-        if row:
-            if getattr(row, "pending_kind", "auth") == "approval" and not getattr(row, "approved", False):
+        row = None
+        if _can_use_repo_helpers(db):
+            try:
+                row = repo.get_pending_tool_request_by_resume_token(db, resume_token)
+            except Exception:
+                row = None
+        if row is None:
+            row = (
+                db.query(PendingToolRequestModel)
+                .filter(PendingToolRequestModel.resume_token == resume_token)
+                .first()
+            )
+        if row and getattr(row, "pending_kind", "auth") == "approval" and not getattr(row, "approved", False):
+            return
+        if _can_use_repo_helpers(db):
+            try:
+                repo.transition_pending_tool_request(
+                    db,
+                    resume_token,
+                    to_status="resumed",
+                    allowed_statuses=("pending", "resumed"),
+                    require_approved=False,
+                )
                 return
+            except Exception:
+                pass
+        if row:
             row.status = "resumed"
             row.updated_at = utc_now()
             db.commit()
@@ -1164,6 +1301,17 @@ def mark_request_resumed(db: DBSession, resume_token: str) -> None:
 def mark_request_completed(db: DBSession, resume_token: str) -> None:
     """Mark a pending request as completed after a successful resume."""
     try:
+        if _can_use_repo_helpers(db):
+            try:
+                repo.transition_pending_tool_request(
+                    db,
+                    resume_token,
+                    to_status="completed",
+                    allowed_statuses=("pending", "resumed"),
+                )
+                return
+            except Exception:
+                pass
         row = (
             db.query(PendingToolRequestModel)
             .filter(PendingToolRequestModel.resume_token == resume_token)
@@ -1189,6 +1337,12 @@ def mark_request_completed(db: DBSession, resume_token: str) -> None:
 def mark_request_approved(db: DBSession, resume_token: str) -> None:
     """Mark a pending approval request as explicitly approved."""
     try:
+        if _can_use_repo_helpers(db):
+            try:
+                repo.approve_pending_tool_request(db, resume_token)
+                return
+            except Exception:
+                pass
         row = (
             db.query(PendingToolRequestModel)
             .filter(PendingToolRequestModel.resume_token == resume_token)

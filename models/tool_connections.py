@@ -1,62 +1,78 @@
 """
-models/tool_connections.py  —  Tracks which Composio-managed tools a workspace
-has connected (OAuth completed, API key stored, etc.).
+models/tool_connections.py  —  Tracks Composio-managed connector/account state.
 
-This is the LOCAL record of what Composio already knows server-side, kept so
-that the tool executor can short-circuit "is this connected?" checks without
-an API round-trip every time.
-
-Identity mapping:
-  workspace_id  ≡  Composio user_id  (1:1 for now)
-  user_id       =  workspace_id      (reserved for future multi-user workspaces)
-
-Columns:
-  id                   — PK, UUID
-  workspace_id         — FK-like reference to workspaces.id (not enforced by FK
-                         constraint to stay additive / migration-safe)
-  user_id              — Composio user_id; equals workspace_id today
-  tool_name            — Composio tool slug, e.g. "GMAIL_SEND_EMAIL"
-  toolkit              — Composio toolkit / app name, e.g. "GMAIL"
-  status               — connected | pending | revoked | error
-  connected_account_id — Composio's opaque account ID once OAuth completes
-  account_label        — UI-safe label / alias for the connected account
-  is_default           — whether this is the preferred active account
-  auth_mode            — oauth2 | api_key | jwt | none
-  metadata_json        — Arbitrary JSON blob for extra data (scopes, labels, …)
-  last_verified_at     — last time the connection was verified locally/remotely
-  last_seen_remote_at  — last time this account was observed in remote Composio state
-  revoked_at           — when a previously-known account was reconciled as revoked
-  status_reason        — UI-safe explanation for pending/revoked/error states
-  created_at           — Row creation timestamp
-  updated_at           — Last status/metadata change
+The app DB stores only safe connector metadata and runtime state. OAuth tokens,
+API keys, and other secret material must remain outside this table.
 """
-from sqlalchemy import Boolean, Column, String, DateTime, JSON
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Index, JSON, String, text
 
-from storage.db import Base, new_id
+from storage.db import Base, TZDateTime, new_id
 from utils.time_utils import utc_now
+
+TOOL_CONNECTION_STATUSES = ("connected", "pending", "revoked", "error", "not_found")
+TOOL_CONNECTION_AUTH_MODES = ("oauth2", "api_key", "jwt", "none")
 
 
 class ToolConnectionModel(Base):
     __tablename__ = "tool_connections"
 
-    id                   = Column(String, primary_key=True, default=new_id)
-    workspace_id         = Column(String, nullable=False, index=True)
-    user_id              = Column(String, nullable=False, index=True)
-    tool_name            = Column(String, nullable=False)           # e.g. GMAIL_SEND_EMAIL
-    toolkit              = Column(String, nullable=False, index=True)  # e.g. GMAIL
-    status               = Column(String, nullable=False, default="pending")
+    id = Column(String, primary_key=True, default=new_id)
+    workspace_id = Column(String, nullable=False, index=True)
+    user_id = Column(String, nullable=False, index=True)
+    tool_name = Column(String, nullable=False)
+    toolkit = Column(String, nullable=False, index=True)
+    status = Column(String, nullable=False, default="pending")
     connected_account_id = Column(String, default="")
-    account_label        = Column(String, default="")
-    is_default           = Column(Boolean, default=False)
-    auth_mode            = Column(String, default="oauth2")         # oauth2 | api_key | jwt | none
-    metadata_json        = Column(JSON,   default=dict)
-    last_verified_at     = Column(DateTime, nullable=True)
-    last_seen_remote_at  = Column(DateTime, nullable=True)
-    revoked_at           = Column(DateTime, nullable=True)
-    status_reason        = Column(String, default="")
-    status_updated_at    = Column(DateTime, default=utc_now, onupdate=utc_now)
-    created_at           = Column(DateTime, default=utc_now)
-    updated_at           = Column(DateTime, default=utc_now, onupdate=utc_now)
+    account_label = Column(String, default="")
+    is_default = Column(Boolean, default=False)
+    auth_mode = Column(String, default="oauth2")
+    metadata_json = Column(JSON, default=dict)
+    last_verified_at = Column(TZDateTime, nullable=True)
+    last_seen_remote_at = Column(TZDateTime, nullable=True)
+    revoked_at = Column(TZDateTime, nullable=True)
+    status_reason = Column(String, default="")
+    status_updated_at = Column(TZDateTime, default=utc_now, onupdate=utc_now)
+    created_at = Column(TZDateTime, default=utc_now)
+    updated_at = Column(TZDateTime, default=utc_now, onupdate=utc_now)
+
+    __table_args__ = (
+        Index(
+            "uq_tool_connections_workspace_toolkit_account",
+            "workspace_id",
+            "toolkit",
+            "connected_account_id",
+            unique=True,
+        ),
+        Index(
+            "uq_tool_connections_single_default_active",
+            "workspace_id",
+            "toolkit",
+            unique=True,
+            postgresql_where=text("is_default = TRUE AND status = 'connected' AND revoked_at IS NULL"),
+        ),
+        Index(
+            "ix_tool_connections_workspace_toolkit_status_default_updated",
+            "workspace_id",
+            "toolkit",
+            "status",
+            "is_default",
+            "updated_at",
+        ),
+        Index(
+            "ix_tool_connections_workspace_toolkit_account",
+            "workspace_id",
+            "toolkit",
+            "connected_account_id",
+        ),
+        CheckConstraint(
+            "status IN ('connected', 'pending', 'revoked', 'error', 'not_found')",
+            name="ck_tool_connections_status",
+        ),
+        CheckConstraint(
+            "auth_mode IN ('oauth2', 'api_key', 'jwt', 'none')",
+            name="ck_tool_connections_auth_mode",
+        ),
+    )
 
     def __repr__(self):
         return (

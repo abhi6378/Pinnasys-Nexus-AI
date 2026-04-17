@@ -315,7 +315,8 @@ def _exec_single_agent(agent_key: str, user_input: str,
 def _exec_workflow(workflow_key: str, user_input: str,
                     brain_context: str, workspace_id: str,
                     db: Session, resume_state: dict = None,
-                    connector_context: dict | None = None) -> dict:
+                    connector_context: dict | None = None,
+                    request_id: str = "") -> dict:
     """Execute a workflow chain and return a standardised result dict."""
     wf_result = run_workflow(
         workflow_key, user_input, brain_context,
@@ -330,6 +331,22 @@ def _exec_workflow(workflow_key: str, user_input: str,
         interrupt_mode = interrupt.get("mode")
         if not interrupt_mode:
             interrupt_mode = "connect_required" if interrupt.get("connect_required") else "validation_error"
+        repo.save_workflow_run(
+            db,
+            workspace_id,
+            workflow_key,
+            wf_result["steps"],
+            interrupt.get("output", "Workflow paused."),
+            status="paused",
+            request_id=request_id,
+            metadata_json={
+                "mode": interrupt_mode,
+                "workflow_paused": True,
+                "step_label": wf_result.get("step_label"),
+                "resume_token": interrupt.get("resume_token", ""),
+                "toolkit": interrupt.get("toolkit", ""),
+            },
+        )
         return {
             "mode":             interrupt_mode,
             "workflow":         workflow_key,
@@ -356,6 +373,21 @@ def _exec_workflow(workflow_key: str, user_input: str,
         "tool_error",
     }:
         mode = wf_result["mode"]
+        repo.save_workflow_run(
+            db,
+            workspace_id,
+            workflow_key,
+            wf_result["steps"],
+            wf_result["final_output"],
+            status="failed" if mode == "tool_error" else "paused",
+            request_id=request_id,
+            metadata_json={
+                "mode": mode,
+                "step_label": wf_result.get("step_label"),
+                "toolkit": wf_result.get("toolkit", ""),
+                "resume_token": wf_result.get("resume_token", ""),
+            },
+        )
         return {
             "mode": mode,
             "workflow": workflow_key,
@@ -383,7 +415,10 @@ def _exec_workflow(workflow_key: str, user_input: str,
     }
     repo.save_workflow_run(
         db, workspace_id, workflow_key,
-        wf_result["steps"], wf_result["final_output"]
+        wf_result["steps"], wf_result["final_output"],
+        status="completed",
+        request_id=request_id,
+        metadata_json={"mode": "workflow", "resumed": bool(resume_state)},
     )
     return result
 
@@ -413,7 +448,8 @@ def _exec_reject(reason: str) -> dict:
 def _auto_route(user_input: str, workspace_id: str, db: Session,
                 brain_context: str,
                 resume_state: dict = None,
-                connector_context: dict | None = None) -> dict:
+                connector_context: dict | None = None,
+                request_id: str = "") -> dict:
     """
     Primary auto-routing path. Tries the LLM router first; falls back to
     legacy keyword → LLM detection if the router fails.
@@ -451,6 +487,7 @@ def _auto_route(user_input: str, workspace_id: str, db: Session,
                     wf_key, user_input, brain_context, workspace_id, db,
                     resume_state=resume_state,
                     connector_context=connector_context,
+                    request_id=request_id,
                 )
             # Router returned a workflow type but no valid key — fall through
             # to legacy detection which may find the right workflow.
@@ -484,6 +521,7 @@ def _auto_route(user_input: str, workspace_id: str, db: Session,
             workflow_key, user_input, brain_context, workspace_id, db,
             resume_state=resume_state,
             connector_context=connector_context,
+            request_id=request_id,
         )
 
     agent_key = detect_agent(user_input)
@@ -590,6 +628,7 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
                 force_workflow, user_input, brain_context, workspace_id, db,
                 resume_state=local_resume_state,
                 connector_context=normalized_connector.to_dict(),
+                request_id=request_id,
             )
         else:
             result = _auto_route(
@@ -599,12 +638,26 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
                 brain_context,
                 resume_state=local_resume_state,
                 connector_context=normalized_connector.to_dict(),
+                request_id=request_id,
             )
 
         # 3. Save conversation — always, including on workflow error / clarify / reject,
         #    so the exchange is visible in chat history and persists after refresh.
         agent_label = result.get("agent") or result.get("workflow", "system")
-        repo.save_conversation(db, workspace_id, agent_label, user_input, result["output"])
+        repo.save_conversation(
+            db,
+            workspace_id,
+            agent_label,
+            user_input,
+            result["output"],
+            request_id=request_id,
+            metadata_json={
+                "mode": result.get("mode", ""),
+                "workflow": result.get("workflow", ""),
+                "toolkit": result.get("toolkit", ""),
+                "workflow_resumed": bool(local_resume_state),
+            },
+        )
 
         # 4. Auto-extract memory — skip on error, clarify, reject, and connect_required.
         is_error   = result.get("error", False)

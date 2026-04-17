@@ -6,7 +6,7 @@ from tests.support import Spy, import_fresh, make_module, make_sqlalchemy_stubs,
 def load_connector_service_module():
     stubs = {}
     stubs.update(make_sqlalchemy_stubs())
-    stubs["storage.repositories"] = make_module(
+    storage_repositories = make_module(
         "storage.repositories",
         upsert_tool_connection=lambda *args, **kwargs: None,
         set_tool_connection_status=lambda *args, **kwargs: None,
@@ -14,12 +14,15 @@ def load_connector_service_module():
         get_workspace_connector_preference=lambda *args, **kwargs: None,
         upsert_workspace_connector_preference=lambda *args, **kwargs: None,
     )
-    stubs["tools.composio_client"] = make_module(
+    stubs["storage.repositories"] = storage_repositories
+    stubs["storage"] = make_module("storage", repositories=storage_repositories)
+    composio_client = make_module(
         "tools.composio_client",
         get_connect_link=lambda *args, **kwargs: None,
         list_connected_accounts=lambda *args, **kwargs: [],
     )
-    stubs["tools.tool_registry"] = make_module(
+    stubs["tools.composio_client"] = composio_client
+    tool_registry = make_module(
         "tools.tool_registry",
         get_toolkit_label=lambda toolkit: toolkit.title(),
         get_toolkit_metadata=lambda toolkit: {"label": toolkit.title(), "slug": toolkit.lower(), "auth_mode": "oauth2"},
@@ -27,15 +30,18 @@ def load_connector_service_module():
         list_ui_toolkits=lambda: [],
         normalize_toolkit_key=lambda toolkit: str(toolkit or "").upper(),
     )
-    stubs["utils.time_utils"] = make_module(
+    stubs["tools.tool_registry"] = tool_registry
+    time_utils = make_module(
         "utils.time_utils",
         utc_now=lambda: __import__("datetime").datetime(2026, 1, 1, tzinfo=__import__("datetime").timezone.utc),
     )
-    stubs["utils.logging_utils"] = make_module(
+    stubs["utils.time_utils"] = time_utils
+    logging_utils = make_module(
         "utils.logging_utils",
         log_event=lambda *args, **kwargs: None,
         log_exception=lambda *args, **kwargs: None,
     )
+    stubs["utils.logging_utils"] = logging_utils
     return import_fresh("tools.connector_service", stubs)
 
 
