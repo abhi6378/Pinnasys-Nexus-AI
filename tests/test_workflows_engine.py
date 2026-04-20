@@ -70,9 +70,15 @@ class WorkflowEngineTests(unittest.TestCase):
         step_connectors = []
 
         def fake_run_agent(agent_key, user_input, brain_context="", **kwargs):
+            current_step = kwargs.get("workflow_state", {}).get("current_step", "")
+            tool_used = ""
+            if current_step == "Log to HubSpot":
+                tool_used = "HUBSPOT_CREATE_CONTACT"
+            if current_step == "Log to Sheets":
+                tool_used = "GOOGLESHEETS_CREATE_SPREADSHEET_ROW"
             step_connectors.append(
                 (
-                    kwargs.get("workflow_state", {}).get("current_step"),
+                    current_step,
                     kwargs.get("connector_context", {}),
                 )
             )
@@ -80,6 +86,7 @@ class WorkflowEngineTests(unittest.TestCase):
                 "name": agent_key.title(),
                 "output": "done",
                 "success": True,
+                "tool_used": tool_used,
             }
 
         with patch_attr(engine, "run_agent", Spy(side_effect=fake_run_agent)):
@@ -94,3 +101,19 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertEqual(step_map["Log to HubSpot"]["selected_toolkit"], "HUBSPOT")
         self.assertEqual(step_map["Log to HubSpot"]["selected_account_id"], "")
         self.assertEqual(step_map["Log to Sheets"]["selected_toolkit"], "GOOGLE_SHEETS")
+
+    def test_required_live_workflow_step_cannot_complete_without_tool_result(self):
+        def fake_run_agent(agent_key, user_input, brain_context="", **kwargs):
+            return {
+                "name": agent_key.title(),
+                "output": "text-only answer",
+                "success": True,
+            }
+
+        with patch_attr(engine, "run_agent", Spy(side_effect=fake_run_agent)):
+            result = engine.email_triage_workflow("check inbox", "ctx")
+
+        self.assertTrue(result["error"])
+        self.assertEqual(result["mode"], "validation_error")
+        self.assertEqual(result["step_label"], "Read Emails")
+        self.assertIn("requires a verified live tool execution", result["final_output"])

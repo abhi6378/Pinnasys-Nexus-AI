@@ -1,7 +1,7 @@
 """
 models/tool_call_logs.py  —  Audit log for every tool execution attempt.
 """
-from sqlalchemy import Boolean, CheckConstraint, Column, Float, Index, String, Text
+from sqlalchemy import Boolean, CheckConstraint, Column, Float, ForeignKey, Index, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 
 from storage.db import Base, TZDateTime, new_id
@@ -12,7 +12,7 @@ class ToolCallLogModel(Base):
     __tablename__ = "tool_call_logs"
 
     id = Column(String, primary_key=True, default=new_id)
-    workspace_id = Column(String, nullable=False, index=True)
+    workspace_id = Column(String, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
     agent_key = Column(String, default="")
     tool_name = Column(String, nullable=False)
     toolkit = Column(String, default="")

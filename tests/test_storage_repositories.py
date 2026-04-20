@@ -47,7 +47,7 @@ def load_repositories_module():
     )
     WorkspaceConnectorPreferenceModel = make_model_class(
         "WorkspaceConnectorPreferenceModel",
-        ["workspace_id", "updated_at"],
+        ["workspace_id", "updated_at", "scope_type", "user_id", "membership_id", "selected_by_user_id"],
     )
     PendingToolRequestModel = make_model_class(
         "PendingToolRequestModel",
@@ -75,6 +75,7 @@ def load_repositories_module():
         "ToolConnectionModel",
         [
             "workspace_id",
+            "user_id",
             "toolkit",
             "status",
             "connected_account_id",

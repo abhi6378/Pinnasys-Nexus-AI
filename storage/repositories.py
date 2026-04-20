@@ -188,7 +188,7 @@ def _tool_connection_from_mapping(values: dict[str, Any]):
         _get_tool_connection_model_cls(),
         id=values.get("id", ""),
         workspace_id=values.get("workspace_id", ""),
-        user_id=values.get("user_id", "") or values.get("workspace_id", ""),
+        user_id=values.get("user_id", "") or None,
         tool_name=values.get("tool_name", "*") or "*",
         toolkit=values.get("toolkit", "") or "",
         status=values.get("status", "pending") or "pending",
@@ -202,6 +202,24 @@ def _tool_connection_from_mapping(values: dict[str, Any]):
         revoked_at=values.get("revoked_at"),
         status_reason=values.get("status_reason", "") or "",
         status_updated_at=values.get("status_updated_at") or values.get("updated_at"),
+        created_at=values.get("created_at"),
+        updated_at=values.get("updated_at"),
+    )
+
+
+def _connector_preference_from_mapping(values: dict[str, Any]):
+    return _model_instance(
+        WorkspaceConnectorPreferenceModel,
+        workspace_id=values.get("workspace_id", ""),
+        scope_type=values.get("scope_type", "workspace") or "workspace",
+        user_id=values.get("user_id"),
+        membership_id=values.get("membership_id"),
+        selected_by_user_id=values.get("selected_by_user_id"),
+        mode=values.get("mode", "auto") or "auto",
+        selected_toolkit=values.get("selected_toolkit", "") or "",
+        selected_account_id=values.get("selected_account_id", "") or "",
+        selected_account_alias=values.get("selected_account_alias", "") or "",
+        source=values.get("source", "persisted_default") or "persisted_default",
         created_at=values.get("created_at"),
         updated_at=values.get("updated_at"),
     )
@@ -1321,7 +1339,7 @@ def upsert_tool_connection(
             row = ToolConnectionModel(
                 id=_id(),
                 workspace_id=workspace_id,
-                user_id=workspace_id,
+                user_id=None,
                 tool_name=tool_name or "*",
                 toolkit=normalized_toolkit,
                 status=status,
@@ -1400,7 +1418,7 @@ def upsert_tool_connection(
                 merged_metadata["last_seen_remote_at"] = str(last_seen_remote_at)
             values = {
                 "workspace_id": workspace_id,
-                "user_id": workspace_id,
+                "user_id": "",
                 "tool_name": tool_name or "*",
                 "toolkit": normalized_toolkit,
                 "status": status,
@@ -1600,9 +1618,25 @@ def get_workspace_connector_preference(
     db: Session,
     workspace_id: str,
 ) -> Optional[WorkspaceConnectorPreferenceModel]:
-    return db.query(WorkspaceConnectorPreferenceModel).filter(
-        WorkspaceConnectorPreferenceModel.workspace_id == workspace_id
-    ).first()
+    try:
+        return db.query(WorkspaceConnectorPreferenceModel).filter(
+            WorkspaceConnectorPreferenceModel.workspace_id == workspace_id
+        ).first()
+    except Exception as exc:
+        if not _is_missing_column_error(exc):
+            raise
+        _safe_rollback(db)
+        table = _get_reflected_table(db, "workspace_connector_preferences")
+        if table is None:
+            raise
+        row = (
+            db.execute(
+                table.select().where(table.c.workspace_id == workspace_id)
+            )
+            .mappings()
+            .first()
+        )
+        return _connector_preference_from_mapping(dict(row)) if row else None
 
 
 def upsert_workspace_connector_preference(
@@ -1614,12 +1648,15 @@ def upsert_workspace_connector_preference(
     selected_account_id: str = "",
     selected_account_alias: str = "",
     source: str = "persisted_default",
+    selected_by_user_id: str | None = None,
 ) -> WorkspaceConnectorPreferenceModel:
     try:
         row = get_workspace_connector_preference(db, workspace_id)
         if not row:
             row = WorkspaceConnectorPreferenceModel(
                 workspace_id=workspace_id,
+                scope_type="workspace",
+                selected_by_user_id=selected_by_user_id,
                 mode=mode,
                 selected_toolkit=selected_toolkit,
                 selected_account_id=selected_account_id,
@@ -1635,11 +1672,54 @@ def upsert_workspace_connector_preference(
             row.selected_account_id = selected_account_id
             row.selected_account_alias = selected_account_alias
             row.source = source or row.source
+            if selected_by_user_id is not None:
+                row.selected_by_user_id = selected_by_user_id
             row.updated_at = utc_now()
         db.commit()
         db.refresh(row)
         return row
     except Exception as exc:
+        if _is_missing_column_error(exc):
+            _safe_rollback(db)
+            table = _get_reflected_table(db, "workspace_connector_preferences")
+            if table is None:
+                raise
+            now = utc_now()
+            existing = db.execute(
+                table.select().where(table.c.workspace_id == workspace_id)
+            ).mappings().first()
+            values = {
+                "workspace_id": workspace_id,
+                "mode": mode,
+                "selected_toolkit": selected_toolkit,
+                "selected_account_id": selected_account_id,
+                "selected_account_alias": selected_account_alias,
+                "source": source or "persisted_default",
+                "updated_at": now,
+            }
+            if "scope_type" in table.c:
+                values["scope_type"] = "workspace"
+            if "selected_by_user_id" in table.c:
+                values["selected_by_user_id"] = selected_by_user_id
+            if "created_at" in table.c and not existing:
+                values["created_at"] = now
+            if existing:
+                db.execute(
+                    table.update()
+                    .where(table.c.workspace_id == workspace_id)
+                    .values(**{key: value for key, value in values.items() if key in table.c})
+                )
+            else:
+                db.execute(
+                    table.insert().values(
+                        **{key: value for key, value in values.items() if key in table.c}
+                    )
+                )
+            db.commit()
+            refreshed = db.execute(
+                table.select().where(table.c.workspace_id == workspace_id)
+            ).mappings().first()
+            return _connector_preference_from_mapping(dict(refreshed)) if refreshed else None
         log_exception(
             logger,
             "storage.connector_preference_upsert_failed",

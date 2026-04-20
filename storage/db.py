@@ -52,6 +52,7 @@ WORKFLOW_RUN_STATUSES = ("pending", "running", "paused", "completed", "failed", 
 WORKSPACE_MEMBERSHIP_ROLES = ("owner", "admin", "member", "viewer")
 WORKSPACE_MEMBERSHIP_STATUSES = ("active", "invited", "suspended", "removed")
 CONNECTOR_PREFERENCE_MODES = ("auto", "manual")
+CONNECTOR_PREFERENCE_SCOPES = ("workspace", "user", "membership")
 
 
 def new_id():
@@ -127,7 +128,7 @@ class WorkspaceMembershipModel(Base):
 class BrainProfileModel(Base):
     __tablename__ = "brain_profiles"
 
-    workspace_id = Column(String, primary_key=True)
+    workspace_id = Column(String, ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True)
     company_name = Column(String, default="")
     brand_context = Column(Text, default="")
     tone = Column(String, default="")
@@ -144,7 +145,7 @@ class KnowledgeItemModel(Base):
     __tablename__ = "knowledge_items"
 
     id = Column(String, primary_key=True, default=new_id)
-    workspace_id = Column(String, nullable=False)
+    workspace_id = Column(String, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
     type = Column(String, default="text")
     title = Column(String, default="")
     content = Column(Text, nullable=False)
@@ -156,7 +157,7 @@ class QuizAnswerModel(Base):
     __tablename__ = "quiz_answers"
 
     id = Column(String, primary_key=True, default=new_id)
-    workspace_id = Column(String, nullable=False)
+    workspace_id = Column(String, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
     question = Column(Text, nullable=False)
     answer = Column(Text, nullable=False)
     category = Column(String, default="general")
@@ -167,7 +168,7 @@ class ConversationModel(Base):
     __tablename__ = "conversations"
 
     id = Column(String, primary_key=True, default=new_id)
-    workspace_id = Column(String, nullable=False, index=True)
+    workspace_id = Column(String, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
     helper = Column(String, nullable=False)
     input = Column(Text, nullable=False)
     output = Column(Text, nullable=False)
@@ -184,7 +185,7 @@ class WorkflowRunModel(Base):
     __tablename__ = "workflow_runs"
 
     id = Column(String, primary_key=True, default=new_id)
-    workspace_id = Column(String, nullable=False, index=True)
+    workspace_id = Column(String, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
     workflow_name = Column(String, nullable=False)
     steps = Column(JSON, default=list)
     final_output = Column(Text, default="")
@@ -205,7 +206,7 @@ class IdeaModel(Base):
     __tablename__ = "ideas"
 
     id = Column(String, primary_key=True, default=new_id)
-    workspace_id = Column(String, nullable=False)
+    workspace_id = Column(String, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
     title = Column(String, nullable=False)
     description = Column(Text, default="")
     source_agent = Column(String, default="system")
@@ -222,7 +223,7 @@ class MemoryRecordModel(Base):
     __tablename__ = "memory_records"
 
     id = Column(String, primary_key=True, default=new_id)
-    workspace_id = Column(String, nullable=False)
+    workspace_id = Column(String, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
     memory_type = Column(String, nullable=False, default="semantic_fact")
     title = Column(String, default="")
     content = Column(Text, default="")
@@ -258,7 +259,7 @@ class MemoryRecordModel(Base):
 class WorkingMemoryStateModel(Base):
     __tablename__ = "working_memory_states"
 
-    workspace_id = Column(String, primary_key=True)
+    workspace_id = Column(String, ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True)
     current_goal = Column(Text, default="")
     active_tasks = Column(JSON, default=list)
     open_questions = Column(JSON, default=list)
@@ -274,7 +275,7 @@ class MemoryEmbeddingModel(Base):
     __tablename__ = "memory_embeddings"
 
     id = Column(String, primary_key=True, default=new_id)
-    workspace_id = Column(String, nullable=False)
+    workspace_id = Column(String, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
     memory_record_id = Column(String, ForeignKey("memory_records.id", ondelete="CASCADE"), nullable=False, index=True)
     model_name = Column(String, default="")
     content_hash = Column(String, default="")
@@ -292,7 +293,11 @@ class MemoryEmbeddingModel(Base):
 class WorkspaceConnectorPreferenceModel(Base):
     __tablename__ = "workspace_connector_preferences"
 
-    workspace_id = Column(String, primary_key=True)
+    workspace_id = Column(String, ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True)
+    scope_type = Column(String, nullable=False, default="workspace")
+    user_id = Column(String, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    membership_id = Column(String, ForeignKey("workspace_memberships.id", ondelete="SET NULL"), nullable=True, index=True)
+    selected_by_user_id = Column(String, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     mode = Column(String, default="auto")
     selected_toolkit = Column(String, default="")
     selected_account_id = Column(String, default="")
@@ -303,6 +308,7 @@ class WorkspaceConnectorPreferenceModel(Base):
 
     __table_args__ = (
         _status_check("mode", CONNECTOR_PREFERENCE_MODES, "ck_workspace_connector_preferences_mode"),
+        _status_check("scope_type", CONNECTOR_PREFERENCE_SCOPES, "ck_workspace_connector_preferences_scope_type"),
     )
 
 

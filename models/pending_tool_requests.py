@@ -1,7 +1,7 @@
 """
 models/pending_tool_requests.py  —  Durable pending auth/approval requests.
 """
-from sqlalchemy import Boolean, CheckConstraint, Column, Index, String, Text
+from sqlalchemy import Boolean, CheckConstraint, Column, ForeignKey, Index, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 
 from storage.db import Base, TZDateTime, new_id
@@ -12,7 +12,7 @@ class PendingToolRequestModel(Base):
     __tablename__ = "pending_tool_requests"
 
     id = Column(String, primary_key=True, default=new_id)
-    workspace_id = Column(String, nullable=False, index=True)
+    workspace_id = Column(String, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
     conversation_id = Column(String, default="")
     agent_key = Column(String, default="")
     original_input = Column(Text, nullable=False)

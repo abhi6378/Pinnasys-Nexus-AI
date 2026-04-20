@@ -672,7 +672,7 @@ def _save_local_connection(
             row = ToolConnectionModel(
                 id=str(uuid.uuid4()),
                 workspace_id=workspace_id,
-                user_id=workspace_id,
+                user_id=None,
                 tool_name="*",
                 toolkit=toolkit.upper(),
                 status=status,

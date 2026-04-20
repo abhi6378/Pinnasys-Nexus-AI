@@ -271,6 +271,8 @@ class WorkflowStepSpec:
     agent_key: str
     prompt_builder: Callable[[str, list[dict[str, Any]], dict[str, Any]], str]
     capability_hint: CapabilityRequest | None = None
+    requires_live_tool: bool = False
+    allow_text_fallback: bool = True
 
 
 @dataclass

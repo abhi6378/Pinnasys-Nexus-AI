@@ -650,6 +650,22 @@ def _run_with_tools(
             # We trust the LLM's intelligence here. If it doesn't emit a tool call,
             # it is either responding conversationally or politely explaining
             # that it lacks the required tools/permissions to fulfill the request.
+            if execution_context.get("requires_live_tool") and not tool_used:
+                return {
+                    "agent": agent_key,
+                    "name": agent_name,
+                    "output": _format_validation_error_message(
+                        str(execution_context.get("current_step") or "live workflow step"),
+                        (
+                            "This workflow step requires a verified live tool execution. "
+                            "The response did not include a confirmed tool result, so the workflow was stopped."
+                        ),
+                        agent_name,
+                    ),
+                    "success": False,
+                    "mode": "validation_error",
+                    "tool_used": tool_used,
+                }
             if _looks_like_unverified_action_claim(
                 str(raw_output),
                 route_context=route_context,

@@ -153,6 +153,8 @@ def _step(
     current_workflow_key: str = "",
     capability_hint: CapabilityRequest | None = None,
     connector_context: dict | None = None,
+    requires_live_tool: bool = False,
+    allow_text_fallback: bool = True,
 ) -> dict:
     """
     Executes a step, skipping if it was already completed in resume_state.
@@ -171,6 +173,8 @@ def _step(
         "completed_steps": completed_steps,
         "current_step": label,
         "is_retry": bool(resume_state),
+        "requires_live_tool": bool(requires_live_tool),
+        "allow_text_fallback": bool(allow_text_fallback),
     }
     if capability_hint:
         workflow_state["capability_hint"] = capability_hint.to_dict()
@@ -204,6 +208,16 @@ def _step(
             agent_key,
             result.get("output", "Unknown error"),
             result=result,
+        )
+    if requires_live_tool and not result.get("tool_used"):
+        raise WorkflowStepError(
+            label,
+            agent_key,
+            (
+                "This workflow step requires a verified live tool execution, "
+                "but no tool result was confirmed."
+            ),
+            result={"mode": "validation_error"},
         )
 
     return WorkflowStepResult(
@@ -246,6 +260,10 @@ def _run_workflow_definition(
                 definition.key,
                 capability_hint=spec.capability_hint,
                 connector_context=connector_context,
+                requires_live_tool=spec.requires_live_tool or bool(
+                    spec.capability_hint and spec.capability_hint.requires_live_data
+                ),
+                allow_text_fallback=spec.allow_text_fallback,
             )
             _append_step_once(steps, step_result)
 

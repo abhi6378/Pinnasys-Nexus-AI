@@ -12,7 +12,7 @@ class ToolIdempotencyRecordModel(Base):
     __tablename__ = "tool_idempotency_records"
 
     id = Column(String, primary_key=True, default=new_id)
-    workspace_id = Column(String, nullable=False, index=True)
+    workspace_id = Column(String, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
     tool_name = Column(String, nullable=False, index=True)
     idempotency_key = Column(String, nullable=False, index=True)
     input_hash = Column(String, default="")

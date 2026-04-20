@@ -17,6 +17,10 @@ should no longer rely on startup-time schema drift fixes.
 
 ## Key Guarantees
 
+- Workspace-owned control-plane tables now declare database ownership through
+  `workspace_id -> workspaces.id` foreign keys. The 20260417_03 migration adds
+  those constraints as PostgreSQL `NOT VALID` constraints so rollout does not
+  block on existing legacy rows, while new writes are protected immediately.
 - Idempotency is DB-enforced with a unique key on
   `(workspace_id, tool_name, idempotency_key)`.
 - Connector rows are unique per effective runtime identity:
@@ -44,7 +48,19 @@ The schema now adds indexes for the query patterns used in runtime code:
 - `tool_connections` stores only safe runtime metadata: toolkit, account id, labels,
   freshness timestamps, status, and revocation state.
 - Secrets, OAuth payloads, tokens, and raw auth config material must not be stored here.
-- `workspace_connector_preferences` remains workspace-scoped and backward-compatible.
+- `tool_connections.user_id` is nullable and should only contain a real future
+  user id. Runtime code must not populate it with `workspace_id` as a pseudo-user.
+- `workspace_connector_preferences` remains workspace-default based and
+  backward-compatible. It now carries nullable scope fields (`scope_type`,
+  `user_id`, `membership_id`, `selected_by_user_id`) so a future auth pass can add
+  user or membership overrides without replacing the table.
+
+## Workflow Live-Step Determinism
+
+Workflow steps may declare `requires_live_tool=True`, and steps with
+`CapabilityRequest.requires_live_data=True` are treated as requiring a verified
+tool result. Those steps cannot be marked successful from free-form text alone.
+Text-only workflow steps remain unchanged.
 
 ## Auth Readiness
 
@@ -57,6 +73,9 @@ This pass adds forward-looking identity tables without changing current workspac
 
 These tables are scaffolding for future Google sign-in and real user identity. They are
 not required by the current request path, connector flow, or workflow runtime yet.
+Future Google auth should be server-verified and should map provider identities
+through `external_identities` into `users`, then authorize access through
+`workspace_memberships`.
 
 ## Deferred Work
 
