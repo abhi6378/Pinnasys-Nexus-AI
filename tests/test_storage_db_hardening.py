@@ -14,6 +14,9 @@ class StorageDbHardeningTests(unittest.TestCase):
         cls.ownership_migration_source = (
             cls.root / "alembic" / "versions" / "20260417_03_ownership_scope_hardening.py"
         ).read_text(encoding="utf-8")
+        cls.auth_migration_source = (
+            cls.root / "alembic" / "versions" / "20260417_04_google_auth_runtime.py"
+        ).read_text(encoding="utf-8")
 
     def test_alembic_files_exist(self):
         self.assertTrue((self.root / "alembic.ini").exists())
@@ -21,6 +24,7 @@ class StorageDbHardeningTests(unittest.TestCase):
         self.assertTrue((self.root / "alembic" / "versions" / "20260417_01_baseline.py").exists())
         self.assertTrue((self.root / "alembic" / "versions" / "20260417_02_db_hardening.py").exists())
         self.assertTrue((self.root / "alembic" / "versions" / "20260417_03_ownership_scope_hardening.py").exists())
+        self.assertTrue((self.root / "alembic" / "versions" / "20260417_04_google_auth_runtime.py").exists())
 
     def test_storage_db_uses_timezone_aware_columns_and_migration_head_check(self):
         self.assertIn("TZDateTime = DateTime(timezone=True)", self.storage_db_source)
@@ -38,6 +42,7 @@ class StorageDbHardeningTests(unittest.TestCase):
         self.assertIn("class UserModel(Base):", self.storage_db_source)
         self.assertIn("class ExternalIdentityModel(Base):", self.storage_db_source)
         self.assertIn("class WorkspaceMembershipModel(Base):", self.storage_db_source)
+        self.assertIn("class AuthSessionModel(Base):", self.storage_db_source)
         self.assertIn('owner_user_id = Column(String, ForeignKey("users.id")', self.storage_db_source)
 
     def test_workspace_owned_models_declare_foreign_keys(self):
@@ -60,6 +65,13 @@ class StorageDbHardeningTests(unittest.TestCase):
         self.assertIn("DROP NOT NULL", self.ownership_migration_source)
         self.assertIn("NOT VALID", self.ownership_migration_source)
         self.assertIn("fk_tool_connections_user", self.ownership_migration_source)
+
+    def test_google_auth_migration_adds_sessions_and_actor_columns(self):
+        self.assertIn('revision = "20260417_04"', self.auth_migration_source)
+        self.assertIn("CREATE TABLE IF NOT EXISTS auth_sessions", self.auth_migration_source)
+        self.assertIn("actor_user_id", self.auth_migration_source)
+        self.assertIn("workspace_connector_preferences ADD COLUMN IF NOT EXISTS id", self.auth_migration_source)
+        self.assertIn("uq_workspace_connector_preferences_user_scope", self.auth_migration_source)
 
     def test_tool_connection_model_declares_uniqueness_and_status_checks(self):
         self.assertIn("uq_tool_connections_workspace_toolkit_account", self.tool_connections_source)

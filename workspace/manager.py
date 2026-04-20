@@ -17,8 +17,8 @@ class WorkspaceContext:
     idea_count: int = 0
 
 
-def create_workspace(name: str, db: Session) -> WorkspaceModel:
-    return repo.create_workspace(db, name)
+def create_workspace(name: str, db: Session, *, owner_user_id: str | None = None) -> WorkspaceModel:
+    return repo.create_workspace(db, name, owner_user_id=owner_user_id)
 
 
 def get_workspace_context(workspace_id: str, db: Session) -> WorkspaceContext | None:

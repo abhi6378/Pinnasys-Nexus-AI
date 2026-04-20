@@ -13,6 +13,7 @@ class PendingToolRequestModel(Base):
 
     id = Column(String, primary_key=True, default=new_id)
     workspace_id = Column(String, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    actor_user_id = Column(String, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     conversation_id = Column(String, default="")
     agent_key = Column(String, default="")
     original_input = Column(Text, nullable=False)

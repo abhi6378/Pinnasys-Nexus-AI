@@ -20,6 +20,7 @@ from tools.connector_service import (
     persist_connector_context,
     refresh_connector_status,
 )
+from ui.auth_state import get_state_membership_id, get_state_user_id
 from ui.connector_state import build_connector_context, ensure_connector_state, set_connector_selection
 
 
@@ -274,6 +275,30 @@ def _render_workflow_state(msg: dict):
         st.success("Workflow resumed from the last completed step.")
 
 
+def _connector_scope_kwargs(workspace_id: str, db) -> dict:
+    user_id = get_state_user_id(st.session_state)
+    membership_id = get_state_membership_id(db, st.session_state, workspace_id) if user_id else None
+    if membership_id:
+        return {
+            "scope_type": "membership",
+            "user_id": user_id,
+            "membership_id": membership_id,
+            "selected_by_user_id": user_id,
+        }
+    if user_id:
+        return {"scope_type": "user", "user_id": user_id, "selected_by_user_id": user_id}
+    return {}
+
+
+def _persist_chat_connector_context(workspace_id: str, db) -> None:
+    persist_connector_context(
+        workspace_id,
+        st.session_state.connector_context,
+        db,
+        **_connector_scope_kwargs(workspace_id, db),
+    )
+
+
 def _render_connector_controls(workspace_id: str, db) -> dict:
     """Render the chat-scoped connector selector and return the active context."""
     ensure_connector_state(st.session_state)
@@ -306,7 +331,7 @@ def _render_connector_controls(workspace_id: str, db) -> dict:
     if selected_connector == "AUTO":
         if current_toolkit:
             set_connector_selection(st.session_state, mode="auto", source="chat_input")
-            persist_connector_context(workspace_id, st.session_state.connector_context, db)
+            _persist_chat_connector_context(workspace_id, db)
             st.rerun()
         st.caption("Auto keeps the existing capability-first routing behavior.")
         return build_connector_context(st.session_state)
@@ -323,7 +348,7 @@ def _render_connector_controls(workspace_id: str, db) -> dict:
             selected_account_alias=str(default_account.get("account_alias", "") or ""),
             source="chat_input",
         )
-        persist_connector_context(workspace_id, st.session_state.connector_context, db)
+        _persist_chat_connector_context(workspace_id, db)
         st.rerun()
 
     state_col, account_col = st.columns([1, 1.2])
@@ -357,7 +382,7 @@ def _render_connector_controls(workspace_id: str, db) -> dict:
                 selected_account_alias=effective_account_alias,
                 source="chat_input",
             )
-            persist_connector_context(workspace_id, st.session_state.connector_context, db)
+            _persist_chat_connector_context(workspace_id, db)
             st.rerun()
 
     with account_col:
@@ -373,7 +398,7 @@ def _render_connector_controls(workspace_id: str, db) -> dict:
                     selected_account_alias=str(only_account.get("account_alias", "") or ""),
                     source="chat_input",
                 )
-                persist_connector_context(workspace_id, st.session_state.connector_context, db)
+                _persist_chat_connector_context(workspace_id, db)
                 st.rerun()
             selected_account = st.selectbox(
                 f"{selected_row['label']} account",
@@ -406,7 +431,7 @@ def _render_connector_controls(workspace_id: str, db) -> dict:
                     selected_account_alias=str(selected_account_row.get("account_alias", "") or ""),
                     source="chat_input",
                 )
-                persist_connector_context(workspace_id, st.session_state.connector_context, db)
+                _persist_chat_connector_context(workspace_id, db)
                 st.rerun()
         else:
             st.caption("No connected accounts available yet.")
@@ -421,8 +446,9 @@ def _render_connector_controls(workspace_id: str, db) -> dict:
 
 # ── Main page render ──────────────────────────────────────────────────────────
 
-def render_chat():
+def render_chat(auth_user=None):
     ws_id = st.session_state.workspace_id
+    actor_user_id = getattr(auth_user, "id", None) if auth_user else None
     ensure_connector_state(st.session_state)
     st.session_state.setdefault("pending_tool_approval", None)
 
@@ -624,6 +650,7 @@ def render_chat():
                             force_workflow=workflow_key,
                             resume_state=context,
                             connector_context=retry_connector_context,
+                            actor_user_id=actor_user_id,
                         )
                     if result.get("mode") not in {
                         "connect_required", "auth_unavailable", "invalid_tool",
@@ -677,6 +704,7 @@ def render_chat():
                             force_workflow=workflow_key,
                             resume_state=context,
                             connector_context=retry_connector_context,
+                            actor_user_id=actor_user_id,
                         )
                         if result.get("mode") not in {
                             "connect_required", "auth_unavailable", "invalid_tool",
@@ -690,6 +718,7 @@ def render_chat():
                             db,
                             force_agent=st.session_state.selected_agent,
                             connector_context=build_connector_context(st.session_state),
+                            actor_user_id=actor_user_id,
                         )
                 else:
                     result = handle_request(
@@ -698,6 +727,7 @@ def render_chat():
                         db,
                         force_agent=st.session_state.selected_agent,
                         connector_context=build_connector_context(st.session_state),
+                        actor_user_id=actor_user_id,
                     )
 
             if result.get("connector_context"):
@@ -734,6 +764,7 @@ def render_chat():
                     db,
                     force_agent=selected,
                     connector_context=connector_context,
+                    actor_user_id=actor_user_id,
                 )
 
             if result.get("connector_context"):

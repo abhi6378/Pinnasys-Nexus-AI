@@ -53,6 +53,7 @@ WORKSPACE_MEMBERSHIP_ROLES = ("owner", "admin", "member", "viewer")
 WORKSPACE_MEMBERSHIP_STATUSES = ("active", "invited", "suspended", "removed")
 CONNECTOR_PREFERENCE_MODES = ("auto", "manual")
 CONNECTOR_PREFERENCE_SCOPES = ("workspace", "user", "membership")
+AUTH_SESSION_STATUSES = ("active", "revoked", "expired")
 
 
 def new_id():
@@ -87,6 +88,12 @@ class UserModel(Base):
 
     __table_args__ = (
         _status_check("status", ("active", "invited", "disabled"), "ck_users_status"),
+        Index(
+            "uq_users_email_nonempty",
+            "email",
+            unique=True,
+            postgresql_where=text("email IS NOT NULL AND email <> ''"),
+        ),
     )
 
 
@@ -122,6 +129,26 @@ class WorkspaceMembershipModel(Base):
         Index("uq_workspace_memberships_workspace_user", "workspace_id", "user_id", unique=True),
         _status_check("role", WORKSPACE_MEMBERSHIP_ROLES, "ck_workspace_memberships_role"),
         _status_check("status", WORKSPACE_MEMBERSHIP_STATUSES, "ck_workspace_memberships_status"),
+    )
+
+
+class AuthSessionModel(Base):
+    __tablename__ = "auth_sessions"
+
+    id = Column(String, primary_key=True, default=new_id)
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    session_hash = Column(String, nullable=False, index=True)
+    status = Column(String, nullable=False, default="active")
+    metadata_json = Column(JSON, default=dict)
+    expires_at = Column(TZDateTime, nullable=False, index=True)
+    created_at = Column(TZDateTime, default=utc_now)
+    last_seen_at = Column(TZDateTime, default=utc_now)
+    revoked_at = Column(TZDateTime, nullable=True)
+
+    __table_args__ = (
+        Index("uq_auth_sessions_session_hash", "session_hash", unique=True),
+        Index("ix_auth_sessions_user_status_expires", "user_id", "status", "expires_at"),
+        _status_check("status", AUTH_SESSION_STATUSES, "ck_auth_sessions_status"),
     )
 
 
@@ -173,6 +200,7 @@ class ConversationModel(Base):
     input = Column(Text, nullable=False)
     output = Column(Text, nullable=False)
     request_id = Column(String, default="", index=True)
+    actor_user_id = Column(String, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     metadata_json = Column(JSON, default=dict)
     created_at = Column(TZDateTime, default=utc_now)
 
@@ -191,6 +219,7 @@ class WorkflowRunModel(Base):
     final_output = Column(Text, default="")
     status = Column(String, nullable=False, default="completed")
     request_id = Column(String, default="", index=True)
+    actor_user_id = Column(String, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     metadata_json = Column(JSON, default=dict)
     created_at = Column(TZDateTime, default=utc_now)
     updated_at = Column(TZDateTime, default=utc_now, onupdate=utc_now)
@@ -293,7 +322,8 @@ class MemoryEmbeddingModel(Base):
 class WorkspaceConnectorPreferenceModel(Base):
     __tablename__ = "workspace_connector_preferences"
 
-    workspace_id = Column(String, ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True)
+    id = Column(String, primary_key=True, default=new_id)
+    workspace_id = Column(String, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
     scope_type = Column(String, nullable=False, default="workspace")
     user_id = Column(String, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     membership_id = Column(String, ForeignKey("workspace_memberships.id", ondelete="SET NULL"), nullable=True, index=True)
@@ -307,6 +337,26 @@ class WorkspaceConnectorPreferenceModel(Base):
     updated_at = Column(TZDateTime, default=utc_now, onupdate=utc_now)
 
     __table_args__ = (
+        Index(
+            "uq_workspace_connector_preferences_workspace_default",
+            "workspace_id",
+            unique=True,
+            postgresql_where=text("scope_type = 'workspace'"),
+        ),
+        Index(
+            "uq_workspace_connector_preferences_user_scope",
+            "workspace_id",
+            "user_id",
+            unique=True,
+            postgresql_where=text("scope_type = 'user' AND user_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_workspace_connector_preferences_membership_scope",
+            "workspace_id",
+            "membership_id",
+            unique=True,
+            postgresql_where=text("scope_type = 'membership' AND membership_id IS NOT NULL"),
+        ),
         _status_check("mode", CONNECTOR_PREFERENCE_MODES, "ck_workspace_connector_preferences_mode"),
         _status_check("scope_type", CONNECTOR_PREFERENCE_SCOPES, "ck_workspace_connector_preferences_scope_type"),
     )

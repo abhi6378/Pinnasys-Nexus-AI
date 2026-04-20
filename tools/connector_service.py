@@ -95,9 +95,23 @@ def build_connector_context(
     )
 
 
-def load_persisted_connector_context(workspace_id: str, db) -> ConnectorContext:
+def load_persisted_connector_context(
+    workspace_id: str,
+    db,
+    *,
+    user_id: str | None = None,
+    membership_id: str | None = None,
+) -> ConnectorContext:
     try:
-        row = repo.get_workspace_connector_preference(db, workspace_id)
+        try:
+            row = repo.get_workspace_connector_preference(
+                db,
+                workspace_id,
+                user_id=user_id,
+                membership_id=membership_id,
+            )
+        except TypeError:
+            row = repo.get_workspace_connector_preference(db, workspace_id)
     except Exception:
         row = None
     if not row:
@@ -114,7 +128,16 @@ def load_persisted_connector_context(workspace_id: str, db) -> ConnectorContext:
     )
 
 
-def persist_connector_context(workspace_id: str, connector_context: ConnectorContext | dict | None, db) -> ConnectorContext:
+def persist_connector_context(
+    workspace_id: str,
+    connector_context: ConnectorContext | dict | None,
+    db,
+    *,
+    scope_type: str = "workspace",
+    user_id: str | None = None,
+    membership_id: str | None = None,
+    selected_by_user_id: str | None = None,
+) -> ConnectorContext:
     connector = normalize_connector_context(connector_context)
     repo.upsert_workspace_connector_preference(
         db,
@@ -124,6 +147,10 @@ def persist_connector_context(workspace_id: str, connector_context: ConnectorCon
         selected_account_id=connector.selected_account_id,
         selected_account_alias=connector.selected_account_alias,
         source=connector.source or "persisted_default",
+        scope_type=scope_type,
+        user_id=user_id,
+        membership_id=membership_id,
+        selected_by_user_id=selected_by_user_id,
     )
     return connector
 

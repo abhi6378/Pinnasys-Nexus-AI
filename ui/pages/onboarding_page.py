@@ -3,10 +3,11 @@ ui/pages/onboarding_page.py  —  First-run workspace creation screen
 """
 import streamlit as st
 from storage.db import SessionLocal
+from ui.auth_state import is_auth_required
 from workspace.manager import create_workspace
 
 
-def render_onboarding():
+def render_onboarding(auth_user=None):
     st.markdown("# 🧠 Welcome to Sintra Clone")
     st.markdown("#### Your AI workforce platform — 12 agents, one workspace.")
     st.markdown("---")
@@ -20,9 +21,16 @@ def render_onboarding():
 
         if st.button("🚀 Create Workspace & Get Started", use_container_width=True, type="primary"):
             if ws_name.strip():
+                if is_auth_required() and not auth_user:
+                    st.warning("Sign in before creating your first workspace.")
+                    st.stop()
                 db = SessionLocal()
                 try:
-                    ws = create_workspace(ws_name.strip(), db)
+                    ws = create_workspace(
+                        ws_name.strip(),
+                        db,
+                        owner_user_id=getattr(auth_user, "id", None) if auth_user else None,
+                    )
                     st.session_state.workspace_id   = ws.id
                     st.session_state.workspace_name = ws.name
                     st.session_state.page           = "brain"

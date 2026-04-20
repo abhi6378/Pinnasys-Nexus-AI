@@ -14,7 +14,8 @@ from storage.db import (
     WorkspaceModel, BrainProfileModel, KnowledgeItemModel,
     QuizAnswerModel, ConversationModel, WorkflowRunModel, IdeaModel,
     MemoryRecordModel, WorkingMemoryStateModel, MemoryEmbeddingModel,
-    WorkspaceConnectorPreferenceModel,
+    WorkspaceConnectorPreferenceModel, UserModel, ExternalIdentityModel,
+    WorkspaceMembershipModel, AuthSessionModel,
 )
 from utils.logging_utils import log_event, log_exception
 from utils.time_utils import utc_now
@@ -150,6 +151,33 @@ def _workspace_from_mapping(values: dict[str, Any]):
     )
 
 
+def _user_from_mapping(values: dict[str, Any]):
+    return _model_instance(
+        UserModel,
+        id=values.get("id", ""),
+        email=values.get("email", "") or "",
+        display_name=values.get("display_name", "") or "",
+        avatar_url=values.get("avatar_url", "") or "",
+        status=values.get("status", "active") or "active",
+        metadata_json=dict(values.get("metadata_json", {}) or {}),
+        created_at=values.get("created_at"),
+        updated_at=values.get("updated_at"),
+    )
+
+
+def _workspace_membership_from_mapping(values: dict[str, Any]):
+    return _model_instance(
+        WorkspaceMembershipModel,
+        id=values.get("id", ""),
+        workspace_id=values.get("workspace_id", ""),
+        user_id=values.get("user_id", ""),
+        role=values.get("role", "member") or "member",
+        status=values.get("status", "active") or "active",
+        created_at=values.get("created_at"),
+        updated_at=values.get("updated_at"),
+    )
+
+
 def _conversation_from_mapping(values: dict[str, Any]):
     return _model_instance(
         ConversationModel,
@@ -159,6 +187,7 @@ def _conversation_from_mapping(values: dict[str, Any]):
         input=values.get("input", ""),
         output=values.get("output", ""),
         request_id=values.get("request_id", "") or "",
+        actor_user_id=values.get("actor_user_id"),
         metadata_json=dict(values.get("metadata_json", {}) or {}),
         created_at=values.get("created_at"),
     )
@@ -174,6 +203,7 @@ def _workflow_run_from_mapping(values: dict[str, Any]):
         final_output=values.get("final_output", "") or "",
         status=values.get("status", "completed") or "completed",
         request_id=values.get("request_id", "") or "",
+        actor_user_id=values.get("actor_user_id"),
         metadata_json=dict(values.get("metadata_json", {}) or {}),
         created_at=values.get("created_at"),
         updated_at=values.get("updated_at") or values.get("created_at"),
@@ -210,6 +240,7 @@ def _tool_connection_from_mapping(values: dict[str, Any]):
 def _connector_preference_from_mapping(values: dict[str, Any]):
     return _model_instance(
         WorkspaceConnectorPreferenceModel,
+        id=values.get("id", ""),
         workspace_id=values.get("workspace_id", ""),
         scope_type=values.get("scope_type", "workspace") or "workspace",
         user_id=values.get("user_id"),
@@ -231,6 +262,7 @@ def _pending_tool_request_from_mapping(values: dict[str, Any]):
         _get_pending_tool_request_model_cls(),
         id=values.get("id", ""),
         workspace_id=values.get("workspace_id", ""),
+        actor_user_id=values.get("actor_user_id"),
         conversation_id=values.get("conversation_id", "") or "",
         agent_key=values.get("agent_key", "") or "",
         original_input=values.get("original_input", "") or "",
@@ -276,18 +308,231 @@ def _get_tool_idempotency_model_cls():
     return ToolIdempotencyRecordModel
 
 
+# ── Users / Auth / Memberships ───────────────────────────────────────────────
+
+def get_user(db: Session, user_id: str) -> Optional[UserModel]:
+    if not user_id:
+        return None
+    return db.query(UserModel).filter(UserModel.id == user_id).first()
+
+
+def get_user_by_email(db: Session, email: str) -> Optional[UserModel]:
+    normalized = str(email or "").strip().lower()
+    if not normalized:
+        return None
+    return db.query(UserModel).filter(UserModel.email == normalized).first()
+
+
+def upsert_user(
+    db: Session,
+    *,
+    user_id: str = "",
+    email: str = "",
+    display_name: str = "",
+    avatar_url: str = "",
+    metadata_json: dict | None = None,
+) -> UserModel:
+    normalized_email = str(email or "").strip().lower()
+    row = get_user(db, user_id) if user_id else None
+    if not row and normalized_email:
+        row = get_user_by_email(db, normalized_email)
+    if not row:
+        row = UserModel(
+            id=user_id or _id(),
+            email=normalized_email,
+            display_name=display_name or "",
+            avatar_url=avatar_url or "",
+            status="active",
+            metadata_json=dict(metadata_json or {}),
+            created_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        db.add(row)
+    else:
+        if normalized_email:
+            row.email = normalized_email
+        if display_name:
+            row.display_name = display_name
+        if avatar_url:
+            row.avatar_url = avatar_url
+        merged_metadata = dict(getattr(row, "metadata_json", {}) or {})
+        merged_metadata.update(dict(metadata_json or {}))
+        row.metadata_json = merged_metadata
+        row.status = getattr(row, "status", "") or "active"
+        row.updated_at = utc_now()
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def get_external_identity(db: Session, provider: str, provider_subject: str) -> Optional[ExternalIdentityModel]:
+    return db.query(ExternalIdentityModel).filter(
+        ExternalIdentityModel.provider == provider,
+        ExternalIdentityModel.provider_subject == provider_subject,
+    ).first()
+
+
+def upsert_external_identity(
+    db: Session,
+    *,
+    user_id: str,
+    provider: str,
+    provider_subject: str,
+    email: str = "",
+    metadata_json: dict | None = None,
+) -> ExternalIdentityModel:
+    row = get_external_identity(db, provider, provider_subject)
+    if not row:
+        row = ExternalIdentityModel(
+            id=_id(),
+            user_id=user_id,
+            provider=provider,
+            provider_subject=provider_subject,
+            email=str(email or "").strip().lower(),
+            metadata_json=dict(metadata_json or {}),
+            created_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        db.add(row)
+    else:
+        row.user_id = user_id
+        if email:
+            row.email = str(email or "").strip().lower()
+        merged_metadata = dict(getattr(row, "metadata_json", {}) or {})
+        merged_metadata.update(dict(metadata_json or {}))
+        row.metadata_json = merged_metadata
+        row.updated_at = utc_now()
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def upsert_workspace_membership(
+    db: Session,
+    *,
+    workspace_id: str,
+    user_id: str,
+    role: str = "member",
+    status: str = "active",
+) -> WorkspaceMembershipModel:
+    row = db.query(WorkspaceMembershipModel).filter(
+        WorkspaceMembershipModel.workspace_id == workspace_id,
+        WorkspaceMembershipModel.user_id == user_id,
+    ).first()
+    if not row:
+        row = WorkspaceMembershipModel(
+            id=_id(),
+            workspace_id=workspace_id,
+            user_id=user_id,
+            role=role,
+            status=status,
+            created_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        db.add(row)
+    else:
+        row.role = role or row.role
+        row.status = status or row.status
+        row.updated_at = utc_now()
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def get_workspace_membership(db: Session, workspace_id: str, user_id: str):
+    if not workspace_id or not user_id:
+        return None
+    return db.query(WorkspaceMembershipModel).filter(
+        WorkspaceMembershipModel.workspace_id == workspace_id,
+        WorkspaceMembershipModel.user_id == user_id,
+        WorkspaceMembershipModel.status == "active",
+    ).first()
+
+
+def list_user_memberships(db: Session, user_id: str):
+    if not user_id:
+        return []
+    return db.query(WorkspaceMembershipModel).filter(
+        WorkspaceMembershipModel.user_id == user_id,
+        WorkspaceMembershipModel.status == "active",
+    ).order_by(WorkspaceMembershipModel.created_at.asc()).all()
+
+
+def create_auth_session(
+    db: Session,
+    *,
+    user_id: str,
+    session_hash: str,
+    expires_at,
+    metadata_json: dict | None = None,
+) -> AuthSessionModel:
+    row = AuthSessionModel(
+        id=_id(),
+        user_id=user_id,
+        session_hash=session_hash,
+        status="active",
+        metadata_json=dict(metadata_json or {}),
+        expires_at=expires_at,
+        created_at=utc_now(),
+        last_seen_at=utc_now(),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def get_active_auth_session_by_hash(db: Session, session_hash: str) -> Optional[AuthSessionModel]:
+    if not session_hash:
+        return None
+    row = db.query(AuthSessionModel).filter(
+        AuthSessionModel.session_hash == session_hash,
+        AuthSessionModel.status == "active",
+    ).first()
+    if not row:
+        return None
+    if getattr(row, "expires_at", None) and row.expires_at <= utc_now():
+        row.status = "expired"
+        row.last_seen_at = utc_now()
+        db.commit()
+        return None
+    row.last_seen_at = utc_now()
+    db.commit()
+    return row
+
+
+def revoke_auth_session(db: Session, session_hash: str) -> bool:
+    row = get_active_auth_session_by_hash(db, session_hash)
+    if not row:
+        return False
+    row.status = "revoked"
+    row.revoked_at = utc_now()
+    row.last_seen_at = utc_now()
+    db.commit()
+    return True
+
+
 # ── Workspace ─────────────────────────────────────────────────────────────────
 
-def create_workspace(db: Session, name: str) -> WorkspaceModel:
+def create_workspace(db: Session, name: str, *, owner_user_id: str | None = None) -> WorkspaceModel:
     ws_id = _id()
     created_at = utc_now()
     try:
-        ws = WorkspaceModel(id=ws_id, name=name, created_at=created_at)
+        ws = WorkspaceModel(id=ws_id, name=name, owner_user_id=owner_user_id, created_at=created_at)
         db.add(ws)
         # seed empty brain profile
         bp = BrainProfileModel(workspace_id=ws.id)
         db.add(bp)
         db.commit()
+        if owner_user_id:
+            upsert_workspace_membership(
+                db,
+                workspace_id=ws.id,
+                user_id=owner_user_id,
+                role="owner",
+                status="active",
+            )
+            db.refresh(ws)
         db.refresh(ws)
         return ws
     except Exception as exc:
@@ -364,6 +609,33 @@ def list_workspaces(db: Session):
             .all()
         )
         return [_workspace_from_mapping(dict(row)) for row in rows]
+
+
+def list_workspaces_for_user(db: Session, user_id: str):
+    if not user_id:
+        return []
+    return (
+        db.query(WorkspaceModel)
+        .join(WorkspaceMembershipModel, WorkspaceMembershipModel.workspace_id == WorkspaceModel.id)
+        .filter(
+            WorkspaceMembershipModel.user_id == user_id,
+            WorkspaceMembershipModel.status == "active",
+        )
+        .order_by(WorkspaceModel.created_at)
+        .all()
+    )
+
+
+def ensure_default_workspace_for_user(db: Session, user: UserModel) -> WorkspaceModel:
+    memberships = list_user_memberships(db, user.id)
+    if memberships:
+        workspace = get_workspace(db, memberships[0].workspace_id)
+        if workspace:
+            return workspace
+    display_name = str(getattr(user, "display_name", "") or "").strip()
+    email = str(getattr(user, "email", "") or "").strip()
+    workspace_name = f"{display_name or email or 'My'} Workspace"
+    return create_workspace(db, workspace_name, owner_user_id=user.id)
 
 
 # ── Brain Profile ─────────────────────────────────────────────────────────────
@@ -933,12 +1205,14 @@ def save_conversation(
     *,
     request_id: str = "",
     metadata_json: dict | None = None,
+    actor_user_id: str | None = None,
 ) -> ConversationModel:
     try:
         conv = ConversationModel(
             id=_id(), workspace_id=workspace_id,
             helper=helper, input=input_, output=output,
             request_id=request_id or "",
+            actor_user_id=actor_user_id,
             metadata_json=dict(metadata_json or {}),
             created_at=utc_now()
         )
@@ -970,6 +1244,8 @@ def save_conversation(
             }
             if "request_id" in table.c:
                 values["request_id"] = request_id or ""
+            if "actor_user_id" in table.c:
+                values["actor_user_id"] = actor_user_id
             if "metadata_json" in table.c:
                 values["metadata_json"] = dict(metadata_json or {})
             db.execute(table.insert().values(**values))
@@ -1050,6 +1326,7 @@ def save_workflow_run(
     status: str = "completed",
     request_id: str = "",
     metadata_json: dict | None = None,
+    actor_user_id: str | None = None,
 ) -> WorkflowRunModel:
     try:
         run = WorkflowRunModel(
@@ -1058,6 +1335,7 @@ def save_workflow_run(
             final_output=final_output,
             status=status or "completed",
             request_id=request_id or "",
+            actor_user_id=actor_user_id,
             metadata_json=dict(metadata_json or {}),
             created_at=utc_now(),
             updated_at=utc_now(),
@@ -1094,6 +1372,8 @@ def save_workflow_run(
                 values["status"] = status or "completed"
             if "request_id" in table.c:
                 values["request_id"] = request_id or ""
+            if "actor_user_id" in table.c:
+                values["actor_user_id"] = actor_user_id
             if "metadata_json" in table.c:
                 values["metadata_json"] = dict(metadata_json or {})
             if "updated_at" in table.c:
@@ -1614,14 +1894,56 @@ def set_tool_connection_status(
         return _tool_connection_from_mapping(dict(refreshed)) if refreshed else None
 
 
+def _get_workspace_connector_preference_by_scope(
+    db: Session,
+    workspace_id: str,
+    *,
+    scope_type: str,
+    user_id: str | None = None,
+    membership_id: str | None = None,
+) -> Optional[WorkspaceConnectorPreferenceModel]:
+    base = db.query(WorkspaceConnectorPreferenceModel).filter(
+        WorkspaceConnectorPreferenceModel.workspace_id == workspace_id,
+        WorkspaceConnectorPreferenceModel.scope_type == scope_type,
+    )
+    if scope_type == "membership":
+        if not membership_id:
+            return None
+        return base.filter(WorkspaceConnectorPreferenceModel.membership_id == membership_id).first()
+    if scope_type == "user":
+        if not user_id:
+            return None
+        return base.filter(WorkspaceConnectorPreferenceModel.user_id == user_id).first()
+    return base.first()
+
+
 def get_workspace_connector_preference(
     db: Session,
     workspace_id: str,
+    *,
+    user_id: str | None = None,
+    membership_id: str | None = None,
 ) -> Optional[WorkspaceConnectorPreferenceModel]:
     try:
-        return db.query(WorkspaceConnectorPreferenceModel).filter(
-            WorkspaceConnectorPreferenceModel.workspace_id == workspace_id
-        ).first()
+        if membership_id:
+            row = _get_workspace_connector_preference_by_scope(
+                db,
+                workspace_id,
+                scope_type="membership",
+                membership_id=membership_id,
+            )
+            if row:
+                return row
+        if user_id:
+            row = _get_workspace_connector_preference_by_scope(
+                db,
+                workspace_id,
+                scope_type="user",
+                user_id=user_id,
+            )
+            if row:
+                return row
+        return _get_workspace_connector_preference_by_scope(db, workspace_id, scope_type="workspace")
     except Exception as exc:
         if not _is_missing_column_error(exc):
             raise
@@ -1649,13 +1971,26 @@ def upsert_workspace_connector_preference(
     selected_account_alias: str = "",
     source: str = "persisted_default",
     selected_by_user_id: str | None = None,
+    scope_type: str = "workspace",
+    user_id: str | None = None,
+    membership_id: str | None = None,
 ) -> WorkspaceConnectorPreferenceModel:
     try:
-        row = get_workspace_connector_preference(db, workspace_id)
+        normalized_scope = scope_type if scope_type in {"workspace", "user", "membership"} else "workspace"
+        row = _get_workspace_connector_preference_by_scope(
+            db,
+            workspace_id,
+            scope_type=normalized_scope,
+            user_id=user_id if normalized_scope == "user" else None,
+            membership_id=membership_id if normalized_scope == "membership" else None,
+        )
         if not row:
             row = WorkspaceConnectorPreferenceModel(
+                id=_id(),
                 workspace_id=workspace_id,
-                scope_type="workspace",
+                scope_type=normalized_scope,
+                user_id=user_id if normalized_scope == "user" else None,
+                membership_id=membership_id if normalized_scope == "membership" else None,
                 selected_by_user_id=selected_by_user_id,
                 mode=mode,
                 selected_toolkit=selected_toolkit,
@@ -1667,6 +2002,9 @@ def upsert_workspace_connector_preference(
             )
             db.add(row)
         else:
+            row.scope_type = normalized_scope
+            row.user_id = user_id if normalized_scope == "user" else None
+            row.membership_id = membership_id if normalized_scope == "membership" else None
             row.mode = mode
             row.selected_toolkit = selected_toolkit
             row.selected_account_id = selected_account_id
@@ -1689,6 +2027,7 @@ def upsert_workspace_connector_preference(
                 table.select().where(table.c.workspace_id == workspace_id)
             ).mappings().first()
             values = {
+                "id": _id(),
                 "workspace_id": workspace_id,
                 "mode": mode,
                 "selected_toolkit": selected_toolkit,
@@ -1698,7 +2037,11 @@ def upsert_workspace_connector_preference(
                 "updated_at": now,
             }
             if "scope_type" in table.c:
-                values["scope_type"] = "workspace"
+                values["scope_type"] = scope_type if scope_type in {"workspace", "user", "membership"} else "workspace"
+            if "user_id" in table.c:
+                values["user_id"] = user_id
+            if "membership_id" in table.c:
+                values["membership_id"] = membership_id
             if "selected_by_user_id" in table.c:
                 values["selected_by_user_id"] = selected_by_user_id
             if "created_at" in table.c and not existing:
@@ -1799,6 +2142,7 @@ def save_pending_tool_request(
     approval_requirement_json: dict | None = None,
     approved: bool = False,
     expires_at=None,
+    actor_user_id: str | None = None,
 ):
     PendingToolRequestModel = _get_pending_tool_request_model_cls()
 
@@ -1820,6 +2164,7 @@ def save_pending_tool_request(
             row = PendingToolRequestModel(
                 id=_id(),
                 workspace_id=workspace_id,
+                actor_user_id=actor_user_id,
                 conversation_id=conversation_id,
                 agent_key=agent_key,
                 original_input=original_input,
@@ -1840,6 +2185,8 @@ def save_pending_tool_request(
             db.add(row)
         else:
             row.resume_token = resume_token
+            if actor_user_id is not None:
+                row.actor_user_id = actor_user_id
             row.conversation_id = conversation_id or row.conversation_id
             row.context_json = dict(context_json or {})
             row.pending_kind = pending_kind
@@ -1888,6 +2235,8 @@ def save_pending_tool_request(
             "context_json": legacy_context,
             "updated_at": utc_now(),
         }
+        if "actor_user_id" in table.c:
+            values["actor_user_id"] = actor_user_id
         if existing_row:
             db.execute(
                 table.update()
@@ -1915,6 +2264,7 @@ def save_pending_tool_request(
             {
                 "id": row_id,
                 "workspace_id": workspace_id,
+                "actor_user_id": actor_user_id,
                 "conversation_id": conversation_id,
                 "agent_key": agent_key,
                 "original_input": original_input,
@@ -2056,6 +2406,7 @@ def claim_tool_idempotency_record(
     *,
     input_hash: str = "",
     status: str = "pending",
+    actor_user_id: str | None = None,
 ):
     ToolIdempotencyRecordModel = _get_tool_idempotency_model_cls()
 
@@ -2066,6 +2417,7 @@ def claim_tool_idempotency_record(
     row = ToolIdempotencyRecordModel(
         id=_id(),
         workspace_id=workspace_id,
+        actor_user_id=actor_user_id,
         tool_name=tool_name,
         idempotency_key=idempotency_key,
         input_hash=input_hash,
@@ -2102,6 +2454,7 @@ def update_tool_idempotency_record(
     output_json: dict | None = None,
     error_message: str = "",
     completed: bool = False,
+    actor_user_id: str | None = None,
 ):
     row = get_tool_idempotency_record(db, workspace_id, tool_name, idempotency_key)
     if not row:
@@ -2112,11 +2465,14 @@ def update_tool_idempotency_record(
             idempotency_key,
             input_hash=input_hash,
             status=status or "pending",
+            actor_user_id=actor_user_id,
         )
     if not row:
         return None
     if input_hash:
         row.input_hash = input_hash
+    if actor_user_id is not None:
+        row.actor_user_id = actor_user_id
     if status:
         row.status = status
     if pending_request_id:

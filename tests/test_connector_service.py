@@ -197,6 +197,39 @@ class ConnectorServiceTests(unittest.TestCase):
         self.assertEqual(loaded.selected_account_id, "acct-9")
         self.assertEqual(loaded.source, "sidebar")
 
+    def test_persisted_connector_context_accepts_membership_scope(self):
+        upsert = Spy()
+        with patch_attr(self.connector_service.repo, "upsert_workspace_connector_preference", upsert):
+            self.connector_service.persist_connector_context(
+                "ws-1",
+                {"mode": "manual", "selected_toolkit": "gmail"},
+                object(),
+                scope_type="membership",
+                user_id="user-1",
+                membership_id="member-1",
+                selected_by_user_id="user-1",
+            )
+
+        kwargs = upsert.calls[0][1]
+        self.assertEqual(kwargs["scope_type"], "membership")
+        self.assertEqual(kwargs["user_id"], "user-1")
+        self.assertEqual(kwargs["membership_id"], "member-1")
+        self.assertEqual(kwargs["selected_by_user_id"], "user-1")
+
+    def test_load_persisted_connector_context_uses_user_and_membership_scope(self):
+        get_pref = Spy(return_value=None)
+        with patch_attr(self.connector_service.repo, "get_workspace_connector_preference", get_pref):
+            self.connector_service.load_persisted_connector_context(
+                "ws-1",
+                object(),
+                user_id="user-1",
+                membership_id="member-1",
+            )
+
+        kwargs = get_pref.calls[0][1]
+        self.assertEqual(kwargs["user_id"], "user-1")
+        self.assertEqual(kwargs["membership_id"], "member-1")
+
     def test_synchronize_connector_accounts_revokes_missing_local_accounts(self):
         revoked = Spy()
         with patch_attr(

@@ -47,7 +47,17 @@ def load_repositories_module():
     )
     WorkspaceConnectorPreferenceModel = make_model_class(
         "WorkspaceConnectorPreferenceModel",
-        ["workspace_id", "updated_at", "scope_type", "user_id", "membership_id", "selected_by_user_id"],
+        ["id", "workspace_id", "updated_at", "scope_type", "user_id", "membership_id", "selected_by_user_id"],
+    )
+    UserModel = make_model_class("UserModel", ["id", "email", "status", "created_at"])
+    ExternalIdentityModel = make_model_class("ExternalIdentityModel", ["provider", "provider_subject", "user_id"])
+    WorkspaceMembershipModel = make_model_class(
+        "WorkspaceMembershipModel",
+        ["id", "workspace_id", "user_id", "role", "status", "created_at"],
+    )
+    AuthSessionModel = make_model_class(
+        "AuthSessionModel",
+        ["id", "user_id", "session_hash", "status", "expires_at", "last_seen_at"],
     )
     PendingToolRequestModel = make_model_class(
         "PendingToolRequestModel",
@@ -122,6 +132,10 @@ def load_repositories_module():
             WorkingMemoryStateModel=WorkingMemoryStateModel,
             MemoryEmbeddingModel=MemoryEmbeddingModel,
             WorkspaceConnectorPreferenceModel=WorkspaceConnectorPreferenceModel,
+            UserModel=UserModel,
+            ExternalIdentityModel=ExternalIdentityModel,
+            WorkspaceMembershipModel=WorkspaceMembershipModel,
+            AuthSessionModel=AuthSessionModel,
         ),
         "sqlalchemy.orm": make_module("sqlalchemy.orm", Session=type("Session", (), {})),
         "sqlalchemy": make_module("sqlalchemy"),

@@ -8,6 +8,13 @@ from storage import repositories as repo
 from helpers.configs import AGENTS
 from ui.connector_state import default_connector_context
 from tools.connector_service import load_persisted_connector_context
+from ui.auth_state import (
+    ensure_auth_state,
+    get_state_membership_id,
+    get_state_user_id,
+    render_auth_gate,
+    resolve_streamlit_user,
+)
 from utils.logging_utils import configure_logging
 
 # Must be first Streamlit call
@@ -40,6 +47,23 @@ if "connector_context" not in st.session_state:
     st.session_state.connector_context = default_connector_context()
 if "connector_context_workspace_id" not in st.session_state:
     st.session_state.connector_context_workspace_id = None
+ensure_auth_state(st.session_state)
+
+_auth_db = SessionLocal()
+try:
+    _auth_user = resolve_streamlit_user(_auth_db, st.session_state)
+    if st.session_state.auth_required and not _auth_user:
+        render_auth_gate(st.session_state)
+        st.stop()
+    if _auth_user and st.session_state.workspace_id:
+        if not repo.get_workspace_membership(_auth_db, st.session_state.workspace_id, _auth_user.id):
+            st.session_state.workspace_id = None
+            st.session_state.workspace_name = None
+            st.session_state.chat_history = []
+            st.session_state.connector_context = default_connector_context()
+            st.session_state.connector_context_workspace_id = None
+finally:
+    _auth_db.close()
 
 # ── Hydrate chat history from DB on cold start / browser refresh ──────────────
 # Runs only when: workspace is known AND chat_history is empty (i.e. page was
@@ -80,6 +104,8 @@ if (
         st.session_state.connector_context = load_persisted_connector_context(
             st.session_state.workspace_id,
             _cdb,
+            user_id=get_state_user_id(st.session_state),
+            membership_id=get_state_membership_id(_cdb, st.session_state, st.session_state.workspace_id),
         ).to_dict()
         st.session_state.connector_context_workspace_id = st.session_state.workspace_id
     finally:
@@ -94,15 +120,15 @@ from ui.pages.ideas_page import render_ideas
 from ui.pages.workflows_page import render_workflows
 from ui.pages.onboarding_page import render_onboarding
 
-render_sidebar()
+render_sidebar(auth_user=_auth_user)
 
 # ── Route to page ─────────────────────────────────────────────────────────────
 if not st.session_state.workspace_id:
-    render_onboarding()
+    render_onboarding(auth_user=_auth_user)
 else:
     page = st.session_state.page
     if page == "chat":
-        render_chat()
+        render_chat(auth_user=_auth_user)
     elif page == "brain":
         render_brain()
     elif page == "helpers":

@@ -3,20 +3,54 @@ ui/sidebar.py  —  Workspace selector + navigation sidebar
 """
 import streamlit as st
 from storage.db import SessionLocal
+from storage import repositories as repo
 from tools.connector_service import list_workspace_connectors, persist_connector_context, refresh_connector_status
+from ui.auth_state import get_state_membership_id, get_state_user_id, is_auth_required, logout_streamlit_session
 from ui.connector_state import default_connector_context, ensure_connector_state, set_connector_selection
 from workspace.manager import list_workspaces, create_workspace, get_workspace_context
 
 
-def render_sidebar():
+def _workspace_options(db):
+    if is_auth_required():
+        user_id = get_state_user_id(st.session_state)
+        if not user_id:
+            return []
+        return [
+            {"id": ws.id, "name": ws.name, "created_at": str(getattr(ws, "created_at", "") or "")}
+            for ws in repo.list_workspaces_for_user(db, user_id)
+        ]
+    return list_workspaces(db)
+
+
+def _connector_scope_kwargs(db, workspace_id: str) -> dict:
+    user_id = get_state_user_id(st.session_state)
+    membership_id = get_state_membership_id(db, st.session_state, workspace_id) if user_id else None
+    if membership_id:
+        return {
+            "scope_type": "membership",
+            "user_id": user_id,
+            "membership_id": membership_id,
+            "selected_by_user_id": user_id,
+        }
+    if user_id:
+        return {"scope_type": "user", "user_id": user_id, "selected_by_user_id": user_id}
+    return {}
+
+
+def render_sidebar(auth_user=None):
     ensure_connector_state(st.session_state)
     with st.sidebar:
         st.markdown("## 🧠 Sintra Clone")
+        if auth_user:
+            st.caption(f"Signed in as {auth_user.email or auth_user.display_name or auth_user.id}")
+            if st.button("Sign out", use_container_width=True):
+                logout_streamlit_session(st.session_state)
+                st.rerun()
         st.markdown("---")
 
         db = SessionLocal()
         try:
-            workspaces = list_workspaces(db)
+            workspaces = _workspace_options(db)
 
             # ── Workspace selector ────────────────────────────────────────────
             st.markdown("### 🏢 Workspace")
@@ -52,7 +86,11 @@ def render_sidebar():
                 new_name = st.text_input("Workspace name", key="new_ws_name")
                 if st.button("Create", key="create_ws_btn"):
                     if new_name.strip():
-                        ws = create_workspace(new_name.strip(), db)
+                        owner_user_id = getattr(auth_user, "id", None) if auth_user else None
+                        if is_auth_required() and not owner_user_id:
+                            st.warning("Sign in before creating a workspace.")
+                            st.stop()
+                        ws = create_workspace(new_name.strip(), db, owner_user_id=owner_user_id)
                         st.session_state.workspace_id   = ws.id
                         st.session_state.workspace_name = ws.name
                         st.session_state.chat_history   = []
@@ -110,6 +148,7 @@ def render_sidebar():
                 current_connector = st.session_state.connector_context
                 current_toolkit = str(current_connector.get("selected_toolkit", "") or "")
                 current_account_id = str(current_connector.get("selected_account_id", "") or "")
+                connector_scope = _connector_scope_kwargs(db, st.session_state.workspace_id)
 
                 if st.button(
                     "Auto Mode",
@@ -118,7 +157,12 @@ def render_sidebar():
                     key="sidebar_connector_auto",
                 ):
                     set_connector_selection(st.session_state, mode="auto", source="sidebar")
-                    persist_connector_context(st.session_state.workspace_id, st.session_state.connector_context, db)
+                    persist_connector_context(
+                        st.session_state.workspace_id,
+                        st.session_state.connector_context,
+                        db,
+                        **connector_scope,
+                    )
                     st.rerun()
 
                 for connector in connector_rows:
@@ -140,7 +184,12 @@ def render_sidebar():
                             selected_account_alias=str(first_account.get("account_alias", "") or ""),
                             source="sidebar",
                         )
-                        persist_connector_context(st.session_state.workspace_id, st.session_state.connector_context, db)
+                        persist_connector_context(
+                            st.session_state.workspace_id,
+                            st.session_state.connector_context,
+                            db,
+                            **connector_scope,
+                        )
                         st.rerun()
 
                     if is_active and connector["accounts"]:
@@ -168,7 +217,12 @@ def render_sidebar():
                                 selected_account_alias=selected_account["account_alias"],
                                 source="sidebar",
                             )
-                            persist_connector_context(st.session_state.workspace_id, st.session_state.connector_context, db)
+                            persist_connector_context(
+                                st.session_state.workspace_id,
+                                st.session_state.connector_context,
+                                db,
+                                **connector_scope,
+                            )
                             st.rerun()
                         if st.button(
                             f"Refresh {connector['label']}",
@@ -184,7 +238,12 @@ def render_sidebar():
                                 selected_account_alias=str(refreshed.effective_account_alias or ""),
                                 source="sidebar",
                             )
-                            persist_connector_context(st.session_state.workspace_id, st.session_state.connector_context, db)
+                            persist_connector_context(
+                                st.session_state.workspace_id,
+                                st.session_state.connector_context,
+                                db,
+                                **connector_scope,
+                            )
                             st.rerun()
                     elif is_active and connector["connect_url"]:
                         st.link_button(

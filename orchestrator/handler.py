@@ -175,7 +175,8 @@ def _exec_single_agent(agent_key: str, user_input: str,
                         db: Session = None,
                         resume_state: dict = None,
                         route_context: dict | None = None,
-                        connector_context: dict | None = None) -> dict:
+                        connector_context: dict | None = None,
+                        actor_user_id: str | None = None) -> dict:
     """Execute a single agent and return a standardised result dict.
 
     When workspace_id and db are provided, the agent runs in tool-aware
@@ -221,6 +222,7 @@ def _exec_single_agent(agent_key: str, user_input: str,
         history=history,
         route_context=route_context,
         connector_context=connector_context,
+        actor_user_id=actor_user_id,
     )
     log_event(
         logger,
@@ -316,12 +318,16 @@ def _exec_workflow(workflow_key: str, user_input: str,
                     brain_context: str, workspace_id: str,
                     db: Session, resume_state: dict = None,
                     connector_context: dict | None = None,
-                    request_id: str = "") -> dict:
+                    request_id: str = "",
+                    actor_user_id: str | None = None) -> dict:
     """Execute a workflow chain and return a standardised result dict."""
+    workflow_resume_state = dict(resume_state or {})
+    if actor_user_id and "actor_user_id" not in workflow_resume_state:
+        workflow_resume_state["actor_user_id"] = actor_user_id
     wf_result = run_workflow(
         workflow_key, user_input, brain_context,
         workspace_id=workspace_id, db=db,
-        resume_state=resume_state,
+        resume_state=workflow_resume_state or resume_state,
         connector_context=connector_context,
     )
 
@@ -339,6 +345,7 @@ def _exec_workflow(workflow_key: str, user_input: str,
             interrupt.get("output", "Workflow paused."),
             status="paused",
             request_id=request_id,
+            actor_user_id=actor_user_id,
             metadata_json={
                 "mode": interrupt_mode,
                 "workflow_paused": True,
@@ -381,6 +388,7 @@ def _exec_workflow(workflow_key: str, user_input: str,
             wf_result["final_output"],
             status="failed" if mode == "tool_error" else "paused",
             request_id=request_id,
+            actor_user_id=actor_user_id,
             metadata_json={
                 "mode": mode,
                 "step_label": wf_result.get("step_label"),
@@ -418,6 +426,7 @@ def _exec_workflow(workflow_key: str, user_input: str,
         wf_result["steps"], wf_result["final_output"],
         status="completed",
         request_id=request_id,
+        actor_user_id=actor_user_id,
         metadata_json={"mode": "workflow", "resumed": bool(resume_state)},
     )
     return result
@@ -449,7 +458,8 @@ def _auto_route(user_input: str, workspace_id: str, db: Session,
                 brain_context: str,
                 resume_state: dict = None,
                 connector_context: dict | None = None,
-                request_id: str = "") -> dict:
+                request_id: str = "",
+                actor_user_id: str | None = None) -> dict:
     """
     Primary auto-routing path. Tries the LLM router first; falls back to
     legacy keyword → LLM detection if the router fails.
@@ -478,6 +488,7 @@ def _auto_route(user_input: str, workspace_id: str, db: Session,
                 resume_state=resume_state,
                 route_context=route,
                 connector_context=connector_context,
+                actor_user_id=actor_user_id,
             )
 
         if route_type == "workflow":
@@ -488,6 +499,7 @@ def _auto_route(user_input: str, workspace_id: str, db: Session,
                     resume_state=resume_state,
                     connector_context=connector_context,
                     request_id=request_id,
+                    actor_user_id=actor_user_id,
                 )
             # Router returned a workflow type but no valid key — fall through
             # to legacy detection which may find the right workflow.
@@ -522,6 +534,7 @@ def _auto_route(user_input: str, workspace_id: str, db: Session,
             resume_state=resume_state,
             connector_context=connector_context,
             request_id=request_id,
+            actor_user_id=actor_user_id,
         )
 
     agent_key = detect_agent(user_input)
@@ -540,6 +553,7 @@ def _auto_route(user_input: str, workspace_id: str, db: Session,
         workspace_id=workspace_id, db=db,
         resume_state=resume_state,
         connector_context=connector_context,
+        actor_user_id=actor_user_id,
     )
 
 
@@ -549,7 +563,8 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
                    force_agent: str = None,
                    force_workflow: str = None,
                    resume_state: dict = None,
-                   connector_context: dict | None = None) -> dict:
+                   connector_context: dict | None = None,
+                   actor_user_id: str | None = None) -> dict:
     """
     Main orchestrator function. Called by API and UI.
 
@@ -622,6 +637,7 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
                 workspace_id=workspace_id, db=db,
                 resume_state=local_resume_state,
                 connector_context=normalized_connector.to_dict(),
+                actor_user_id=actor_user_id,
             )
         elif force_workflow and force_workflow in WORKFLOWS:
             result = _exec_workflow(
@@ -629,6 +645,7 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
                 resume_state=local_resume_state,
                 connector_context=normalized_connector.to_dict(),
                 request_id=request_id,
+                actor_user_id=actor_user_id,
             )
         else:
             result = _auto_route(
@@ -639,6 +656,7 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
                 resume_state=local_resume_state,
                 connector_context=normalized_connector.to_dict(),
                 request_id=request_id,
+                actor_user_id=actor_user_id,
             )
 
         # 3. Save conversation — always, including on workflow error / clarify / reject,
@@ -657,6 +675,7 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
                 "toolkit": result.get("toolkit", ""),
                 "workflow_resumed": bool(local_resume_state),
             },
+            actor_user_id=actor_user_id,
         )
 
         # 4. Auto-extract memory — skip on error, clarify, reject, and connect_required.
