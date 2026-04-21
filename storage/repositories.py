@@ -308,6 +308,22 @@ def _get_tool_idempotency_model_cls():
     return ToolIdempotencyRecordModel
 
 
+def _get_scheduled_task_model_cls():
+    model = globals().get("_scheduled_task_model")
+    if model is not None:
+        return model
+    from models.scheduled_tasks import ScheduledTaskModel
+    return ScheduledTaskModel
+
+
+def _get_scheduled_task_run_model_cls():
+    model = globals().get("_scheduled_task_run_model")
+    if model is not None:
+        return model
+    from models.scheduled_tasks import ScheduledTaskRunModel
+    return ScheduledTaskRunModel
+
+
 # ── Users / Auth / Memberships ───────────────────────────────────────────────
 
 def get_user(db: Session, user_id: str) -> Optional[UserModel]:
@@ -2487,4 +2503,324 @@ def update_tool_idempotency_record(
     if completed:
         row.completed_at = utc_now()
     db.commit()
+    return row
+
+
+# ── Scheduled Automations ────────────────────────────────────────────────────
+
+def create_scheduled_task(
+    db: Session,
+    *,
+    workspace_id: str,
+    target_kind: str,
+    target_name: str,
+    schedule_type: str,
+    timezone: str = "UTC",
+    start_at=None,
+    end_at=None,
+    next_run_at=None,
+    cron_expression: str = "",
+    interval_seconds: int = 0,
+    payload_json: dict | None = None,
+    connector_context_json: dict | None = None,
+    execution_policy_json: dict | None = None,
+    retry_policy_json: dict | None = None,
+    metadata_json: dict | None = None,
+    actor_user_id: str | None = None,
+    created_by_user_id: str | None = None,
+    membership_id: str | None = None,
+    task_kind: str = "automation",
+    status: str = "active",
+):
+    ScheduledTaskModel = _get_scheduled_task_model_cls()
+    row = ScheduledTaskModel(
+        id=_id(),
+        workspace_id=workspace_id,
+        actor_user_id=actor_user_id,
+        created_by_user_id=created_by_user_id or actor_user_id,
+        membership_id=membership_id,
+        task_kind=task_kind or "automation",
+        target_kind=target_kind,
+        target_name=target_name,
+        status=status or "active",
+        schedule_type=schedule_type,
+        cron_expression=cron_expression or "",
+        interval_seconds=int(interval_seconds or 0),
+        timezone=timezone or "UTC",
+        start_at=start_at,
+        end_at=end_at,
+        next_run_at=next_run_at,
+        last_run_at=None,
+        connector_context_json=dict(connector_context_json or {}),
+        payload_json=dict(payload_json or {}),
+        execution_policy_json=dict(execution_policy_json or {}),
+        retry_policy_json=dict(retry_policy_json or {}),
+        metadata_json=dict(metadata_json or {}),
+        created_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def get_scheduled_task(db: Session, task_id: str):
+    ScheduledTaskModel = _get_scheduled_task_model_cls()
+    if not task_id:
+        return None
+    return db.query(ScheduledTaskModel).filter(ScheduledTaskModel.id == task_id).first()
+
+
+def list_scheduled_tasks(
+    db: Session,
+    workspace_id: str,
+    *,
+    status: str = "",
+    limit: int = 50,
+):
+    ScheduledTaskModel = _get_scheduled_task_model_cls()
+    query = db.query(ScheduledTaskModel).filter(ScheduledTaskModel.workspace_id == workspace_id)
+    if status:
+        query = query.filter(ScheduledTaskModel.status == status)
+    return query.order_by(ScheduledTaskModel.created_at.desc()).limit(limit).all()
+
+
+def update_scheduled_task(
+    db: Session,
+    task_id: str,
+    *,
+    status: str | None = None,
+    target_kind: str | None = None,
+    target_name: str | None = None,
+    schedule_type: str | None = None,
+    timezone: str | None = None,
+    start_at=None,
+    end_at=None,
+    cron_expression: str | None = None,
+    interval_seconds: int | None = None,
+    next_run_at=None,
+    last_run_at=None,
+    payload_json: dict | None = None,
+    connector_context_json: dict | None = None,
+    execution_policy_json: dict | None = None,
+    retry_policy_json: dict | None = None,
+    metadata_json: dict | None = None,
+):
+    row = get_scheduled_task(db, task_id)
+    if not row:
+        return None
+    if status is not None:
+        row.status = status
+    if target_kind is not None:
+        row.target_kind = target_kind
+    if target_name is not None:
+        row.target_name = target_name
+    if schedule_type is not None:
+        row.schedule_type = schedule_type
+    if timezone is not None:
+        row.timezone = timezone or "UTC"
+    if start_at is not None:
+        row.start_at = start_at
+    if end_at is not None:
+        row.end_at = end_at
+    if cron_expression is not None:
+        row.cron_expression = cron_expression or ""
+    if interval_seconds is not None:
+        row.interval_seconds = int(interval_seconds or 0)
+    if next_run_at is not None:
+        row.next_run_at = next_run_at
+    if last_run_at is not None:
+        row.last_run_at = last_run_at
+    if payload_json is not None:
+        row.payload_json = dict(payload_json or {})
+    if connector_context_json is not None:
+        row.connector_context_json = dict(connector_context_json or {})
+    if execution_policy_json is not None:
+        row.execution_policy_json = dict(execution_policy_json or {})
+    if retry_policy_json is not None:
+        row.retry_policy_json = dict(retry_policy_json or {})
+    if metadata_json is not None:
+        row.metadata_json = dict(metadata_json or {})
+    row.updated_at = utc_now()
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def set_scheduled_task_status(db: Session, task_id: str, status: str):
+    return update_scheduled_task(db, task_id, status=status)
+
+
+def list_due_scheduled_tasks(db: Session, due_at, *, limit: int = 20):
+    ScheduledTaskModel = _get_scheduled_task_model_cls()
+    return (
+        db.query(ScheduledTaskModel)
+        .filter(
+            ScheduledTaskModel.status == "active",
+            ScheduledTaskModel.next_run_at.isnot(None),
+            ScheduledTaskModel.next_run_at <= due_at,
+        )
+        .order_by(ScheduledTaskModel.next_run_at.asc(), ScheduledTaskModel.created_at.asc())
+        .limit(limit)
+        .all()
+    )
+
+
+def create_scheduled_task_run(
+    db: Session,
+    *,
+    scheduled_task_id: str,
+    workspace_id: str,
+    planned_for,
+    run_key: str,
+    actor_user_id: str | None = None,
+    membership_id: str | None = None,
+    idempotency_key: str = "",
+    request_id: str = "",
+    attempt_number: int = 1,
+    status: str = "queued",
+):
+    ScheduledTaskRunModel = _get_scheduled_task_run_model_cls()
+    existing = get_scheduled_task_run_by_key(db, run_key)
+    if existing:
+        return existing
+    row = ScheduledTaskRunModel(
+        id=_id(),
+        scheduled_task_id=scheduled_task_id,
+        workspace_id=workspace_id,
+        actor_user_id=actor_user_id,
+        membership_id=membership_id,
+        run_key=run_key,
+        status=status,
+        planned_for=planned_for,
+        request_id=request_id or "",
+        idempotency_key=idempotency_key or "",
+        attempt_number=max(1, int(attempt_number or 1)),
+        result_json={},
+        error_message="",
+        created_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    db.add(row)
+    try:
+        db.commit()
+        db.refresh(row)
+        return row
+    except Exception as exc:
+        if not _is_integrity_error(exc):
+            raise
+        _safe_rollback(db)
+        return get_scheduled_task_run_by_key(db, run_key)
+
+
+def get_scheduled_task_run(db: Session, run_id: str):
+    ScheduledTaskRunModel = _get_scheduled_task_run_model_cls()
+    if not run_id:
+        return None
+    return db.query(ScheduledTaskRunModel).filter(ScheduledTaskRunModel.id == run_id).first()
+
+
+def get_scheduled_task_run_by_key(db: Session, run_key: str):
+    ScheduledTaskRunModel = _get_scheduled_task_run_model_cls()
+    if not run_key:
+        return None
+    return db.query(ScheduledTaskRunModel).filter(ScheduledTaskRunModel.run_key == run_key).first()
+
+
+def get_scheduled_task_run_by_resume_token(db: Session, resume_token: str):
+    ScheduledTaskRunModel = _get_scheduled_task_run_model_cls()
+    if not resume_token:
+        return None
+    return (
+        db.query(ScheduledTaskRunModel)
+        .filter(ScheduledTaskRunModel.resume_token == resume_token)
+        .first()
+    )
+
+
+def list_scheduled_task_runs(
+    db: Session,
+    *,
+    workspace_id: str = "",
+    scheduled_task_id: str = "",
+    status: str = "",
+    limit: int = 50,
+):
+    ScheduledTaskRunModel = _get_scheduled_task_run_model_cls()
+    query = db.query(ScheduledTaskRunModel)
+    if workspace_id:
+        query = query.filter(ScheduledTaskRunModel.workspace_id == workspace_id)
+    if scheduled_task_id:
+        query = query.filter(ScheduledTaskRunModel.scheduled_task_id == scheduled_task_id)
+    if status:
+        query = query.filter(ScheduledTaskRunModel.status == status)
+    return query.order_by(ScheduledTaskRunModel.created_at.desc()).limit(limit).all()
+
+
+def list_queued_scheduled_task_runs(db: Session, *, due_at=None, limit: int = 20):
+    ScheduledTaskRunModel = _get_scheduled_task_run_model_cls()
+    query = db.query(ScheduledTaskRunModel).filter(ScheduledTaskRunModel.status == "queued")
+    if due_at is not None:
+        query = query.filter(ScheduledTaskRunModel.planned_for <= due_at)
+    return query.order_by(ScheduledTaskRunModel.planned_for.asc(), ScheduledTaskRunModel.created_at.asc()).limit(limit).all()
+
+
+def claim_scheduled_task_run(db: Session, run_id: str):
+    ScheduledTaskRunModel = _get_scheduled_task_run_model_cls()
+    if not run_id:
+        return None
+    updated = (
+        db.query(ScheduledTaskRunModel)
+        .filter(
+            ScheduledTaskRunModel.id == run_id,
+            ScheduledTaskRunModel.status == "queued",
+        )
+        .update(
+            {
+                "status": "running",
+                "started_at": utc_now(),
+                "updated_at": utc_now(),
+            },
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    if not updated:
+        return get_scheduled_task_run(db, run_id)
+    return get_scheduled_task_run(db, run_id)
+
+
+def update_scheduled_task_run(
+    db: Session,
+    run_id: str,
+    *,
+    status: str | None = None,
+    result_json: dict | None = None,
+    error_message: str | None = None,
+    request_id: str | None = None,
+    idempotency_key: str | None = None,
+    resume_token: str | None = None,
+    finished_at=None,
+):
+    row = get_scheduled_task_run(db, run_id)
+    if not row:
+        return None
+    if status is not None:
+        row.status = status
+    if result_json is not None:
+        row.result_json = dict(result_json or {})
+    if error_message is not None:
+        row.error_message = error_message
+    if request_id is not None:
+        row.request_id = request_id
+    if idempotency_key is not None:
+        row.idempotency_key = idempotency_key
+    if resume_token is not None:
+        row.resume_token = resume_token
+    if finished_at is not None:
+        row.finished_at = finished_at
+    row.updated_at = utc_now()
+    db.commit()
+    db.refresh(row)
     return row

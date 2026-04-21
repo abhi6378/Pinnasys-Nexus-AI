@@ -176,6 +176,21 @@ def _step(
         "requires_live_tool": bool(requires_live_tool),
         "allow_text_fallback": bool(allow_text_fallback),
     }
+    if isinstance(resume_state, dict):
+        for key in (
+            "actor_user_id",
+            "membership_id",
+            "request_id",
+            "scheduled_task_id",
+            "scheduled_run_id",
+            "automation_run_id",
+            "idempotency_key",
+            "approval_granted",
+            "approved_idempotency_keys",
+            "automation",
+        ):
+            if key in resume_state:
+                workflow_state[key] = resume_state[key]
     if capability_hint:
         workflow_state["capability_hint"] = capability_hint.to_dict()
     if not step_constraint.is_empty():
@@ -189,6 +204,7 @@ def _step(
         db=db,
         workflow_state=workflow_state,
         connector_context=effective_connector.to_dict(),
+        actor_user_id=str(workflow_state.get("actor_user_id", "") or "") or None,
     )
 
     interrupt_modes = {

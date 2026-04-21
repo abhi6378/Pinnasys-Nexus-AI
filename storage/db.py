@@ -54,6 +54,9 @@ WORKSPACE_MEMBERSHIP_STATUSES = ("active", "invited", "suspended", "removed")
 CONNECTOR_PREFERENCE_MODES = ("auto", "manual")
 CONNECTOR_PREFERENCE_SCOPES = ("workspace", "user", "membership")
 AUTH_SESSION_STATUSES = ("active", "revoked", "expired")
+SCHEDULED_TASK_STATUSES = ("active", "paused", "cancelled", "archived")
+SCHEDULED_RUN_STATUSES = ("queued", "running", "succeeded", "failed", "skipped", "cancelled", "approval_required")
+SCHEDULE_TYPES = ("once", "interval", "cron")
 
 
 def new_id():
@@ -365,6 +368,7 @@ class WorkspaceConnectorPreferenceModel(Base):
 def register_model_modules() -> None:
     # Import models that live outside this module so they register on Base.metadata.
     from models.pending_tool_requests import PendingToolRequestModel  # noqa: F401
+    from models.scheduled_tasks import ScheduledTaskModel, ScheduledTaskRunModel  # noqa: F401
     from models.tool_call_logs import ToolCallLogModel  # noqa: F401
     from models.tool_connections import ToolConnectionModel  # noqa: F401
     from models.tool_idempotency_records import ToolIdempotencyRecordModel  # noqa: F401

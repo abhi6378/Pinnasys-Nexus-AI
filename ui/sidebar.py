@@ -115,6 +115,7 @@ def render_sidebar(auth_user=None):
                     ("🤖 Helpers",      "helpers"),
                     ("💡 Ideas Inbox",  "ideas"),
                     ("⚙️ Workflows",    "workflows"),
+                    ("⏱️ Automations", "automations"),
                 ]
 
                 for label, key in pages:

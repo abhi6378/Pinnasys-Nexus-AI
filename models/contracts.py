@@ -503,3 +503,166 @@ class ConnectorStatusSummary:
         payload = asdict(self)
         payload["accounts"] = [account.to_dict() for account in self.accounts]
         return payload
+
+
+@dataclass
+class ScheduleSpec:
+    schedule_type: str = "once"
+    timezone: str = "UTC"
+    start_at: str = ""
+    end_at: str = ""
+    cron_expression: str = ""
+    interval_seconds: int = 0
+
+    @classmethod
+    def from_value(cls, value: Any) -> "ScheduleSpec":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            return cls(
+                schedule_type=str(value.get("schedule_type", "once") or "once"),
+                timezone=str(value.get("timezone", "UTC") or "UTC"),
+                start_at=str(value.get("start_at", "") or ""),
+                end_at=str(value.get("end_at", "") or ""),
+                cron_expression=str(value.get("cron_expression", "") or ""),
+                interval_seconds=int(value.get("interval_seconds", 0) or 0),
+            )
+        return cls()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class RetryPolicy:
+    max_attempts: int = 1
+    backoff_seconds: int = 300
+
+    @classmethod
+    def from_value(cls, value: Any) -> "RetryPolicy":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            return cls(
+                max_attempts=max(1, int(value.get("max_attempts", 1) or 1)),
+                backoff_seconds=max(0, int(value.get("backoff_seconds", 300) or 300)),
+            )
+        return cls()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ExecutionPolicy:
+    approval_policy: str = "per_run"
+    allow_write_actions: bool = True
+    idempotency_scope: str = "scheduled_run"
+
+    @classmethod
+    def from_value(cls, value: Any) -> "ExecutionPolicy":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            return cls(
+                approval_policy=str(value.get("approval_policy", "per_run") or "per_run"),
+                allow_write_actions=bool(value.get("allow_write_actions", True)),
+                idempotency_scope=str(value.get("idempotency_scope", "scheduled_run") or "scheduled_run"),
+            )
+        return cls()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ScheduledTaskPayload:
+    target_kind: str = "workflow"
+    target_name: str = ""
+    user_input: str = ""
+    force_agent: str = ""
+    force_workflow: str = ""
+    payload_json: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_value(cls, value: Any) -> "ScheduledTaskPayload":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            target_kind = str(value.get("target_kind", "workflow") or "workflow")
+            target_name = str(value.get("target_name", "") or "")
+            return cls(
+                target_kind=target_kind,
+                target_name=target_name,
+                user_input=str(value.get("user_input", "") or value.get("message", "") or ""),
+                force_agent=str(value.get("force_agent", "") or (target_name if target_kind == "agent" else "")),
+                force_workflow=str(value.get("force_workflow", "") or (target_name if target_kind == "workflow" else "")),
+                payload_json=dict(value.get("payload_json", {}) or {}),
+            )
+        return cls()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ScheduledTaskDefinition:
+    id: str = ""
+    workspace_id: str = ""
+    actor_user_id: str = ""
+    membership_id: str = ""
+    status: str = "active"
+    schedule: ScheduleSpec = field(default_factory=ScheduleSpec)
+    payload: ScheduledTaskPayload = field(default_factory=ScheduledTaskPayload)
+    connector_context: ConnectorContext = field(default_factory=ConnectorContext)
+    retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
+    execution_policy: ExecutionPolicy = field(default_factory=ExecutionPolicy)
+    metadata_json: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "workspace_id": self.workspace_id,
+            "actor_user_id": self.actor_user_id,
+            "membership_id": self.membership_id,
+            "status": self.status,
+            "schedule": self.schedule.to_dict(),
+            "payload": self.payload.to_dict(),
+            "connector_context": self.connector_context.to_dict(),
+            "retry_policy": self.retry_policy.to_dict(),
+            "execution_policy": self.execution_policy.to_dict(),
+            "metadata_json": dict(self.metadata_json),
+        }
+
+
+@dataclass
+class ScheduledRunContext:
+    scheduled_task_id: str = ""
+    scheduled_run_id: str = ""
+    workspace_id: str = ""
+    actor_user_id: str = ""
+    membership_id: str = ""
+    planned_for: str = ""
+    run_key: str = ""
+    attempt_number: int = 1
+    connector_context: ConnectorContext = field(default_factory=ConnectorContext)
+    request_id: str = ""
+    idempotency_key: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["connector_context"] = self.connector_context.to_dict()
+        return payload
+
+
+@dataclass
+class ScheduledRunResult:
+    status: str = "queued"
+    output: str = ""
+    error_message: str = ""
+    result_json: dict[str, Any] = field(default_factory=dict)
+    resume_token: str = ""
+    idempotency_key: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)

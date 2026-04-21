@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi import FastAPI, Depends, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from sqlalchemy.orm import Session
 
@@ -27,6 +27,7 @@ from auth.service import (
 )
 from storage.db import init_db, get_db, SessionLocal
 from storage import repositories as repo
+from automation import service as automation_service
 from workspace.manager import create_workspace, list_workspaces, get_workspace_context
 from brain.quiz_engine import get_next_question, save_answer, quiz_progress
 from orchestrator.handler import handle_request
@@ -146,6 +147,47 @@ class QuizAnswerRequest(BaseModel):
 class IdeaStatusRequest(BaseModel):
     status: str
 
+class AutomationScheduleRequest(BaseModel):
+    schedule_type: str = "once"
+    timezone: str = "UTC"
+    start_at: str = ""
+    end_at: str = ""
+    cron_expression: str = ""
+    interval_seconds: int = 0
+
+class AutomationPayloadRequest(BaseModel):
+    target_kind: str = "workflow"
+    target_name: str = ""
+    user_input: str
+    force_agent: str = ""
+    force_workflow: str = ""
+    payload_json: dict[str, Any] = Field(default_factory=dict)
+
+class AutomationPolicyRequest(BaseModel):
+    approval_policy: str = "per_run"
+    allow_write_actions: bool = True
+    idempotency_scope: str = "scheduled_run"
+
+class AutomationRetryPolicyRequest(BaseModel):
+    max_attempts: int = 1
+    backoff_seconds: int = 300
+
+class AutomationCreateRequest(BaseModel):
+    schedule: AutomationScheduleRequest
+    payload: AutomationPayloadRequest
+    connector_context: Optional[ConnectorContextRequest] = None
+    retry_policy: AutomationRetryPolicyRequest = Field(default_factory=AutomationRetryPolicyRequest)
+    execution_policy: AutomationPolicyRequest = Field(default_factory=AutomationPolicyRequest)
+    metadata_json: dict[str, Any] = Field(default_factory=dict)
+
+class AutomationUpdateRequest(BaseModel):
+    schedule: Optional[AutomationScheduleRequest] = None
+    payload: Optional[AutomationPayloadRequest] = None
+    connector_context: Optional[ConnectorContextRequest] = None
+    retry_policy: Optional[AutomationRetryPolicyRequest] = None
+    execution_policy: Optional[AutomationPolicyRequest] = None
+    metadata_json: Optional[dict[str, Any]] = None
+
 
 @dataclass
 class RequestActor:
@@ -202,6 +244,19 @@ def _normalize_connector_payload(value: ConnectorContextRequest | None) -> dict 
 
 def _workspace_payload(ws) -> dict:
     return {"id": ws.id, "name": ws.name, "created_at": str(getattr(ws, "created_at", "") or "")}
+
+
+def _automation_task_for_workspace(db: Session, workspace_id: str, task_id: str):
+    task = repo.get_scheduled_task(db, task_id)
+    if not task or getattr(task, "workspace_id", "") != workspace_id:
+        raise HTTPException(status_code=404, detail="Automation not found.")
+    return task
+
+
+def _model_dict(value: BaseModel | None) -> dict | None:
+    if value is None:
+        return None
+    return value.model_dump()
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
@@ -366,6 +421,7 @@ def api_chat_resume(req: ResumeRequest, request: Request, db: Session = Depends(
         connector_context=connector_context,
         actor_user_id=actor.actor_user_id,
     )
+    automation_service.complete_run_from_resume(db, context.get("scheduled_run_id"), result)
     if result.get("mode") not in {
         "connect_required", "auth_unavailable", "invalid_tool",
         "validation_error", "tool_error"
@@ -413,6 +469,7 @@ def api_chat_approve(req: ApproveRequest, request: Request, db: Session = Depend
         connector_context=connector_context,
         actor_user_id=actor.actor_user_id,
     )
+    automation_service.complete_run_from_resume(db, context.get("scheduled_run_id"), result)
     if result.get("mode") not in {
         "connect_required", "auth_unavailable", "invalid_tool",
         "validation_error", "tool_error"
@@ -588,3 +645,95 @@ def api_workflow_history(workspace_id: str, request: Request, db: Session = Depe
     return [{"id": r.id, "workflow_name": r.workflow_name,
              "steps": r.steps, "final_output": r.final_output[:300],
              "created_at": str(r.created_at)} for r in runs]
+
+
+# ── Automations ──────────────────────────────────────────────────────────────
+
+@app.post("/workspace/{workspace_id}/automations")
+def api_create_automation(workspace_id: str, req: AutomationCreateRequest, request: Request, db: Session = Depends(get_db)):
+    actor = _actor_for_workspace(request, db, workspace_id)
+    try:
+        task = automation_service.create_schedule(
+            db,
+            workspace_id=workspace_id,
+            actor_user_id=actor.actor_user_id,
+            membership_id=getattr(actor.membership, "id", None),
+            schedule=req.schedule.model_dump(),
+            payload=req.payload.model_dump(),
+            connector_context=_normalize_connector_payload(req.connector_context),
+            retry_policy=req.retry_policy.model_dump(),
+            execution_policy=req.execution_policy.model_dump(),
+            metadata_json=req.metadata_json,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return automation_service.task_to_dict(task)
+
+
+@app.get("/workspace/{workspace_id}/automations")
+def api_list_automations(workspace_id: str, request: Request, status: str = "", db: Session = Depends(get_db)):
+    _actor_for_workspace(request, db, workspace_id)
+    return automation_service.list_schedules(db, workspace_id, status=status)
+
+
+@app.get("/workspace/{workspace_id}/automations/{task_id}")
+def api_get_automation(workspace_id: str, task_id: str, request: Request, db: Session = Depends(get_db)):
+    _actor_for_workspace(request, db, workspace_id)
+    task = _automation_task_for_workspace(db, workspace_id, task_id)
+    return automation_service.task_to_dict(task)
+
+
+@app.patch("/workspace/{workspace_id}/automations/{task_id}")
+def api_update_automation(workspace_id: str, task_id: str, req: AutomationUpdateRequest, request: Request, db: Session = Depends(get_db)):
+    _actor_for_workspace(request, db, workspace_id)
+    _automation_task_for_workspace(db, workspace_id, task_id)
+    try:
+        task = automation_service.update_schedule(
+            db,
+            task_id,
+            schedule=_model_dict(req.schedule),
+            payload=_model_dict(req.payload),
+            connector_context=_normalize_connector_payload(req.connector_context) if req.connector_context else None,
+            retry_policy=_model_dict(req.retry_policy),
+            execution_policy=_model_dict(req.execution_policy),
+            metadata_json=req.metadata_json,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return automation_service.task_to_dict(task)
+
+
+@app.post("/workspace/{workspace_id}/automations/{task_id}/pause")
+def api_pause_automation(workspace_id: str, task_id: str, request: Request, db: Session = Depends(get_db)):
+    _actor_for_workspace(request, db, workspace_id)
+    _automation_task_for_workspace(db, workspace_id, task_id)
+    return automation_service.task_to_dict(automation_service.pause_schedule(db, task_id))
+
+
+@app.post("/workspace/{workspace_id}/automations/{task_id}/resume")
+def api_resume_automation(workspace_id: str, task_id: str, request: Request, db: Session = Depends(get_db)):
+    _actor_for_workspace(request, db, workspace_id)
+    _automation_task_for_workspace(db, workspace_id, task_id)
+    return automation_service.task_to_dict(automation_service.resume_schedule(db, task_id))
+
+
+@app.post("/workspace/{workspace_id}/automations/{task_id}/cancel")
+def api_cancel_automation(workspace_id: str, task_id: str, request: Request, db: Session = Depends(get_db)):
+    _actor_for_workspace(request, db, workspace_id)
+    _automation_task_for_workspace(db, workspace_id, task_id)
+    return automation_service.task_to_dict(automation_service.cancel_schedule(db, task_id))
+
+
+@app.post("/workspace/{workspace_id}/automations/{task_id}/run-now")
+def api_run_automation_now(workspace_id: str, task_id: str, request: Request, db: Session = Depends(get_db)):
+    _actor_for_workspace(request, db, workspace_id)
+    _automation_task_for_workspace(db, workspace_id, task_id)
+    run = automation_service.run_now(db, task_id)
+    return automation_service.run_to_dict(run)
+
+
+@app.get("/workspace/{workspace_id}/automations/{task_id}/runs")
+def api_list_automation_runs(workspace_id: str, task_id: str, request: Request, db: Session = Depends(get_db)):
+    _actor_for_workspace(request, db, workspace_id)
+    _automation_task_for_workspace(db, workspace_id, task_id)
+    return automation_service.list_runs(db, workspace_id=workspace_id, scheduled_task_id=task_id)

@@ -26,6 +26,7 @@ from tools.connector_service import (
     refresh_connector_status,
     validate_connector_context,
 )
+from automation.chat_intent import maybe_create_chat_schedule
 from utils.logging_utils import log_event, log_exception, request_context
 
 logger = logging.getLogger(__name__)
@@ -625,6 +626,33 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
                 "connector_context": normalized_connector.to_dict(),
                 "connector_status": connector_status.to_dict(),
             }
+
+        if not force_agent and not force_workflow and not resume_state:
+            workflow_hint = detect_workflow(user_input)
+            schedule_result = maybe_create_chat_schedule(
+                db=db,
+                workspace_id=workspace_id,
+                user_input=user_input,
+                workflow_key=workflow_hint,
+                connector_context=normalized_connector.to_dict(),
+                actor_user_id=actor_user_id,
+                membership_id=str((local_resume_state or {}).get("membership_id", "") or "") or None,
+            )
+            if schedule_result:
+                repo.save_conversation(
+                    db,
+                    workspace_id,
+                    schedule_result.get("agent", "system"),
+                    user_input,
+                    schedule_result["output"],
+                    request_id=request_id,
+                    metadata_json={
+                        "mode": schedule_result.get("mode", ""),
+                        "automation_id": schedule_result.get("automation", {}).get("id", ""),
+                    },
+                    actor_user_id=actor_user_id,
+                )
+                return schedule_result
 
         # 1. Load Brain AI context
         brain = BrainAI(workspace_id, db)

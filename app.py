@@ -118,6 +118,7 @@ from ui.pages.brain_page import render_brain
 from ui.pages.helpers_page import render_helpers
 from ui.pages.ideas_page import render_ideas
 from ui.pages.workflows_page import render_workflows
+from ui.pages.automations_page import render_automations
 from ui.pages.onboarding_page import render_onboarding
 
 render_sidebar(auth_user=_auth_user)
@@ -137,5 +138,7 @@ else:
         render_ideas()
     elif page == "workflows":
         render_workflows()
+    elif page == "automations":
+        render_automations(auth_user=_auth_user)
     else:
         render_chat()

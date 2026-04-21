@@ -11,6 +11,7 @@ alembic
 psycopg2-binary
 tenacity>=8.2.0
 google-auth>=2.29.0
+croniter>=2.0.0
 
 # ── Composio SDK 1.0 (single package; composio-openai is merged in) ──────────
 composio>=0.11.0

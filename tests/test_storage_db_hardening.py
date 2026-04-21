@@ -25,6 +25,7 @@ class StorageDbHardeningTests(unittest.TestCase):
         self.assertTrue((self.root / "alembic" / "versions" / "20260417_02_db_hardening.py").exists())
         self.assertTrue((self.root / "alembic" / "versions" / "20260417_03_ownership_scope_hardening.py").exists())
         self.assertTrue((self.root / "alembic" / "versions" / "20260417_04_google_auth_runtime.py").exists())
+        self.assertTrue((self.root / "alembic" / "versions" / "20260422_01_scheduled_automations.py").exists())
 
     def test_storage_db_uses_timezone_aware_columns_and_migration_head_check(self):
         self.assertIn("TZDateTime = DateTime(timezone=True)", self.storage_db_source)
