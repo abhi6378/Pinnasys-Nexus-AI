@@ -50,6 +50,7 @@ def render_sidebar(auth_user=None):
 
         db = SessionLocal()
         try:
+            connector_render_cache = {}
             workspaces = _workspace_options(db)
 
             # ── Workspace selector ────────────────────────────────────────────
@@ -143,6 +144,7 @@ def render_sidebar(auth_user=None):
                 connector_rows = list_workspace_connectors(
                     st.session_state.workspace_id,
                     db,
+                    request_cache=connector_render_cache,
                     selected_toolkit=str(st.session_state.connector_context.get("selected_toolkit", "") or ""),
                     include_connect_url=True,
                 )
@@ -230,7 +232,7 @@ def render_sidebar(auth_user=None):
                             key=f"sidebar_refresh_{toolkit}",
                             use_container_width=True,
                         ):
-                            refreshed = refresh_connector_status(st.session_state.workspace_id, toolkit, db, request_cache={})
+                            refreshed = refresh_connector_status(st.session_state.workspace_id, toolkit, db, request_cache=connector_render_cache)
                             set_connector_selection(
                                 st.session_state,
                                 mode="manual",

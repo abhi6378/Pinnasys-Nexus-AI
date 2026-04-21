@@ -595,9 +595,41 @@ def _run_with_tools(
         )
         prompt_tools = available_tools
 
-    composio_tool_schemas = get_tool_schemas(
-        workspace_id,
-        [tool["tool_name"] for tool in prompt_tools],
+    requested_schema_tools = [tool["tool_name"] for tool in prompt_tools]
+    prompt_schema_cache = execution_context.setdefault("prompt_tool_schema_cache", {})
+    cached_schemas = {
+        tool_name: dict(prompt_schema_cache[tool_name])
+        for tool_name in requested_schema_tools
+        if isinstance(prompt_schema_cache.get(tool_name), dict)
+    }
+    missing_schema_tools = [
+        tool_name for tool_name in requested_schema_tools if tool_name not in cached_schemas
+    ]
+    fetched_schemas = get_tool_schemas(workspace_id, missing_schema_tools) if missing_schema_tools else []
+    for schema in fetched_schemas:
+        schema_name = str(
+            schema.get("function", {}).get("name")
+            or schema.get("name")
+            or schema.get("slug")
+            or ""
+        )
+        if schema_name:
+            prompt_schema_cache[schema_name] = dict(schema)
+            cached_schemas[schema_name] = dict(schema)
+    composio_tool_schemas = [
+        dict(cached_schemas[tool_name])
+        for tool_name in requested_schema_tools
+        if tool_name in cached_schemas
+    ]
+    log_event(
+        logger,
+        logging.DEBUG,
+        "agent.schema_cache",
+        workspace_id=workspace_id,
+        agent_name=agent_name,
+        requested_count=len(requested_schema_tools),
+        cache_hit_count=len(requested_schema_tools) - len(missing_schema_tools),
+        fetched_count=len(fetched_schemas),
     )
     use_native_tool_calling = bool(composio_tool_schemas)
     log_event(

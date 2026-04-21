@@ -306,9 +306,11 @@ def _render_connector_controls(workspace_id: str, db) -> dict:
     current_toolkit = str(current.get("selected_toolkit", "") or "")
     current_account_id = str(current.get("selected_account_id", "") or "")
     current_account_alias = str(current.get("selected_account_alias", "") or "")
+    connector_render_cache = {}
     connector_rows = list_workspace_connectors(
         workspace_id,
         db,
+        request_cache=connector_render_cache,
         selected_toolkit=current_toolkit,
         include_connect_url=True,
     )
@@ -371,7 +373,12 @@ def _render_connector_controls(workspace_id: str, db) -> dict:
             key=f"chat_refresh_{selected_connector}",
             use_container_width=True,
         ):
-            refreshed = refresh_connector_status(workspace_id, selected_connector, db, request_cache={})
+            refreshed = refresh_connector_status(
+                workspace_id,
+                selected_connector,
+                db,
+                request_cache=connector_render_cache,
+            )
             effective_account_id = str(refreshed.effective_account_id or current_account_id or "")
             effective_account_alias = str(refreshed.effective_account_alias or current_account_alias or "")
             set_connector_selection(

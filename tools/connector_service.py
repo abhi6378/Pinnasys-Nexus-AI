@@ -57,6 +57,10 @@ def _cache_set(request_cache: dict | None, key: str, value):
     return value
 
 
+def _ensure_request_cache(request_cache: dict | None) -> dict:
+    return request_cache if isinstance(request_cache, dict) else {}
+
+
 def normalize_connector_context(value: Any = None) -> ConnectorContext:
     connector = ConnectorContext.from_value(value)
     normalized_toolkit = normalize_toolkit_key(
@@ -255,6 +259,13 @@ def synchronize_connector_accounts(
     cache_key = f"connector_sync:{workspace_id}:{toolkit}:{force_refresh}:{selected_account_id}"
     cached = _cache_get(request_cache, cache_key)
     if cached is not None:
+        log_event(
+            logger,
+            logging.DEBUG,
+            "connector.accounts.remote_refresh_cache_hit",
+            workspace_id=workspace_id,
+            toolkit=toolkit,
+        )
         return [ConnectorAccountSummary.from_value(item) for item in cached]
 
     started = time.perf_counter()
@@ -377,12 +388,25 @@ def list_connector_accounts(
     )
     should_allow_remote = bool(allow_remote) or refresh
     should_refresh = refresh or not local_accounts
+    stale_local_count = sum(1 for account in local_accounts if account.stale)
     if selected_account_id and not any(
         account.connected_account_id == selected_account_id for account in local_accounts
     ):
         should_refresh = should_allow_remote
-    elif should_allow_remote and any(account.stale for account in local_accounts):
+    elif should_allow_remote and stale_local_count:
         should_refresh = True
+    log_event(
+        logger,
+        logging.DEBUG,
+        "connector.accounts.refresh_decision",
+        workspace_id=workspace_id,
+        toolkit=selected_toolkit,
+        local_count=len(local_accounts),
+        stale_count=stale_local_count,
+        refresh_requested=refresh,
+        allow_remote=should_allow_remote,
+        remote_attempted=bool(should_refresh and should_allow_remote),
+    )
 
     accounts = local_accounts
     if should_refresh and should_allow_remote:
@@ -603,8 +627,23 @@ def list_workspace_connectors(
     selected_toolkit: str = "",
     include_connect_url: bool = False,
 ) -> list[dict]:
+    request_cache = _ensure_request_cache(request_cache)
     normalized_selected_toolkit = normalize_toolkit_key(selected_toolkit)
     connector_rows: list[dict] = []
+    cache_key = (
+        f"workspace_connectors:{workspace_id}:{normalized_selected_toolkit}:"
+        f"{refresh}:{include_connect_url}"
+    )
+    cached = _cache_get(request_cache, cache_key)
+    if cached is not None:
+        log_event(
+            logger,
+            logging.DEBUG,
+            "connector.workspace_list.cache_hit",
+            workspace_id=workspace_id,
+            selected_toolkit=normalized_selected_toolkit,
+        )
+        return [dict(row) for row in cached]
     for toolkit in list_ui_toolkits():
         summary = get_connector_status_summary(
             workspace_id,
@@ -622,6 +661,7 @@ def list_workspace_connectors(
             allow_remote=toolkit == normalized_selected_toolkit,
         )
         connector_rows.append(summary.to_dict())
+    _cache_set(request_cache, cache_key, connector_rows)
     return connector_rows
 
 

@@ -12,6 +12,7 @@ from orchestrator.handler import handle_request
 from storage import repositories as repo
 from storage.db import SessionLocal, init_db
 from utils.logging_utils import configure_logging, log_event
+from utils.perf import elapsed_ms, perf_counter
 from utils.time_utils import utc_now
 
 from automation import service
@@ -35,9 +36,12 @@ def _build_resume_state(task, run) -> dict:
 
 
 def execute_run(db, run_id: str) -> dict:
+    started = perf_counter()
     claimed = repo.claim_scheduled_task_run(db, run_id)
     if not claimed or getattr(claimed, "status", "") != "running":
-        return {"status": getattr(claimed, "status", "not_found") if claimed else "not_found"}
+        status = getattr(claimed, "status", "not_found") if claimed else "not_found"
+        log_event(logger, logging.INFO, "automation.worker.run", run_id=run_id, status=status, duration_ms=elapsed_ms(started))
+        return {"status": status}
 
     task = repo.get_scheduled_task(db, getattr(claimed, "scheduled_task_id", ""))
     if not task:
@@ -48,9 +52,21 @@ def execute_run(db, run_id: str) -> dict:
             error_message="Scheduled task definition was not found.",
             finished_at=utc_now(),
         )
-        return {"status": "failed", "error_message": "Scheduled task definition was not found."}
+        result = {"status": "failed", "error_message": "Scheduled task definition was not found."}
+        log_event(logger, logging.INFO, "automation.worker.run", run_id=run_id, status="failed", duration_ms=elapsed_ms(started))
+        return result
 
+    connector_started = perf_counter()
     connector_context, connector_error = service.validate_task_connector(db, task)
+    log_event(
+        logger,
+        logging.INFO,
+        "automation.worker.connector_validate",
+        run_id=run_id,
+        task_id=getattr(task, "id", ""),
+        has_error=bool(connector_error),
+        duration_ms=elapsed_ms(connector_started),
+    )
     if connector_error:
         repo.update_scheduled_task_run(
             db,
@@ -60,7 +76,9 @@ def execute_run(db, run_id: str) -> dict:
             result_json={"connector_context": connector_context},
             finished_at=utc_now(),
         )
-        return {"status": "failed", "error_message": connector_error}
+        result = {"status": "failed", "error_message": connector_error}
+        log_event(logger, logging.INFO, "automation.worker.run", run_id=run_id, status="failed", duration_ms=elapsed_ms(started))
+        return result
 
     payload = ScheduledTaskPayload.from_value(dict(getattr(task, "payload_json", {}) or {}))
     resume_state = _build_resume_state(task, claimed)
@@ -73,6 +91,7 @@ def execute_run(db, run_id: str) -> dict:
     if payload.target_kind == "direct_action" and not force_agent:
         force_agent = payload.target_name or "assistant"
 
+    execution_started = perf_counter()
     result = handle_request(
         payload.user_input,
         getattr(task, "workspace_id", ""),
@@ -82,6 +101,14 @@ def execute_run(db, run_id: str) -> dict:
         resume_state=resume_state,
         connector_context=connector_context,
         actor_user_id=getattr(claimed, "actor_user_id", None) or getattr(task, "actor_user_id", None),
+    )
+    log_event(
+        logger,
+        logging.INFO,
+        "automation.worker.execute_runtime",
+        run_id=run_id,
+        task_id=getattr(task, "id", ""),
+        duration_ms=elapsed_ms(execution_started),
     )
     mode = str(result.get("mode", "") or "")
     errored = bool(result.get("error", False))
@@ -119,16 +146,34 @@ def execute_run(db, run_id: str) -> dict:
                 attempt_number=attempt_number + 1,
                 status="queued",
             )
+    log_event(
+        logger,
+        logging.INFO,
+        "automation.worker.run",
+        run_id=run_id,
+        task_id=getattr(task, "id", ""),
+        status=status,
+        duration_ms=elapsed_ms(started),
+    )
     return {"status": status, "result": result}
 
 
 def execute_queued_runs(*, batch_size: int = 10) -> list[dict]:
+    started = perf_counter()
     db = SessionLocal()
     try:
         runs = repo.list_queued_scheduled_task_runs(db, due_at=utc_now(), limit=batch_size)
         results = []
         for run in runs:
             results.append(execute_run(db, getattr(run, "id", "")))
+        log_event(
+            logger,
+            logging.INFO,
+            "automation.worker.batch",
+            run_count=len(results),
+            batch_size=batch_size,
+            duration_ms=elapsed_ms(started),
+        )
         return results
     finally:
         db.close()

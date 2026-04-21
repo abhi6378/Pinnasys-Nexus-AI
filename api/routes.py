@@ -3,6 +3,7 @@ api/routes.py  —  FastAPI REST API
 Run with: uvicorn api.routes:app --reload
 """
 import os
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,9 +42,11 @@ from tools.connector_service import (
 from tools.composio_client import get_connect_link
 from tools.tool_registry import get_toolkit_metadata, normalize_toolkit_key
 from utils.logging_utils import configure_logging
+from utils.perf import timed_log
 
 app = FastAPI(title="Sintra Clone API", version="1.0.0")
 configure_logging()
+logger = logging.getLogger(__name__)
 
 allowed_origins = [
     origin.strip()
@@ -263,53 +266,55 @@ def _model_dict(value: BaseModel | None) -> dict | None:
 
 @app.post("/auth/google", response_model=AuthLoginResponse)
 def api_auth_google(req: GoogleAuthRequest, request: Request, response: Response, db: Session = Depends(get_db)):
-    try:
-        validate_google_csrf(request, req.g_csrf_token)
-        payload = verify_google_credential(req.credential)
-    except AuthServiceError as exc:
-        raise _translate_auth_error(exc) from exc
-    user, workspace, session_token = sign_in_with_google_payload(db, payload)
-    set_session_cookie(response, session_token)
-    memberships = repo.list_user_memberships(db, user.id)
-    workspace_rows = [
-        repo.get_workspace(db, membership.workspace_id)
-        for membership in memberships
-    ]
-    workspace_rows = [row for row in workspace_rows if row]
-    return {
-        "authenticated": True,
-        "user": {
-            "id": user.id,
-            "email": user.email,
-            "display_name": user.display_name,
-            "avatar_url": user.avatar_url,
-        },
-        "default_workspace": _workspace_payload(workspace),
-        "workspaces": [_workspace_payload(row) for row in workspace_rows],
-        "access_token": session_token,
-        "token_type": "bearer",
-    }
+    with timed_log(logger, "api.auth_google"):
+        try:
+            validate_google_csrf(request, req.g_csrf_token)
+            payload = verify_google_credential(req.credential)
+        except AuthServiceError as exc:
+            raise _translate_auth_error(exc) from exc
+        user, workspace, session_token = sign_in_with_google_payload(db, payload)
+        set_session_cookie(response, session_token)
+        memberships = repo.list_user_memberships(db, user.id)
+        workspace_rows = [
+            repo.get_workspace(db, membership.workspace_id)
+            for membership in memberships
+        ]
+        workspace_rows = [row for row in workspace_rows if row]
+        return {
+            "authenticated": True,
+            "user": {
+                "id": user.id,
+                "email": user.email,
+                "display_name": user.display_name,
+                "avatar_url": user.avatar_url,
+            },
+            "default_workspace": _workspace_payload(workspace),
+            "workspaces": [_workspace_payload(row) for row in workspace_rows],
+            "access_token": session_token,
+            "token_type": "bearer",
+        }
 
 
 @app.get("/auth/me", response_model=AuthStateResponse)
 def api_auth_me(request: Request, db: Session = Depends(get_db)):
-    user = _current_user(request, db)
-    if not user:
-        if is_auth_required():
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
-        return {"authenticated": False, "user": None, "workspaces": []}
-    memberships = repo.list_user_memberships(db, user.id)
-    workspaces = [
-        repo.get_workspace(db, membership.workspace_id)
-        for membership in memberships
-    ]
-    workspaces = [workspace for workspace in workspaces if workspace]
-    return {
-        "authenticated": True,
-        "user": user.to_dict(),
-        "workspaces": [_workspace_payload(workspace) for workspace in workspaces],
-        "default_workspace": _workspace_payload(workspaces[0]) if workspaces else None,
-    }
+    with timed_log(logger, "api.auth_me"):
+        user = _current_user(request, db)
+        if not user:
+            if is_auth_required():
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+            return {"authenticated": False, "user": None, "workspaces": []}
+        memberships = repo.list_user_memberships(db, user.id)
+        workspaces = [
+            repo.get_workspace(db, membership.workspace_id)
+            for membership in memberships
+        ]
+        workspaces = [workspace for workspace in workspaces if workspace]
+        return {
+            "authenticated": True,
+            "user": user.to_dict(),
+            "workspaces": [_workspace_payload(workspace) for workspace in workspaces],
+            "default_workspace": _workspace_payload(workspaces[0]) if workspaces else None,
+        }
 
 
 @app.post("/auth/logout")
@@ -355,17 +360,18 @@ def api_get_workspace(workspace_id: str, request: Request, db: Session = Depends
 
 @app.post("/chat")
 def api_chat(req: ChatRequest, request: Request, db: Session = Depends(get_db)):
-    actor = _actor_for_workspace(request, db, req.workspace_id)
-    connector_context = _normalize_connector_payload(req.connector_context)
-    result = handle_request(
-        req.message,
-        req.workspace_id,
-        db,
-        force_agent=req.agent,
-        connector_context=connector_context,
-        actor_user_id=actor.actor_user_id,
-    )
-    return result
+    with timed_log(logger, "api.chat", workspace_id=req.workspace_id):
+        actor = _actor_for_workspace(request, db, req.workspace_id)
+        connector_context = _normalize_connector_payload(req.connector_context)
+        result = handle_request(
+            req.message,
+            req.workspace_id,
+            db,
+            force_agent=req.agent,
+            connector_context=connector_context,
+            actor_user_id=actor.actor_user_id,
+        )
+        return result
 
 
 @app.post("/chat/resume")
@@ -377,105 +383,107 @@ def api_chat_resume(req: ResumeRequest, request: Request, db: Session = Depends(
     connect_required response.  We look up the pending request, extract
     the original user message, and re-send it through handle_request().
     """
-    from tools.tool_executor import (
-        get_pending_request,
-        mark_request_resumed,
-        mark_request_completed,
-    )
-
-    actor = _actor_for_workspace(request, db, req.workspace_id)
-    pending = get_pending_request(db, req.resume_token)
-    if not pending:
-        raise HTTPException(
-            status_code=404,
-            detail="Resume token not found or already used.",
+    with timed_log(logger, "api.chat_resume", workspace_id=req.workspace_id):
+        from tools.tool_executor import (
+            get_pending_request,
+            mark_request_resumed,
+            mark_request_completed,
         )
 
-    # Mark it as resumed so it can't be replayed
-    mark_request_resumed(db, req.resume_token)
+        actor = _actor_for_workspace(request, db, req.workspace_id)
+        pending = get_pending_request(db, req.resume_token)
+        if not pending:
+            raise HTTPException(
+                status_code=404,
+                detail="Resume token not found or already used.",
+            )
 
-    # Invalidate stale Composio session so fresh connection state is picked up
-    from tools.composio_client import invalidate_session
-    invalidate_session(req.workspace_id)
-    if getattr(pending, "requested_toolkit", ""):
-        refresh_connector_status(
+        # Mark it as resumed so it can't be replayed
+        mark_request_resumed(db, req.resume_token)
+
+        # Invalidate stale Composio session so fresh connection state is picked up
+        from tools.composio_client import invalidate_session
+        invalidate_session(req.workspace_id)
+        if getattr(pending, "requested_toolkit", ""):
+            refresh_connector_status(
+                req.workspace_id,
+                pending.requested_toolkit,
+                db,
+                request_cache={},
+            )
+
+        # Determine if this was a workflow resume
+        context = pending.context_json or {}
+        wf_key = context.get("workflow_key")
+        connector_context = context.get("connector_context")
+
+        # Re-send the original request through the orchestrator
+        result = handle_request(
+            pending.original_input,
             req.workspace_id,
-            pending.requested_toolkit,
             db,
-            request_cache={},
+            force_agent=pending.agent_key if (pending.agent_key and not wf_key) else None,
+            force_workflow=wf_key,
+            resume_state=context,
+            connector_context=connector_context,
+            actor_user_id=actor.actor_user_id,
         )
-
-    # Determine if this was a workflow resume
-    context = pending.context_json or {}
-    wf_key = context.get("workflow_key")
-    connector_context = context.get("connector_context")
-
-    # Re-send the original request through the orchestrator
-    result = handle_request(
-        pending.original_input,
-        req.workspace_id,
-        db,
-        force_agent=pending.agent_key if (pending.agent_key and not wf_key) else None,
-        force_workflow=wf_key,
-        resume_state=context,
-        connector_context=connector_context,
-        actor_user_id=actor.actor_user_id,
-    )
-    automation_service.complete_run_from_resume(db, context.get("scheduled_run_id"), result)
-    if result.get("mode") not in {
-        "connect_required", "auth_unavailable", "invalid_tool",
-        "validation_error", "tool_error"
-    } and not result.get("error", False):
-        mark_request_completed(db, req.resume_token)
-    return result
+        automation_service.complete_run_from_resume(db, context.get("scheduled_run_id"), result)
+        if result.get("mode") not in {
+            "connect_required", "auth_unavailable", "invalid_tool",
+            "validation_error", "tool_error"
+        } and not result.get("error", False):
+            mark_request_completed(db, req.resume_token)
+        return result
 
 
 @app.post("/chat/approve")
 def api_chat_approve(req: ApproveRequest, request: Request, db: Session = Depends(get_db)):
-    from tools.tool_executor import (
-        get_pending_request,
-        mark_request_approved,
-        mark_request_resumed,
-        mark_request_completed,
-    )
-
-    actor = _actor_for_workspace(request, db, req.workspace_id)
-    pending = get_pending_request(db, req.resume_token)
-    if not pending:
-        raise HTTPException(
-            status_code=404,
-            detail="Resume token not found or already used.",
+    with timed_log(logger, "api.chat_approve", workspace_id=req.workspace_id):
+        from tools.tool_executor import (
+            get_pending_request,
+            mark_request_approved,
+            mark_request_resumed,
+            mark_request_completed,
         )
 
-    mark_request_approved(db, req.resume_token)
-    mark_request_resumed(db, req.resume_token)
+        actor = _actor_for_workspace(request, db, req.workspace_id)
+        pending = get_pending_request(db, req.resume_token)
+        if not pending:
+            raise HTTPException(
+                status_code=404,
+                detail="Resume token not found or already used.",
+            )
 
-    context = dict(getattr(pending, "context_json", {}) or {})
-    context["approval_granted"] = True
-    approved_keys = list(context.get("approved_idempotency_keys", []) or [])
-    if getattr(pending, "idempotency_key", "") and pending.idempotency_key not in approved_keys:
-        approved_keys.append(pending.idempotency_key)
-    context["approved_idempotency_keys"] = approved_keys
-    workflow_key = context.get("workflow_key")
-    connector_context = context.get("connector_context")
+        mark_request_approved(db, req.resume_token)
+        mark_request_resumed(db, req.resume_token)
 
-    result = handle_request(
-        pending.original_input,
-        req.workspace_id,
-        db,
-        force_agent=pending.agent_key if (pending.agent_key and not workflow_key) else None,
-        force_workflow=workflow_key,
-        resume_state=context,
-        connector_context=connector_context,
-        actor_user_id=actor.actor_user_id,
-    )
-    automation_service.complete_run_from_resume(db, context.get("scheduled_run_id"), result)
-    if result.get("mode") not in {
-        "connect_required", "auth_unavailable", "invalid_tool",
-        "validation_error", "tool_error"
-    } and not result.get("error", False):
-        mark_request_completed(db, req.resume_token)
-    return result
+        context = dict(getattr(pending, "context_json", {}) or {})
+        context["approval_granted"] = True
+        approved_keys = list(context.get("approved_idempotency_keys", []) or [])
+        if getattr(pending, "idempotency_key", "") and pending.idempotency_key not in approved_keys:
+            approved_keys.append(pending.idempotency_key)
+        context["approved_idempotency_keys"] = approved_keys
+        workflow_key = context.get("workflow_key")
+        connector_context = context.get("connector_context")
+
+        result = handle_request(
+            pending.original_input,
+            req.workspace_id,
+            db,
+            force_agent=pending.agent_key if (pending.agent_key and not workflow_key) else None,
+            force_workflow=workflow_key,
+            resume_state=context,
+            connector_context=connector_context,
+            actor_user_id=actor.actor_user_id,
+        )
+        automation_service.complete_run_from_resume(db, context.get("scheduled_run_id"), result)
+        if result.get("mode") not in {
+            "connect_required", "auth_unavailable", "invalid_tool",
+            "validation_error", "tool_error"
+        } and not result.get("error", False):
+            mark_request_completed(db, req.resume_token)
+        return result
 
 
 # ── Brain AI ─────────────────────────────────────────────────────────────────
@@ -548,27 +556,31 @@ def api_list_helpers():
 
 @app.get("/workspace/{workspace_id}/connectors")
 def api_list_connectors(workspace_id: str, request: Request, refresh: bool = False, selected_toolkit: str = "", db: Session = Depends(get_db)):
-    _actor_for_workspace(request, db, workspace_id)
-    return list_workspace_connectors(
-        workspace_id,
-        db,
-        refresh=refresh,
-        selected_toolkit=selected_toolkit,
-        include_connect_url=bool(selected_toolkit),
-    )
+    with timed_log(logger, "api.connectors.list", workspace_id=workspace_id, refresh=refresh, selected_toolkit=selected_toolkit):
+        _actor_for_workspace(request, db, workspace_id)
+        return list_workspace_connectors(
+            workspace_id,
+            db,
+            request_cache={},
+            refresh=refresh,
+            selected_toolkit=selected_toolkit,
+            include_connect_url=bool(selected_toolkit),
+        )
 
 
 @app.get("/workspace/{workspace_id}/connectors/{toolkit}/accounts")
 def api_list_connector_accounts(workspace_id: str, toolkit: str, request: Request, refresh: bool = False, db: Session = Depends(get_db)):
-    _actor_for_workspace(request, db, workspace_id)
-    return list_connector_accounts(
-        workspace_id,
-        toolkit,
-        db,
-        include_disconnected=True,
-        refresh=refresh,
-        allow_remote=True,
-    )
+    with timed_log(logger, "api.connectors.accounts", workspace_id=workspace_id, toolkit=toolkit, refresh=refresh):
+        _actor_for_workspace(request, db, workspace_id)
+        return list_connector_accounts(
+            workspace_id,
+            toolkit,
+            db,
+            request_cache={},
+            include_disconnected=True,
+            refresh=refresh,
+            allow_remote=True,
+        )
 
 
 @app.get("/workspace/{workspace_id}/connectors/{toolkit}/connect-link")
@@ -579,9 +591,10 @@ def api_get_connector_link(workspace_id: str, toolkit: str, request: Request, db
 
 @app.post("/workspace/{workspace_id}/connectors/{toolkit}/refresh")
 def api_refresh_connector(workspace_id: str, toolkit: str, request: Request, db: Session = Depends(get_db)):
-    _actor_for_workspace(request, db, workspace_id)
-    summary = refresh_connector_status(workspace_id, toolkit, db, request_cache={})
-    return summary.to_dict()
+    with timed_log(logger, "api.connectors.refresh", workspace_id=workspace_id, toolkit=toolkit):
+        _actor_for_workspace(request, db, workspace_id)
+        summary = refresh_connector_status(workspace_id, toolkit, db, request_cache={})
+        return summary.to_dict()
 
 
 # ── Ideas Inbox ───────────────────────────────────────────────────────────────
@@ -672,8 +685,9 @@ def api_create_automation(workspace_id: str, req: AutomationCreateRequest, reque
 
 @app.get("/workspace/{workspace_id}/automations")
 def api_list_automations(workspace_id: str, request: Request, status: str = "", db: Session = Depends(get_db)):
-    _actor_for_workspace(request, db, workspace_id)
-    return automation_service.list_schedules(db, workspace_id, status=status)
+    with timed_log(logger, "api.automations.list", workspace_id=workspace_id, status=status):
+        _actor_for_workspace(request, db, workspace_id)
+        return automation_service.list_schedules(db, workspace_id, status=status)
 
 
 @app.get("/workspace/{workspace_id}/automations/{task_id}")
@@ -726,10 +740,11 @@ def api_cancel_automation(workspace_id: str, task_id: str, request: Request, db:
 
 @app.post("/workspace/{workspace_id}/automations/{task_id}/run-now")
 def api_run_automation_now(workspace_id: str, task_id: str, request: Request, db: Session = Depends(get_db)):
-    _actor_for_workspace(request, db, workspace_id)
-    _automation_task_for_workspace(db, workspace_id, task_id)
-    run = automation_service.run_now(db, task_id)
-    return automation_service.run_to_dict(run)
+    with timed_log(logger, "api.automations.run_now", workspace_id=workspace_id, task_id=task_id):
+        _actor_for_workspace(request, db, workspace_id)
+        _automation_task_for_workspace(db, workspace_id, task_id)
+        run = automation_service.run_now(db, task_id)
+        return automation_service.run_to_dict(run)
 
 
 @app.get("/workspace/{workspace_id}/automations/{task_id}/runs")

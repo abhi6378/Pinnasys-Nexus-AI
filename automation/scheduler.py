@@ -7,6 +7,7 @@ import time
 
 from storage.db import SessionLocal, init_db
 from utils.logging_utils import configure_logging, log_event
+from utils.perf import elapsed_ms, perf_counter
 
 from automation.service import enqueue_due_runs
 
@@ -15,10 +16,18 @@ logger = logging.getLogger(__name__)
 
 
 def enqueue_due_once(*, batch_size: int = 20) -> list[dict]:
+    started = perf_counter()
     db = SessionLocal()
     try:
         runs = enqueue_due_runs(db, limit=batch_size)
-        log_event(logger, logging.INFO, "automation.scheduler.enqueue_due", run_count=len(runs))
+        log_event(
+            logger,
+            logging.INFO,
+            "automation.scheduler.enqueue_due",
+            run_count=len(runs),
+            batch_size=batch_size,
+            duration_ms=elapsed_ms(started),
+        )
         return runs
     finally:
         db.close()

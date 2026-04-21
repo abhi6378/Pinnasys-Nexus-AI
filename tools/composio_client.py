@@ -24,6 +24,8 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 
 from tools.tool_registry import get_toolkit_app_enum, get_toolkit_runtime_config, get_toolkit_slug
+from utils.logging_utils import log_event, log_exception
+from utils.perf import elapsed_ms, perf_counter
 
 load_dotenv()
 
@@ -44,8 +46,10 @@ _default_client: Any = None
 _schema_cache: dict[tuple[str, str], dict] = {}
 _schema_cache_times: dict[tuple[str, str], float] = {}
 _catalog_validation_cache: dict[str, tuple[float, dict]] = {}
+_auth_config_cache: dict[str, tuple[float, Optional[str]]] = {}
 SCHEMA_CACHE_TTL_SECONDS = int(os.getenv("COMPOSIO_SCHEMA_CACHE_TTL_SECONDS", "1800") or "1800")
 CATALOG_CACHE_TTL_SECONDS = int(os.getenv("COMPOSIO_CATALOG_CACHE_TTL_SECONDS", "1800") or "1800")
+AUTH_CONFIG_CACHE_TTL_SECONDS = int(os.getenv("COMPOSIO_AUTH_CONFIG_CACHE_TTL_SECONDS", "1800") or "1800")
 
 
 def _entity_id(workspace_id: str) -> str:
@@ -172,6 +176,7 @@ def _get_client(user_id: str = "", force_refresh: bool = False) -> Any | None:
         return None
 
     if not user_id:
+        log_event(logger, logging.DEBUG, "composio.client.default", cache_hit=bool(_default_client))
         return _default_client
 
     entity_id = _entity_id(user_id)
@@ -179,16 +184,28 @@ def _get_client(user_id: str = "", force_refresh: bool = False) -> Any | None:
         _clients.pop(entity_id, None)
 
     if entity_id not in _clients:
+        started = perf_counter()
         try:
             from composio import Composio
             _clients[entity_id] = Composio(api_key=_api_key)
-            logger.info("Created Composio client for entity_id=%s", entity_id)
+            log_event(
+                logger,
+                logging.INFO,
+                "composio.client.create",
+                entity_id=entity_id,
+                duration_ms=elapsed_ms(started),
+            )
         except Exception as exc:
-            logger.error(
-                "Failed to create Composio client for entity_id=%s: %s",
-                entity_id, exc,
+            log_exception(
+                logger,
+                "composio.client.create_failed",
+                exc,
+                entity_id=entity_id,
+                duration_ms=elapsed_ms(started),
             )
             return None
+    else:
+        log_event(logger, logging.DEBUG, "composio.client.cache_hit", entity_id=entity_id)
 
     return _clients[entity_id]
 
@@ -207,6 +224,26 @@ def _is_cache_fresh(cache_key: tuple[str, str]) -> bool:
     if cached_at is None:
         return False
     return (time.time() - cached_at) <= SCHEMA_CACHE_TTL_SECONDS
+
+
+def _auth_config_cache_get(toolkit_slug: str) -> Optional[str]:
+    cached = _auth_config_cache.get(toolkit_slug)
+    if not cached:
+        log_event(logger, logging.DEBUG, "composio.auth_config.cache_miss", toolkit_slug=toolkit_slug)
+        return None
+    cached_at, auth_config_id = cached
+    if (time.time() - cached_at) > AUTH_CONFIG_CACHE_TTL_SECONDS:
+        _auth_config_cache.pop(toolkit_slug, None)
+        log_event(logger, logging.DEBUG, "composio.auth_config.cache_stale", toolkit_slug=toolkit_slug)
+        return None
+    log_event(logger, logging.DEBUG, "composio.auth_config.cache_hit", toolkit_slug=toolkit_slug)
+    return auth_config_id
+
+
+def _auth_config_cache_set(toolkit_slug: str, auth_config_id: Optional[str]) -> Optional[str]:
+    if toolkit_slug and auth_config_id:
+        _auth_config_cache[toolkit_slug] = (time.time(), auth_config_id)
+    return auth_config_id
 
 
 def get_session(user_id: str, force_refresh: bool = False) -> Any | None:
@@ -262,13 +299,26 @@ def _find_auth_config_id(client: Any, toolkit_slug: str) -> Optional[str]:
     managed auth so new deployments don't require manual Composio
     dashboard setup.
     """
+    cached = _auth_config_cache_get(toolkit_slug)
+    if cached:
+        return cached
+
+    started = perf_counter()
     try:
         configs = client.auth_configs.list(toolkit_slug=toolkit_slug)
         config_items = _coerce_sequence(configs)
         for cfg in config_items:
             cfg_id = getattr(cfg, "id", None) or (cfg.get("id") if isinstance(cfg, dict) else None)
             if cfg_id:
-                return str(cfg_id)
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "composio.auth_config.lookup",
+                    toolkit_slug=toolkit_slug,
+                    cache_hit=False,
+                    duration_ms=elapsed_ms(started),
+                )
+                return _auth_config_cache_set(toolkit_slug, str(cfg_id))
     except Exception as exc:
         logger.warning(
             "Could not list auth_configs for toolkit_slug=%s: %s",
@@ -276,7 +326,7 @@ def _find_auth_config_id(client: Any, toolkit_slug: str) -> Optional[str]:
         )
 
     # No config found — try to auto-create with Composio managed auth.
-    return _auto_create_auth_config(client, toolkit_slug)
+    return _auth_config_cache_set(toolkit_slug, _auto_create_auth_config(client, toolkit_slug))
 
 
 def _auto_create_auth_config(client: Any, toolkit_slug: str) -> Optional[str]:
@@ -368,7 +418,17 @@ def get_toolkit_auth_details(toolkit: str) -> dict:
 
 
 def list_connected_accounts(user_id: str, toolkit: str = "", force_refresh: bool = False) -> list[dict]:
+    started = perf_counter()
     if not is_available():
+        log_event(
+            logger,
+            logging.INFO,
+            "composio.accounts.list",
+            user_id=user_id,
+            toolkit=toolkit,
+            available=False,
+            duration_ms=elapsed_ms(started),
+        )
         return []
 
     toolkit_slug = get_toolkit_slug(toolkit) if toolkit else ""
@@ -421,11 +481,25 @@ def list_connected_accounts(user_id: str, toolkit: str = "", force_refresh: bool
                     ),
                 }
             )
+        log_event(
+            logger,
+            logging.INFO,
+            "composio.accounts.list",
+            user_id=user_id,
+            toolkit=toolkit,
+            account_count=len(normalized),
+            force_refresh=force_refresh,
+            duration_ms=elapsed_ms(started),
+        )
         return normalized
     except Exception as exc:
-        logger.error(
-            "list_connected_accounts failed for user_id=%s toolkit=%s: %s",
-            user_id, toolkit, exc,
+        log_exception(
+            logger,
+            "composio.accounts.list_failed",
+            exc,
+            user_id=user_id,
+            toolkit=toolkit,
+            duration_ms=elapsed_ms(started),
         )
         return []
 
@@ -567,8 +641,18 @@ def get_connect_link(user_id: str, toolkit: str, callback_url: str = "") -> Opti
     SDK 1.0 uses ``client.connected_accounts.initiate(user_id, auth_config_id, ...)``
     which requires an ``auth_config_id``.  We look it up from the toolkit slug.
     """
+    started = perf_counter()
     if not is_available():
         logger.warning("Cannot generate connect link; Composio is unavailable.")
+        log_event(
+            logger,
+            logging.INFO,
+            "composio.connect_link",
+            user_id=user_id,
+            toolkit=toolkit,
+            available=False,
+            duration_ms=elapsed_ms(started),
+        )
         return None
 
     toolkit_config = get_toolkit_runtime_config(toolkit)
@@ -612,11 +696,25 @@ def get_connect_link(user_id: str, toolkit: str, callback_url: str = "") -> Opti
             auth_config_id=auth_config_id,
             **kwargs,
         )
-        return _extract_redirect_url(request)
+        link = _extract_redirect_url(request)
+        log_event(
+            logger,
+            logging.INFO,
+            "composio.connect_link",
+            user_id=user_id,
+            toolkit=toolkit,
+            has_link=bool(link),
+            duration_ms=elapsed_ms(started),
+        )
+        return link
     except Exception as exc:
-        logger.error(
-            "get_connect_link failed for user_id=%s toolkit=%s: %s",
-            user_id, toolkit, exc,
+        log_exception(
+            logger,
+            "composio.connect_link_failed",
+            exc,
+            user_id=user_id,
+            toolkit=toolkit,
+            duration_ms=elapsed_ms(started),
         )
         return None
 
@@ -639,6 +737,7 @@ def get_tool_schemas(user_id: str, tool_names: list[str] | None = None) -> list[
     if not actions:
         return []
 
+    started = perf_counter()
     entity_id = _entity_id(user_id)
     cached_results: dict[str, dict] = {}
     missing_actions: list[str] = []
@@ -650,6 +749,14 @@ def get_tool_schemas(user_id: str, tool_names: list[str] | None = None) -> list[
             missing_actions.append(action)
 
     if not missing_actions:
+        log_event(
+            logger,
+            logging.DEBUG,
+            "composio.schemas.cache_hit",
+            user_id=user_id,
+            tool_count=len(actions),
+            duration_ms=elapsed_ms(started),
+        )
         return [dict(cached_results[action]) for action in actions if action in cached_results]
 
     try:
@@ -671,9 +778,27 @@ def get_tool_schemas(user_id: str, tool_names: list[str] | None = None) -> list[
                     _schema_cache_times[(entity_id, tool_name)] = time.time()
                     fetched_results[tool_name] = normalized
         merged_results = {**cached_results, **fetched_results}
+        log_event(
+            logger,
+            logging.INFO,
+            "composio.schemas.fetch",
+            user_id=user_id,
+            requested_count=len(actions),
+            fetched_count=len(fetched_results),
+            cache_hit_count=len(cached_results),
+            duration_ms=elapsed_ms(started),
+        )
         return [dict(merged_results[action]) for action in actions if action in merged_results]
     except Exception as exc:
-        logger.error("get_tool_schemas failed for user_id=%s: %s", user_id, exc)
+        log_exception(
+            logger,
+            "composio.schemas.fetch_failed",
+            exc,
+            user_id=user_id,
+            requested_count=len(actions),
+            cache_hit_count=len(cached_results),
+            duration_ms=elapsed_ms(started),
+        )
         return [dict(cached_results[action]) for action in actions if action in cached_results]
 
 
@@ -710,8 +835,10 @@ def validate_tool_slug(tool_name: str) -> dict:
 
     cached = _catalog_validation_cache.get(tool_name)
     if cached and (time.time() - cached[0]) <= CATALOG_CACHE_TTL_SECONDS:
+        log_event(logger, logging.DEBUG, "composio.catalog.cache_hit", tool_name=tool_name)
         return dict(cached[1])
 
+    started = perf_counter()
     try:
         schemas = get_tool_schemas("__catalog__", [tool_name])
         result = {
@@ -720,6 +847,14 @@ def validate_tool_slug(tool_name: str) -> dict:
             "error": None,
         }
         _catalog_validation_cache[tool_name] = (time.time(), dict(result))
+        log_event(
+            logger,
+            logging.INFO,
+            "composio.catalog.validate",
+            tool_name=tool_name,
+            exists=result["exists"],
+            duration_ms=elapsed_ms(started),
+        )
         return result
     except Exception as exc:
         result = {
@@ -728,6 +863,13 @@ def validate_tool_slug(tool_name: str) -> dict:
             "error": str(exc),
         }
         _catalog_validation_cache[tool_name] = (time.time(), dict(result))
+        log_exception(
+            logger,
+            "composio.catalog.validate_failed",
+            exc,
+            tool_name=tool_name,
+            duration_ms=elapsed_ms(started),
+        )
         return result
 
 
@@ -752,6 +894,7 @@ def execute_tool(
                                avoids the "toolkit version not specified" error
                                that occurs in manual (non-framework) execution.
     """
+    started = perf_counter()
     client = _get_client(user_id)
     if client is None:
         raise RuntimeError(_import_error or "Composio client not available")
@@ -785,13 +928,26 @@ def execute_tool(
             **exec_kwargs,
         )
     except Exception as exc:
-        logger.error(
-            "execute_tool failed for user_id=%s tool_name=%s: %s",
-            user_id, tool_name, exc,
+        log_exception(
+            logger,
+            "composio.tool.execute_failed",
+            exc,
+            user_id=user_id,
+            tool_name=tool_name,
+            duration_ms=elapsed_ms(started),
         )
         raise
 
     normalized = _normalize_sdk_payload(result)
+    log_event(
+        logger,
+        logging.INFO,
+        "composio.tool.execute",
+        user_id=user_id,
+        tool_name=tool_name,
+        connected_account=bool(connected_account_id),
+        duration_ms=elapsed_ms(started),
+    )
     if isinstance(normalized, dict):
         return {
             "data": normalized.get("data", normalized),
@@ -804,3 +960,33 @@ def execute_tool(
         "error": None,
         "raw": normalized,
     }
+
+
+async def async_list_connected_accounts(user_id: str, toolkit: str = "", force_refresh: bool = False) -> list[dict]:
+    import asyncio
+    return await asyncio.to_thread(list_connected_accounts, user_id, toolkit, force_refresh)
+
+
+async def async_get_connect_link(user_id: str, toolkit: str, callback_url: str = "") -> Optional[str]:
+    import asyncio
+    return await asyncio.to_thread(get_connect_link, user_id, toolkit, callback_url)
+
+
+async def async_get_tool_schemas(user_id: str, tool_names: list[str] | None = None) -> list[dict]:
+    import asyncio
+    return await asyncio.to_thread(get_tool_schemas, user_id, tool_names)
+
+
+async def async_validate_tool_slug(tool_name: str) -> dict:
+    import asyncio
+    return await asyncio.to_thread(validate_tool_slug, tool_name)
+
+
+async def async_execute_tool(
+    user_id: str,
+    tool_name: str,
+    arguments: dict | None = None,
+    connected_account_id: str | None = None,
+) -> dict:
+    import asyncio
+    return await asyncio.to_thread(execute_tool, user_id, tool_name, arguments, connected_account_id)
