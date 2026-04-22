@@ -1,10 +1,10 @@
 # Google Authentication
 
-FastAPI is now the production auth boundary. The Streamlit app can still run in
-workspace-first local/dev mode, but production clients should sign in through the
-FastAPI `/auth/*` endpoints. When `SINTRA_AUTH_REQUIRED=1`, Streamlit also
-requires a backend-issued app session token before it renders workspace
-onboarding, chat, or connector controls.
+FastAPI is now the production auth boundary. A future React frontend should sign
+in through the FastAPI `/auth/*` endpoints and use `/auth/me` as the source of
+truth for current user, workspace, membership, and role state. Streamlit remains
+a workspace-first local/dev compatibility shell; this pass intentionally does
+not productize Streamlit Google login UI.
 
 ## Flow
 
@@ -51,7 +51,7 @@ stored as profile/contact metadata and is not used as the external identity key.
   `tool_connections.user_id` is reserved for a real future user id and must not be
   populated with `workspace_id`.
 
-## Streamlit Auth Mode
+## Streamlit Compatibility Mode
 
 When `SINTRA_AUTH_REQUIRED=0`, Streamlit keeps the legacy local workflow: it can
 list all workspaces and create anonymous workspaces. When
@@ -60,10 +60,9 @@ valid backend app session token. It stores only the backend-issued app session
 token and resolved safe user metadata; it does not store Google credentials,
 Google ID tokens, OAuth refresh tokens, or connector secrets.
 
-The current Streamlit login surface is intentionally minimal: sign in through a
-client that calls `POST /auth/google`, then paste the returned app session token
-into Streamlit. A native Streamlit Google button/custom component is a separate
-UI follow-up.
+The production login surface should be the React client using FastAPI auth
+contracts. A native Streamlit Google button/custom component is intentionally
+deferred and should not become a second production auth boundary.
 
 ## Backward Compatibility
 

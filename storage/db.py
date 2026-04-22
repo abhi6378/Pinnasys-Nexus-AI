@@ -204,6 +204,7 @@ class ConversationModel(Base):
     output = Column(Text, nullable=False)
     request_id = Column(String, default="", index=True)
     actor_user_id = Column(String, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    membership_id = Column(String, ForeignKey("workspace_memberships.id", ondelete="SET NULL"), nullable=True, index=True)
     metadata_json = Column(JSON, default=dict)
     created_at = Column(TZDateTime, default=utc_now)
 
@@ -223,6 +224,7 @@ class WorkflowRunModel(Base):
     status = Column(String, nullable=False, default="completed")
     request_id = Column(String, default="", index=True)
     actor_user_id = Column(String, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    membership_id = Column(String, ForeignKey("workspace_memberships.id", ondelete="SET NULL"), nullable=True, index=True)
     metadata_json = Column(JSON, default=dict)
     created_at = Column(TZDateTime, default=utc_now)
     updated_at = Column(TZDateTime, default=utc_now, onupdate=utc_now)

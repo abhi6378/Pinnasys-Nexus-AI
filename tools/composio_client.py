@@ -251,6 +251,16 @@ def get_session(user_id: str, force_refresh: bool = False) -> Any | None:
     return _get_client(user_id, force_refresh=force_refresh)
 
 
+def get_entity_session(workspace_entity_id: str, force_refresh: bool = False) -> Any | None:
+    """Entity-named adapter for callers that should not treat workspace id as user id."""
+    return _get_client(workspace_entity_id, force_refresh=force_refresh)
+
+
+def invalidate_entity_session(workspace_entity_id: str) -> None:
+    """Entity-named adapter for workspace-scoped Composio cache invalidation."""
+    invalidate_session(workspace_entity_id)
+
+
 # ── Resolution helpers ────────────────────────────────────────────────────────
 
 def _resolve_action(tool_name: str) -> str | None:

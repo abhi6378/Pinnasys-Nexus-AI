@@ -101,6 +101,7 @@ def execute_run(db, run_id: str) -> dict:
         resume_state=resume_state,
         connector_context=connector_context,
         actor_user_id=getattr(claimed, "actor_user_id", None) or getattr(task, "actor_user_id", None),
+        membership_id=getattr(claimed, "membership_id", None) or getattr(task, "membership_id", None),
     )
     log_event(
         logger,

@@ -132,6 +132,53 @@ def load_persisted_connector_context(
     )
 
 
+def resolve_persisted_connector_preference(
+    workspace_id: str,
+    db,
+    *,
+    user_id: str | None = None,
+    membership_id: str | None = None,
+) -> dict:
+    """Return the effective persisted connector preference plus winning scope."""
+    try:
+        try:
+            resolved = repo.resolve_workspace_connector_preference(
+                db,
+                workspace_id,
+                user_id=user_id,
+                membership_id=membership_id,
+            )
+        except AttributeError:
+            row = repo.get_workspace_connector_preference(
+                db,
+                workspace_id,
+                user_id=user_id,
+                membership_id=membership_id,
+            )
+            resolved = {
+                "row": row,
+                "winning_scope": getattr(row, "scope_type", "workspace") if row else "auto",
+            }
+    except Exception:
+        resolved = {"row": None, "winning_scope": "auto"}
+
+    row = resolved.get("row")
+    connector = load_persisted_connector_context(
+        workspace_id,
+        db,
+        user_id=user_id,
+        membership_id=membership_id,
+    ) if row else ConnectorContext()
+    return {
+        "workspace_id": workspace_id,
+        "scope_type": str(getattr(row, "scope_type", "") or resolved.get("winning_scope") or "auto"),
+        "winning_scope": str(resolved.get("winning_scope") or getattr(row, "scope_type", "") or "auto"),
+        "selected_by_user_id": str(getattr(row, "selected_by_user_id", "") or ""),
+        "connector_context": connector.to_dict(),
+        "updated_at": _isoformat(getattr(row, "updated_at", None)) if row else "",
+    }
+
+
 def persist_connector_context(
     workspace_id: str,
     connector_context: ConnectorContext | dict | None,

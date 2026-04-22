@@ -205,6 +205,7 @@ def _step(
         workflow_state=workflow_state,
         connector_context=effective_connector.to_dict(),
         actor_user_id=str(workflow_state.get("actor_user_id", "") or "") or None,
+        membership_id=str(workflow_state.get("membership_id", "") or "") or None,
     )
 
     interrupt_modes = {

@@ -335,6 +335,7 @@ def run_agent(
     route_context: dict | None = None,
     connector_context: ConnectorContext | dict | None = None,
     actor_user_id: str | None = None,
+    membership_id: str | None = None,
 ) -> dict:
     """
     Executes a single helper.
@@ -482,6 +483,7 @@ def run_agent(
         route_context=route_context,
         connector_context=connector_context,
         actor_user_id=actor_user_id,
+        membership_id=membership_id,
     )
 
 
@@ -502,6 +504,7 @@ def _run_with_tools(
     route_context: dict | None = None,
     connector_context: ConnectorContext | dict | None = None,
     actor_user_id: str | None = None,
+    membership_id: str | None = None,
 ) -> dict:
     """
     Calls the LLM with tool awareness. If the LLM requests a tool:
@@ -527,6 +530,8 @@ def _run_with_tools(
     execution_context = dict(workflow_state or {})
     if actor_user_id and "actor_user_id" not in execution_context:
         execution_context["actor_user_id"] = actor_user_id
+    if membership_id and "membership_id" not in execution_context:
+        execution_context["membership_id"] = membership_id
     if not connector.is_auto():
         execution_context.setdefault("connector_context", connector.to_dict())
     workflow_capability_hint = dict(execution_context.get("capability_hint", {}) or {})

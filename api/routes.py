@@ -33,11 +33,14 @@ from workspace.manager import create_workspace, list_workspaces, get_workspace_c
 from brain.quiz_engine import get_next_question, save_answer, quiz_progress
 from orchestrator.handler import handle_request
 from helpers.configs import list_agents
+from models.contracts import RuntimeActorContext
 from tools.connector_service import (
     list_connector_accounts,
     list_workspace_connectors,
     normalize_connector_context,
+    persist_connector_context,
     refresh_connector_status,
+    resolve_persisted_connector_preference,
 )
 from tools.composio_client import get_connect_link
 from tools.tool_registry import get_toolkit_metadata, normalize_toolkit_key
@@ -87,6 +90,8 @@ class WorkspaceSummary(BaseModel):
     id: str
     name: str
     created_at: str = ""
+    membership_id: str = ""
+    membership_role: str = ""
 
 class AuthStateResponse(BaseModel):
     authenticated: bool
@@ -109,6 +114,10 @@ class ConnectorContextRequest(BaseModel):
     source: str = "api"
 
     def to_connector_dict(self) -> dict[str, Any]:
+        default_membership = next(
+            (membership for row, membership in workspace_pairs if row.id == workspace.id),
+            workspace_pairs[0][1] if workspace_pairs else None,
+        )
         return {
             "mode": self.mode,
             "selected_toolkit": self.selected_toolkit,
@@ -119,6 +128,54 @@ class ConnectorContextRequest(BaseModel):
             "enforce_account": self.enforce_account,
             "source": self.source,
         }
+
+class ConnectorPreferenceUpdateRequest(BaseModel):
+    connector_context: ConnectorContextRequest = Field(default_factory=ConnectorContextRequest)
+
+class ConnectorPreferenceResponse(BaseModel):
+    workspace_id: str
+    scope_type: str = "auto"
+    winning_scope: str = "auto"
+    selected_by_user_id: str = ""
+    connector_context: dict[str, Any] = Field(default_factory=dict)
+    updated_at: str = ""
+
+class ConnectorAccountResponse(BaseModel):
+    toolkit: str = ""
+    connected_account_id: str = ""
+    account_alias: str = ""
+    display_label: str = ""
+    status: str = ""
+    is_default: bool = False
+    is_selected: bool = False
+    source: str = ""
+    last_verified_at: str = ""
+    stale: bool = False
+
+class ConnectorStatusResponse(BaseModel):
+    toolkit: str = ""
+    connector_key: str = ""
+    label: str = ""
+    slug: str = ""
+    connected: bool = False
+    status: str = ""
+    source: str = ""
+    validation_status: str = ""
+    status_reason: str = ""
+    stale: bool = False
+    stale_selection: bool = False
+    account_required: bool = False
+    account_count: int = 0
+    selected_account_id: str = ""
+    selected_account_alias: str = ""
+    effective_account_id: str = ""
+    effective_account_alias: str = ""
+    connect_url: Optional[str] = None
+    setup_message: str = ""
+    connection_mode: str = ""
+    auth_mode: str = ""
+    last_verified_at: str = ""
+    accounts: list[ConnectorAccountResponse] = Field(default_factory=list)
 
 class ChatRequest(BaseModel):
     workspace_id: str
@@ -196,10 +253,29 @@ class AutomationUpdateRequest(BaseModel):
 class RequestActor:
     user: Any | None = None
     membership: Any | None = None
+    workspace_id: str = ""
+    auth_required: bool = False
 
     @property
     def actor_user_id(self) -> str | None:
         return getattr(self.user, "id", None) if self.user else None
+
+    @property
+    def membership_id(self) -> str | None:
+        return getattr(self.membership, "id", None) if self.membership else None
+
+    @property
+    def membership_role(self) -> str:
+        return str(getattr(self.membership, "role", "") or "")
+
+    def to_runtime_context(self) -> RuntimeActorContext:
+        return RuntimeActorContext(
+            workspace_id=self.workspace_id,
+            actor_user_id=self.actor_user_id or "",
+            membership_id=self.membership_id or "",
+            auth_required=bool(self.auth_required),
+            membership_role=self.membership_role,
+        )
 
 
 def _current_user(request: Request, db: Session):
@@ -221,7 +297,12 @@ def _actor_for_workspace(request: Request, db: Session, workspace_id: str) -> Re
     user = _current_user(request, db)
     _require_workspace_if_needed(db, workspace_id, user)
     membership = repo.get_workspace_membership(db, workspace_id, user.id) if user else None
-    return RequestActor(user=user, membership=membership)
+    return RequestActor(
+        user=user,
+        membership=membership,
+        workspace_id=workspace_id,
+        auth_required=is_auth_required(),
+    )
 
 
 def _normalize_connector_payload(value: ConnectorContextRequest | None) -> dict | None:
@@ -245,8 +326,14 @@ def _normalize_connector_payload(value: ConnectorContextRequest | None) -> dict 
     return connector.to_dict()
 
 
-def _workspace_payload(ws) -> dict:
-    return {"id": ws.id, "name": ws.name, "created_at": str(getattr(ws, "created_at", "") or "")}
+def _workspace_payload(ws, membership=None) -> dict:
+    return {
+        "id": ws.id,
+        "name": ws.name,
+        "created_at": str(getattr(ws, "created_at", "") or ""),
+        "membership_id": str(getattr(membership, "id", "") or ""),
+        "membership_role": str(getattr(membership, "role", "") or ""),
+    }
 
 
 def _automation_task_for_workspace(db: Session, workspace_id: str, task_id: str):
@@ -275,11 +362,11 @@ def api_auth_google(req: GoogleAuthRequest, request: Request, response: Response
         user, workspace, session_token = sign_in_with_google_payload(db, payload)
         set_session_cookie(response, session_token)
         memberships = repo.list_user_memberships(db, user.id)
-        workspace_rows = [
-            repo.get_workspace(db, membership.workspace_id)
+        workspace_pairs = [
+            (repo.get_workspace(db, membership.workspace_id), membership)
             for membership in memberships
         ]
-        workspace_rows = [row for row in workspace_rows if row]
+        workspace_pairs = [(row, membership) for row, membership in workspace_pairs if row]
         return {
             "authenticated": True,
             "user": {
@@ -288,8 +375,8 @@ def api_auth_google(req: GoogleAuthRequest, request: Request, response: Response
                 "display_name": user.display_name,
                 "avatar_url": user.avatar_url,
             },
-            "default_workspace": _workspace_payload(workspace),
-            "workspaces": [_workspace_payload(row) for row in workspace_rows],
+            "default_workspace": _workspace_payload(workspace, default_membership),
+            "workspaces": [_workspace_payload(row, membership) for row, membership in workspace_pairs],
             "access_token": session_token,
             "token_type": "bearer",
         }
@@ -304,16 +391,16 @@ def api_auth_me(request: Request, db: Session = Depends(get_db)):
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
             return {"authenticated": False, "user": None, "workspaces": []}
         memberships = repo.list_user_memberships(db, user.id)
-        workspaces = [
-            repo.get_workspace(db, membership.workspace_id)
+        workspace_pairs = [
+            (repo.get_workspace(db, membership.workspace_id), membership)
             for membership in memberships
         ]
-        workspaces = [workspace for workspace in workspaces if workspace]
+        workspace_pairs = [(workspace, membership) for workspace, membership in workspace_pairs if workspace]
         return {
             "authenticated": True,
             "user": user.to_dict(),
-            "workspaces": [_workspace_payload(workspace) for workspace in workspaces],
-            "default_workspace": _workspace_payload(workspaces[0]) if workspaces else None,
+            "workspaces": [_workspace_payload(workspace, membership) for workspace, membership in workspace_pairs],
+            "default_workspace": _workspace_payload(workspace_pairs[0][0], workspace_pairs[0][1]) if workspace_pairs else None,
         }
 
 
@@ -341,7 +428,13 @@ def api_create_workspace(req: CreateWorkspaceRequest, request: Request, db: Sess
 def api_list_workspaces(request: Request, db: Session = Depends(get_db)):
     user = _current_user(request, db)
     if user:
-        return [_workspace_payload(ws) for ws in repo.list_workspaces_for_user(db, user.id)]
+        memberships = repo.list_user_memberships(db, user.id)
+        payloads = []
+        for membership in memberships:
+            workspace = repo.get_workspace(db, membership.workspace_id)
+            if workspace:
+                payloads.append(_workspace_payload(workspace, membership))
+        return payloads
     if is_auth_required():
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
     return list_workspaces(db)
@@ -370,6 +463,7 @@ def api_chat(req: ChatRequest, request: Request, db: Session = Depends(get_db)):
             force_agent=req.agent,
             connector_context=connector_context,
             actor_user_id=actor.actor_user_id,
+            membership_id=actor.membership_id,
         )
         return result
 
@@ -413,7 +507,11 @@ def api_chat_resume(req: ResumeRequest, request: Request, db: Session = Depends(
             )
 
         # Determine if this was a workflow resume
-        context = pending.context_json or {}
+        context = dict(pending.context_json or {})
+        if actor.actor_user_id:
+            context.setdefault("actor_user_id", actor.actor_user_id)
+        if actor.membership_id:
+            context.setdefault("membership_id", actor.membership_id)
         wf_key = context.get("workflow_key")
         connector_context = context.get("connector_context")
 
@@ -427,6 +525,7 @@ def api_chat_resume(req: ResumeRequest, request: Request, db: Session = Depends(
             resume_state=context,
             connector_context=connector_context,
             actor_user_id=actor.actor_user_id,
+            membership_id=actor.membership_id,
         )
         automation_service.complete_run_from_resume(db, context.get("scheduled_run_id"), result)
         if result.get("mode") not in {
@@ -459,6 +558,10 @@ def api_chat_approve(req: ApproveRequest, request: Request, db: Session = Depend
         mark_request_resumed(db, req.resume_token)
 
         context = dict(getattr(pending, "context_json", {}) or {})
+        if actor.actor_user_id:
+            context.setdefault("actor_user_id", actor.actor_user_id)
+        if actor.membership_id:
+            context.setdefault("membership_id", actor.membership_id)
         context["approval_granted"] = True
         approved_keys = list(context.get("approved_idempotency_keys", []) or [])
         if getattr(pending, "idempotency_key", "") and pending.idempotency_key not in approved_keys:
@@ -476,6 +579,7 @@ def api_chat_approve(req: ApproveRequest, request: Request, db: Session = Depend
             resume_state=context,
             connector_context=connector_context,
             actor_user_id=actor.actor_user_id,
+            membership_id=actor.membership_id,
         )
         automation_service.complete_run_from_resume(db, context.get("scheduled_run_id"), result)
         if result.get("mode") not in {
@@ -554,7 +658,7 @@ def api_list_helpers():
     return list_agents()
 
 
-@app.get("/workspace/{workspace_id}/connectors")
+@app.get("/workspace/{workspace_id}/connectors", response_model=list[ConnectorStatusResponse])
 def api_list_connectors(workspace_id: str, request: Request, refresh: bool = False, selected_toolkit: str = "", db: Session = Depends(get_db)):
     with timed_log(logger, "api.connectors.list", workspace_id=workspace_id, refresh=refresh, selected_toolkit=selected_toolkit):
         _actor_for_workspace(request, db, workspace_id)
@@ -568,7 +672,46 @@ def api_list_connectors(workspace_id: str, request: Request, refresh: bool = Fal
         )
 
 
-@app.get("/workspace/{workspace_id}/connectors/{toolkit}/accounts")
+@app.get("/workspace/{workspace_id}/connector-preference", response_model=ConnectorPreferenceResponse)
+def api_get_connector_preference(workspace_id: str, request: Request, db: Session = Depends(get_db)):
+    actor = _actor_for_workspace(request, db, workspace_id)
+    resolved = resolve_persisted_connector_preference(
+        workspace_id,
+        db,
+        user_id=actor.actor_user_id,
+        membership_id=actor.membership_id,
+    )
+    return resolved
+
+
+@app.put("/workspace/{workspace_id}/connector-preference", response_model=ConnectorPreferenceResponse)
+def api_put_connector_preference(
+    workspace_id: str,
+    req: ConnectorPreferenceUpdateRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    actor = _actor_for_workspace(request, db, workspace_id)
+    scope_type = "membership" if actor.membership_id else ("user" if actor.actor_user_id else "workspace")
+    connector_context = _normalize_connector_payload(req.connector_context) or {}
+    persist_connector_context(
+        workspace_id,
+        connector_context,
+        db,
+        scope_type=scope_type,
+        user_id=actor.actor_user_id,
+        membership_id=actor.membership_id,
+        selected_by_user_id=actor.actor_user_id,
+    )
+    return resolve_persisted_connector_preference(
+        workspace_id,
+        db,
+        user_id=actor.actor_user_id,
+        membership_id=actor.membership_id,
+    )
+
+
+@app.get("/workspace/{workspace_id}/connectors/{toolkit}/accounts", response_model=list[ConnectorAccountResponse])
 def api_list_connector_accounts(workspace_id: str, toolkit: str, request: Request, refresh: bool = False, db: Session = Depends(get_db)):
     with timed_log(logger, "api.connectors.accounts", workspace_id=workspace_id, toolkit=toolkit, refresh=refresh):
         _actor_for_workspace(request, db, workspace_id)
@@ -589,7 +732,7 @@ def api_get_connector_link(workspace_id: str, toolkit: str, request: Request, db
     return {"connect_url": get_connect_link(workspace_id, toolkit)}
 
 
-@app.post("/workspace/{workspace_id}/connectors/{toolkit}/refresh")
+@app.post("/workspace/{workspace_id}/connectors/{toolkit}/refresh", response_model=ConnectorStatusResponse)
 def api_refresh_connector(workspace_id: str, toolkit: str, request: Request, db: Session = Depends(get_db)):
     with timed_log(logger, "api.connectors.refresh", workspace_id=workspace_id, toolkit=toolkit):
         _actor_for_workspace(request, db, workspace_id)
@@ -622,6 +765,7 @@ def api_accept_idea(idea_id: str, request: Request, db: Session = Depends(get_db
         idea.description, idea.workspace_id, db,
         force_workflow=hint if hint not in ("", "none") else None,
         actor_user_id=actor.actor_user_id,
+        membership_id=actor.membership_id,
     )
     return {
         "accepted": True,
@@ -645,7 +789,9 @@ def api_conversations(workspace_id: str, request: Request, db: Session = Depends
     _actor_for_workspace(request, db, workspace_id)
     convs = repo.get_conversations(db, workspace_id)
     return [{"id": c.id, "helper": c.helper, "input": c.input,
-             "output": c.output[:300], "created_at": str(c.created_at)}
+             "output": c.output[:300], "created_at": str(c.created_at),
+             "actor_user_id": getattr(c, "actor_user_id", "") or "",
+             "membership_id": getattr(c, "membership_id", "") or ""}
             for c in convs]
 
 
@@ -657,7 +803,9 @@ def api_workflow_history(workspace_id: str, request: Request, db: Session = Depe
     runs = repo.get_workflow_runs(db, workspace_id)
     return [{"id": r.id, "workflow_name": r.workflow_name,
              "steps": r.steps, "final_output": r.final_output[:300],
-             "created_at": str(r.created_at)} for r in runs]
+             "created_at": str(r.created_at),
+             "actor_user_id": getattr(r, "actor_user_id", "") or "",
+             "membership_id": getattr(r, "membership_id", "") or ""} for r in runs]
 
 
 # ── Automations ──────────────────────────────────────────────────────────────
@@ -670,7 +818,7 @@ def api_create_automation(workspace_id: str, req: AutomationCreateRequest, reque
             db,
             workspace_id=workspace_id,
             actor_user_id=actor.actor_user_id,
-            membership_id=getattr(actor.membership, "id", None),
+            membership_id=actor.membership_id,
             schedule=req.schedule.model_dump(),
             payload=req.payload.model_dump(),
             connector_context=_normalize_connector_payload(req.connector_context),

@@ -14,6 +14,7 @@ class ToolIdempotencyRecordModel(Base):
     id = Column(String, primary_key=True, default=new_id)
     workspace_id = Column(String, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
     actor_user_id = Column(String, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    membership_id = Column(String, ForeignKey("workspace_memberships.id", ondelete="SET NULL"), nullable=True, index=True)
     tool_name = Column(String, nullable=False, index=True)
     idempotency_key = Column(String, nullable=False, index=True)
     input_hash = Column(String, default="")

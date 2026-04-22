@@ -177,7 +177,8 @@ def _exec_single_agent(agent_key: str, user_input: str,
                         resume_state: dict = None,
                         route_context: dict | None = None,
                         connector_context: dict | None = None,
-                        actor_user_id: str | None = None) -> dict:
+                        actor_user_id: str | None = None,
+                        membership_id: str | None = None) -> dict:
     """Execute a single agent and return a standardised result dict.
 
     When workspace_id and db are provided, the agent runs in tool-aware
@@ -215,15 +216,21 @@ def _exec_single_agent(agent_key: str, user_input: str,
         has_history=bool(history),
         is_resume=bool(resume_state),
     )
+    agent_state = dict(resume_state or {})
+    if actor_user_id and "actor_user_id" not in agent_state:
+        agent_state["actor_user_id"] = actor_user_id
+    if membership_id and "membership_id" not in agent_state:
+        agent_state["membership_id"] = membership_id
     agent_result = run_agent(
         agent_key, user_input, brain_context,
         workspace_id=workspace_id,
         db=db,
-        workflow_state=resume_state,
+        workflow_state=agent_state or resume_state,
         history=history,
         route_context=route_context,
         connector_context=connector_context,
         actor_user_id=actor_user_id,
+        membership_id=membership_id,
     )
     log_event(
         logger,
@@ -320,11 +327,14 @@ def _exec_workflow(workflow_key: str, user_input: str,
                     db: Session, resume_state: dict = None,
                     connector_context: dict | None = None,
                     request_id: str = "",
-                    actor_user_id: str | None = None) -> dict:
+                    actor_user_id: str | None = None,
+                    membership_id: str | None = None) -> dict:
     """Execute a workflow chain and return a standardised result dict."""
     workflow_resume_state = dict(resume_state or {})
     if actor_user_id and "actor_user_id" not in workflow_resume_state:
         workflow_resume_state["actor_user_id"] = actor_user_id
+    if membership_id and "membership_id" not in workflow_resume_state:
+        workflow_resume_state["membership_id"] = membership_id
     wf_result = run_workflow(
         workflow_key, user_input, brain_context,
         workspace_id=workspace_id, db=db,
@@ -347,6 +357,7 @@ def _exec_workflow(workflow_key: str, user_input: str,
             status="paused",
             request_id=request_id,
             actor_user_id=actor_user_id,
+            membership_id=membership_id,
             metadata_json={
                 "mode": interrupt_mode,
                 "workflow_paused": True,
@@ -390,6 +401,7 @@ def _exec_workflow(workflow_key: str, user_input: str,
             status="failed" if mode == "tool_error" else "paused",
             request_id=request_id,
             actor_user_id=actor_user_id,
+            membership_id=membership_id,
             metadata_json={
                 "mode": mode,
                 "step_label": wf_result.get("step_label"),
@@ -428,6 +440,7 @@ def _exec_workflow(workflow_key: str, user_input: str,
         status="completed",
         request_id=request_id,
         actor_user_id=actor_user_id,
+        membership_id=membership_id,
         metadata_json={"mode": "workflow", "resumed": bool(resume_state)},
     )
     return result
@@ -460,7 +473,8 @@ def _auto_route(user_input: str, workspace_id: str, db: Session,
                 resume_state: dict = None,
                 connector_context: dict | None = None,
                 request_id: str = "",
-                actor_user_id: str | None = None) -> dict:
+                actor_user_id: str | None = None,
+                membership_id: str | None = None) -> dict:
     """
     Primary auto-routing path. Tries the LLM router first; falls back to
     legacy keyword → LLM detection if the router fails.
@@ -490,6 +504,7 @@ def _auto_route(user_input: str, workspace_id: str, db: Session,
                 route_context=route,
                 connector_context=connector_context,
                 actor_user_id=actor_user_id,
+                membership_id=membership_id,
             )
 
         if route_type == "workflow":
@@ -501,6 +516,7 @@ def _auto_route(user_input: str, workspace_id: str, db: Session,
                     connector_context=connector_context,
                     request_id=request_id,
                     actor_user_id=actor_user_id,
+                    membership_id=membership_id,
                 )
             # Router returned a workflow type but no valid key — fall through
             # to legacy detection which may find the right workflow.
@@ -536,6 +552,7 @@ def _auto_route(user_input: str, workspace_id: str, db: Session,
             connector_context=connector_context,
             request_id=request_id,
             actor_user_id=actor_user_id,
+            membership_id=membership_id,
         )
 
     agent_key = detect_agent(user_input)
@@ -565,7 +582,8 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
                    force_workflow: str = None,
                    resume_state: dict = None,
                    connector_context: dict | None = None,
-                   actor_user_id: str | None = None) -> dict:
+                   actor_user_id: str | None = None,
+                   membership_id: str | None = None) -> dict:
     """
     Main orchestrator function. Called by API and UI.
 
@@ -593,6 +611,11 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
     if isinstance(local_resume_state, dict) and not local_resume_state.get("request_id"):
         local_resume_state = dict(local_resume_state)
         local_resume_state["request_id"] = request_id
+    if isinstance(local_resume_state, dict):
+        if actor_user_id and "actor_user_id" not in local_resume_state:
+            local_resume_state["actor_user_id"] = actor_user_id
+        if membership_id and "membership_id" not in local_resume_state:
+            local_resume_state["membership_id"] = membership_id
 
     with request_context(request_id=request_id, workspace_id=workspace_id):
         request_cache: dict[str, object] = {}
@@ -636,7 +659,7 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
                 workflow_key=workflow_hint,
                 connector_context=normalized_connector.to_dict(),
                 actor_user_id=actor_user_id,
-                membership_id=str((local_resume_state or {}).get("membership_id", "") or "") or None,
+                membership_id=membership_id,
             )
             if schedule_result:
                 repo.save_conversation(
@@ -651,6 +674,7 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
                         "automation_id": schedule_result.get("automation", {}).get("id", ""),
                     },
                     actor_user_id=actor_user_id,
+                    membership_id=membership_id,
                 )
                 return schedule_result
 
@@ -666,6 +690,7 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
                 resume_state=local_resume_state,
                 connector_context=normalized_connector.to_dict(),
                 actor_user_id=actor_user_id,
+                membership_id=membership_id,
             )
         elif force_workflow and force_workflow in WORKFLOWS:
             result = _exec_workflow(
@@ -674,6 +699,7 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
                 connector_context=normalized_connector.to_dict(),
                 request_id=request_id,
                 actor_user_id=actor_user_id,
+                membership_id=membership_id,
             )
         else:
             result = _auto_route(
@@ -685,6 +711,7 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
                 connector_context=normalized_connector.to_dict(),
                 request_id=request_id,
                 actor_user_id=actor_user_id,
+                membership_id=membership_id,
             )
 
         # 3. Save conversation — always, including on workflow error / clarify / reject,
@@ -704,6 +731,7 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
                 "workflow_resumed": bool(local_resume_state),
             },
             actor_user_id=actor_user_id,
+            membership_id=membership_id,
         )
 
         # 4. Auto-extract memory — skip on error, clarify, reject, and connect_required.

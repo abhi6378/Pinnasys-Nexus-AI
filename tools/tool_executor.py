@@ -293,6 +293,7 @@ def _upsert_idempotency_record(
     error_message: str = "",
     completed: bool = False,
     actor_user_id: str | None = None,
+    membership_id: str | None = None,
 ) -> ToolIdempotencyRecordModel | None:
     if not idempotency_key:
         return None
@@ -312,6 +313,7 @@ def _upsert_idempotency_record(
                     error_message=error_message,
                     completed=completed,
                     actor_user_id=actor_user_id,
+                    membership_id=membership_id,
                 )
             except Exception:
                 pass
@@ -332,6 +334,7 @@ def _upsert_idempotency_record(
                 updated_at=utc_now(),
                 completed_at=utc_now() if completed else None,
                 actor_user_id=actor_user_id,
+                membership_id=membership_id,
             )
             db.add(row)
         else:
@@ -352,6 +355,8 @@ def _upsert_idempotency_record(
                 row.completed_at = utc_now()
             if actor_user_id:
                 row.actor_user_id = actor_user_id
+            if membership_id:
+                row.membership_id = membership_id
         db.commit()
         return row
     except Exception as exc:
@@ -414,6 +419,7 @@ def _log_attempt(
     pending_kind: str = "",
     approval_required: bool = False,
     actor_user_id: str | None = None,
+    membership_id: str | None = None,
 ) -> ToolCallLogModel:
     """
     Write one row to tool_call_logs. Called for EVERY attempt, regardless
@@ -424,6 +430,7 @@ def _log_attempt(
             id=str(uuid.uuid4()),
             workspace_id=workspace_id,
             actor_user_id=actor_user_id,
+            membership_id=membership_id,
             agent_key=agent_key,
             tool_name=tool_name,
             toolkit=toolkit,
@@ -480,6 +487,7 @@ def _save_pending_request(
     """
     try:
         actor_user_id = str((context_json or {}).get("actor_user_id", "") or "") or None
+        membership_id = str((context_json or {}).get("membership_id", "") or "") or None
         if _can_use_repo_helpers(db):
             try:
                 return repo.save_pending_tool_request(
@@ -497,6 +505,7 @@ def _save_pending_request(
                     approval_requirement_json=approval_requirement,
                     approved=approved,
                     actor_user_id=actor_user_id,
+                    membership_id=membership_id,
                 )
             except Exception:
                 pass
@@ -522,6 +531,10 @@ def _save_pending_request(
             existing.approval_requirement_json = dict(approval_requirement or getattr(existing, "approval_requirement_json", {}) or {})
             existing.approved = bool(approved)
             existing.approved_at = utc_now() if approved else getattr(existing, "approved_at", None)
+            if actor_user_id:
+                existing.actor_user_id = actor_user_id
+            if membership_id:
+                existing.membership_id = membership_id
             existing.updated_at = utc_now()
             db.commit()
             return existing
@@ -544,6 +557,7 @@ def _save_pending_request(
             created_at=utc_now(),
             updated_at=utc_now(),
             actor_user_id=actor_user_id,
+            membership_id=membership_id,
         )
         db.add(row)
         db.commit()
@@ -752,6 +766,7 @@ def attempt_tool_call(
     """
     start = time.time()
     actor_user_id = str((context_json or {}).get("actor_user_id", "") or "") or None
+    membership_id = str((context_json or {}).get("membership_id", "") or "") or None
     log_event(
         logger,
         logging.INFO,
@@ -769,6 +784,7 @@ def attempt_tool_call(
             db, workspace_id, agent_key, tool_name, "",
             "invalid_tool", input_args, error_message=result["error"],
             actor_user_id=actor_user_id,
+            membership_id=membership_id,
         )
         return result
 
@@ -790,6 +806,7 @@ def attempt_tool_call(
             db, workspace_id, agent_key, tool_name, toolkit,
             "validation_error", input_args, error_message=result["error"],
             actor_user_id=actor_user_id,
+            membership_id=membership_id,
         )
         return result
 
@@ -804,6 +821,7 @@ def attempt_tool_call(
                 db, workspace_id, agent_key, tool_name, toolkit,
                 "invalid_tool", input_args, error_message=error_msg,
                 actor_user_id=actor_user_id,
+                membership_id=membership_id,
             )
             return _fail("invalid_tool", error_msg)
         if not catalog_check.get("available") and catalog_check.get("error"):
@@ -839,6 +857,7 @@ def attempt_tool_call(
             db, workspace_id, agent_key, tool_name, toolkit,
             "validation_error", input_args, error_message=result["error"],
             actor_user_id=actor_user_id,
+            membership_id=membership_id,
         )
         return result
 
@@ -858,6 +877,7 @@ def attempt_tool_call(
                         input_hash=input_hash,
                         status="in_progress",
                         actor_user_id=actor_user_id,
+                        membership_id=membership_id,
                     )
                 except Exception:
                     idempotency_record = None
@@ -870,6 +890,7 @@ def attempt_tool_call(
                     input_hash=input_hash,
                     status="in_progress",
                     actor_user_id=actor_user_id,
+                    membership_id=membership_id,
                 )
         if idempotency_record and getattr(idempotency_record, "input_hash", "") and idempotency_record.input_hash != input_hash:
             error_message = "The same idempotency key was reused for a different write payload."
@@ -879,6 +900,7 @@ def attempt_tool_call(
                 idempotency_key=idempotency_key,
                 approval_required=approval_requirement.required,
                 actor_user_id=actor_user_id,
+                membership_id=membership_id,
             )
             return _fail("validation_error", error_message)
 
@@ -934,6 +956,7 @@ def attempt_tool_call(
                 input_hash=input_hash,
                 status="in_progress",
                 actor_user_id=actor_user_id,
+                membership_id=membership_id,
             )
 
     # ── Step 5: Check connection (local cache, then remote live check) ───
@@ -1037,6 +1060,7 @@ def attempt_tool_call(
                     status="pending_auth",
                     pending_request_id=getattr(pending_row, "id", ""),
                     actor_user_id=actor_user_id,
+                    membership_id=membership_id,
                 )
 
         elapsed = (time.time() - start) * 1000
@@ -1050,6 +1074,7 @@ def attempt_tool_call(
             pending_kind="auth" if connect_url else "",
             approval_required=approval_requirement.required,
             actor_user_id=actor_user_id,
+            membership_id=membership_id,
         )
         if write_action and not connect_url:
             _upsert_idempotency_record(
@@ -1061,6 +1086,7 @@ def attempt_tool_call(
                 status="failure",
                 error_message=error_detail or conn_info.get("error") or f"Auth unavailable for {toolkit}",
                 actor_user_id=actor_user_id,
+                membership_id=membership_id,
             )
 
         return _connect_required(
@@ -1097,6 +1123,7 @@ def attempt_tool_call(
             status="pending_approval",
             pending_request_id=getattr(pending_row, "id", "") if pending_row else "",
             actor_user_id=actor_user_id,
+            membership_id=membership_id,
         )
         elapsed = (time.time() - start) * 1000
         _log_attempt(
@@ -1113,6 +1140,7 @@ def attempt_tool_call(
             pending_kind="approval",
             approval_required=True,
             actor_user_id=actor_user_id,
+            membership_id=membership_id,
         )
         return {
             "status": "validation_error",
@@ -1152,6 +1180,7 @@ def attempt_tool_call(
                 idempotency_key=idempotency_key,
                 approval_required=approval_requirement.required,
                 actor_user_id=actor_user_id,
+                membership_id=membership_id,
             )
             if write_action:
                 _upsert_idempotency_record(
@@ -1165,6 +1194,7 @@ def attempt_tool_call(
                     output_json=output_data if isinstance(output_data, dict) else {"data": output_data},
                     error_message=str(error_text),
                     actor_user_id=actor_user_id,
+                    membership_id=membership_id,
                 )
             return _fail("failure", str(error_text), elapsed)
 
@@ -1191,6 +1221,7 @@ def attempt_tool_call(
             idempotency_key=idempotency_key,
             approval_required=approval_requirement.required,
             actor_user_id=actor_user_id,
+            membership_id=membership_id,
         )
         if write_action:
             _upsert_idempotency_record(
@@ -1204,6 +1235,7 @@ def attempt_tool_call(
                 output_json=output_data if isinstance(output_data, dict) else {"data": output_data},
                 completed=True,
                 actor_user_id=actor_user_id,
+                membership_id=membership_id,
             )
 
         return {
@@ -1236,6 +1268,7 @@ def attempt_tool_call(
             idempotency_key=idempotency_key,
             approval_required=approval_requirement.required,
             actor_user_id=actor_user_id,
+            membership_id=membership_id,
         )
         if write_action:
             _upsert_idempotency_record(
@@ -1248,6 +1281,7 @@ def attempt_tool_call(
                 tool_call_log_id=getattr(call_log, "id", ""),
                 error_message=error_str,
                 actor_user_id=actor_user_id,
+                membership_id=membership_id,
             )
 
         return _fail("failure", error_str, elapsed)

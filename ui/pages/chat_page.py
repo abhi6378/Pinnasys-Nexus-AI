@@ -456,6 +456,7 @@ def _render_connector_controls(workspace_id: str, db) -> dict:
 def render_chat(auth_user=None):
     ws_id = st.session_state.workspace_id
     actor_user_id = getattr(auth_user, "id", None) if auth_user else None
+    membership_id = None
     ensure_connector_state(st.session_state)
     st.session_state.setdefault("pending_tool_approval", None)
 
@@ -463,6 +464,7 @@ def render_chat(auth_user=None):
 
     db = SessionLocal()
     try:
+        membership_id = get_state_membership_id(db, st.session_state, ws_id) if actor_user_id else None
         # ── Brain AI quiz nudge ───────────────────────────────────────────────
         progress = quiz_progress(ws_id, db)
         if not progress["complete"]:
@@ -641,6 +643,10 @@ def render_chat(auth_user=None):
                     mark_request_approved(db, resume_token)
                     mark_request_resumed(db, resume_token)
                     context = dict(getattr(pending, "context_json", {}) or {})
+                    if actor_user_id:
+                        context.setdefault("actor_user_id", actor_user_id)
+                    if membership_id:
+                        context.setdefault("membership_id", membership_id)
                     context["approval_granted"] = True
                     approved_keys = list(context.get("approved_idempotency_keys", []) or [])
                     if getattr(pending, "idempotency_key", "") and pending.idempotency_key not in approved_keys:
@@ -658,6 +664,7 @@ def render_chat(auth_user=None):
                             resume_state=context,
                             connector_context=retry_connector_context,
                             actor_user_id=actor_user_id,
+                            membership_id=membership_id,
                         )
                     if result.get("mode") not in {
                         "connect_required", "auth_unavailable", "invalid_tool",
@@ -700,7 +707,11 @@ def render_chat(auth_user=None):
                         if getattr(pending, "requested_toolkit", ""):
                             refresh_connector_status(ws_id, pending.requested_toolkit, db, request_cache={})
                         mark_request_resumed(db, resume_token)
-                        context = pending.context_json or {}
+                        context = dict(pending.context_json or {})
+                        if actor_user_id:
+                            context.setdefault("actor_user_id", actor_user_id)
+                        if membership_id:
+                            context.setdefault("membership_id", membership_id)
                         workflow_key = context.get("workflow_key")
                         retry_connector_context = context.get("connector_context") or build_connector_context(st.session_state)
                         result = handle_request(
@@ -712,6 +723,7 @@ def render_chat(auth_user=None):
                             resume_state=context,
                             connector_context=retry_connector_context,
                             actor_user_id=actor_user_id,
+                            membership_id=membership_id,
                         )
                         if result.get("mode") not in {
                             "connect_required", "auth_unavailable", "invalid_tool",
@@ -726,6 +738,7 @@ def render_chat(auth_user=None):
                             force_agent=st.session_state.selected_agent,
                             connector_context=build_connector_context(st.session_state),
                             actor_user_id=actor_user_id,
+                            membership_id=membership_id,
                         )
                 else:
                     result = handle_request(
@@ -735,6 +748,7 @@ def render_chat(auth_user=None):
                         force_agent=st.session_state.selected_agent,
                         connector_context=build_connector_context(st.session_state),
                         actor_user_id=actor_user_id,
+                        membership_id=membership_id,
                     )
 
             if result.get("connector_context"):
@@ -772,6 +786,7 @@ def render_chat(auth_user=None):
                     force_agent=selected,
                     connector_context=connector_context,
                     actor_user_id=actor_user_id,
+                    membership_id=membership_id,
                 )
 
             if result.get("connector_context"):

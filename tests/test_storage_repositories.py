@@ -468,6 +468,40 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(row.selected_account_alias, "Sales")
         self.assertEqual(row.source, "chat_input")
 
+    def test_resolve_workspace_connector_preference_prefers_membership_then_user_then_workspace(self):
+        workspace_row = self.repo.WorkspaceConnectorPreferenceModel(scope_type="workspace", selected_toolkit="GMAIL")
+        user_row = self.repo.WorkspaceConnectorPreferenceModel(scope_type="user", selected_toolkit="SLACK")
+        membership_row = self.repo.WorkspaceConnectorPreferenceModel(scope_type="membership", selected_toolkit="HUBSPOT")
+
+        def by_scope(_db, _workspace_id, *, scope_type, user_id=None, membership_id=None):
+            return {
+                "workspace": workspace_row,
+                "user": user_row if user_id == "user-1" else None,
+                "membership": membership_row if membership_id == "member-1" else None,
+            }[scope_type]
+
+        with patch_attr(self.repo, "_get_workspace_connector_preference_by_scope", by_scope):
+            resolved = self.repo.resolve_workspace_connector_preference(
+                object(),
+                "ws-1",
+                user_id="user-1",
+                membership_id="member-1",
+            )
+            self.assertEqual(resolved["winning_scope"], "membership")
+            self.assertEqual(resolved["row"].selected_toolkit, "HUBSPOT")
+
+            resolved = self.repo.resolve_workspace_connector_preference(
+                object(),
+                "ws-1",
+                user_id="user-1",
+            )
+            self.assertEqual(resolved["winning_scope"], "user")
+            self.assertEqual(resolved["row"].selected_toolkit, "SLACK")
+
+            resolved = self.repo.resolve_workspace_connector_preference(object(), "ws-1")
+            self.assertEqual(resolved["winning_scope"], "workspace")
+            self.assertEqual(resolved["row"].selected_toolkit, "GMAIL")
+
     def test_save_pending_tool_request_sets_expiry_and_reuses_existing_rows(self):
         existing = self.repo._pending_tool_request_model(
             workspace_id="ws-1",
@@ -500,11 +534,15 @@ class RepositoryTests(unittest.TestCase):
             context_json={"workflow_key": "email_triage"},
             idempotency_key="idem-1",
             approval_requirement_json={"required": True},
+            actor_user_id="user-1",
+            membership_id="member-1",
         )
 
         self.assertEqual(row.resume_token, "new-token")
         self.assertEqual(row.context_json, {"workflow_key": "email_triage"})
         self.assertEqual(row.idempotency_key, "idem-1")
+        self.assertEqual(row.actor_user_id, "user-1")
+        self.assertEqual(row.membership_id, "member-1")
         self.assertIsNotNone(row.expires_at)
 
     def test_transition_pending_tool_request_updates_status_conditionally(self):
@@ -561,10 +599,14 @@ class RepositoryTests(unittest.TestCase):
                 "idem-1",
                 input_hash="hash-1",
                 status="in_progress",
+                actor_user_id="user-1",
+                membership_id="member-1",
             )
 
         self.assertEqual(row.id, "idem-row")
         self.assertEqual(row.status, "in_progress")
+        self.assertEqual(row.actor_user_id, "user-1")
+        self.assertEqual(row.membership_id, "member-1")
         query.first_result = row
         updated = self.repo.update_tool_idempotency_record(
             db,
@@ -574,6 +616,8 @@ class RepositoryTests(unittest.TestCase):
             status="success",
             output_json={"ok": True},
             completed=True,
+            membership_id="member-2",
         )
         self.assertEqual(updated.status, "success")
         self.assertEqual(updated.output_json, {"ok": True})
+        self.assertEqual(updated.membership_id, "member-2")

@@ -169,6 +169,34 @@ class ExecutionConstraint:
 
 
 @dataclass
+class RuntimeActorContext:
+    """Safe request actor context shared across API and runtime layers."""
+
+    workspace_id: str = ""
+    actor_user_id: str = ""
+    membership_id: str = ""
+    auth_required: bool = False
+    membership_role: str = ""
+
+    @classmethod
+    def from_value(cls, value: Any) -> "RuntimeActorContext":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            return cls(
+                workspace_id=str(value.get("workspace_id", "") or ""),
+                actor_user_id=str(value.get("actor_user_id", "") or ""),
+                membership_id=str(value.get("membership_id", "") or ""),
+                auth_required=bool(value.get("auth_required", False)),
+                membership_role=str(value.get("membership_role", "") or ""),
+            )
+        return cls()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class ToolPlan:
     """Agent plan for external actions or live data access."""
 
