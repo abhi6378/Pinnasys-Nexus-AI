@@ -2,7 +2,6 @@
 api/routes.py  —  FastAPI REST API
 Run with: uvicorn api.routes:app --reload
 """
-import os
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -46,16 +45,13 @@ from tools.composio_client import get_connect_link
 from tools.tool_registry import get_toolkit_metadata, normalize_toolkit_key
 from utils.logging_utils import configure_logging
 from utils.perf import timed_log
+from utils.runtime_config import parse_allowed_origins, validate_production_config
 
 app = FastAPI(title="Sintra Clone API", version="1.0.0")
 configure_logging()
 logger = logging.getLogger(__name__)
 
-allowed_origins = [
-    origin.strip()
-    for origin in (os.getenv("SINTRA_ALLOWED_ORIGINS", "*") or "*").split(",")
-    if origin.strip()
-]
+allowed_origins = parse_allowed_origins()
 
 app.add_middleware(
     CORSMiddleware,
@@ -68,6 +64,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 def startup():
+    validate_production_config(allowed_origins=allowed_origins)
     init_db()
 
 
@@ -114,10 +111,6 @@ class ConnectorContextRequest(BaseModel):
     source: str = "api"
 
     def to_connector_dict(self) -> dict[str, Any]:
-        default_membership = next(
-            (membership for row, membership in workspace_pairs if row.id == workspace.id),
-            workspace_pairs[0][1] if workspace_pairs else None,
-        )
         return {
             "mode": self.mode,
             "selected_toolkit": self.selected_toolkit,
@@ -175,6 +168,7 @@ class ConnectorStatusResponse(BaseModel):
     connection_mode: str = ""
     auth_mode: str = ""
     last_verified_at: str = ""
+    remote_attempted: bool = False
     accounts: list[ConnectorAccountResponse] = Field(default_factory=list)
 
 class ChatRequest(BaseModel):
@@ -367,6 +361,10 @@ def api_auth_google(req: GoogleAuthRequest, request: Request, response: Response
             for membership in memberships
         ]
         workspace_pairs = [(row, membership) for row, membership in workspace_pairs if row]
+        default_membership = next(
+            (membership for row, membership in workspace_pairs if row.id == workspace.id),
+            workspace_pairs[0][1] if workspace_pairs else None,
+        )
         return {
             "authenticated": True,
             "user": {

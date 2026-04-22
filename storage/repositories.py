@@ -18,6 +18,7 @@ from storage.db import (
     WorkspaceMembershipModel, AuthSessionModel,
 )
 from utils.logging_utils import log_event, log_exception
+from utils.runtime_config import legacy_schema_fallback_allowed
 from utils.time_utils import utc_now
 
 
@@ -25,6 +26,13 @@ logger = logging.getLogger(__name__)
 PENDING_REQUEST_TTL_HOURS = int(os.getenv("SINTRA_PENDING_REQUEST_TTL_HOURS", "72") or "72")
 _TABLE_COLUMN_CACHE: dict[tuple[int, str], set[str] | None] = {}
 _REFLECTED_TABLE_CACHE: dict[tuple[int, str], Any] = {}
+_CANONICAL_SCHEMA_TABLES = {
+    "conversations",
+    "workflow_runs",
+    "pending_tool_requests",
+    "workspace_connector_preferences",
+    "tool_idempotency_records",
+}
 
 
 def _id():
@@ -117,6 +125,23 @@ def _table_has_column(db: Session, table_name: str, column_name: str) -> bool:
 
 
 def _get_reflected_table(db: Session, table_name: str):
+    if table_name in _CANONICAL_SCHEMA_TABLES and not legacy_schema_fallback_allowed(table_name):
+        log_event(
+            logger,
+            logging.ERROR,
+            "storage.legacy_schema_fallback_blocked",
+            table_name=table_name,
+        )
+        raise RuntimeError(
+            f"Canonical table '{table_name}' is missing expected columns. "
+            "Run Alembic migrations before starting production services."
+        )
+    log_event(
+        logger,
+        logging.WARNING,
+        "storage.legacy_schema_fallback_used",
+        table_name=table_name,
+    )
     bind = _get_bind(db)
     if bind is None:
         return None

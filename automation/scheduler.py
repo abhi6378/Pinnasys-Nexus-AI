@@ -8,6 +8,7 @@ import time
 from storage.db import SessionLocal, init_db
 from utils.logging_utils import configure_logging, log_event
 from utils.perf import elapsed_ms, perf_counter
+from utils.runtime_config import validate_production_config
 
 from automation.service import enqueue_due_runs
 
@@ -46,6 +47,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=int(os.getenv("SINTRA_SCHEDULER_BATCH_SIZE", "20") or "20"))
     args = parser.parse_args()
     configure_logging()
+    validate_production_config()
     init_db()
     if args.once:
         enqueue_due_once(batch_size=args.batch_size)

@@ -9,11 +9,17 @@ from datetime import timedelta
 from typing import Any
 
 from utils.time_utils import utc_now
+from utils.runtime_config import (
+    allow_insecure_dev_auth,
+    env_flag,
+    is_auth_required as _is_auth_required,
+    validate_session_config,
+)
 
 
 SESSION_COOKIE_NAME = os.getenv("SINTRA_SESSION_COOKIE_NAME", "sintra_session")
 SESSION_TTL_HOURS = int(os.getenv("SINTRA_SESSION_TTL_HOURS", "168") or "168")
-AUTH_REQUIRED = str(os.getenv("SINTRA_AUTH_REQUIRED", "") or "").lower() in {"1", "true", "yes", "on"}
+AUTH_REQUIRED = _is_auth_required()
 
 
 class _RepositoryProxy:
@@ -52,7 +58,7 @@ class AuthenticatedUser:
 
 
 def is_auth_required() -> bool:
-    return str(os.getenv("SINTRA_AUTH_REQUIRED", "") or "").lower() in {"1", "true", "yes", "on"}
+    return _is_auth_required()
 
 
 def _session_secret() -> str:
@@ -61,6 +67,8 @@ def _session_secret() -> str:
         if is_auth_required():
             raise RuntimeError("SINTRA_SESSION_SECRET is required when SINTRA_AUTH_REQUIRED=1.")
         secret = "dev-only-sintra-session-secret"
+    if is_auth_required():
+        validate_session_config()
     return secret
 
 
@@ -76,7 +84,12 @@ def extract_session_token(request: Any) -> str:
 
 
 def set_session_cookie(response: Any, token: str) -> None:
-    secure = str(os.getenv("SINTRA_SESSION_COOKIE_SECURE", "true") or "true").lower() not in {"0", "false", "no"}
+    secure = env_flag("SINTRA_SESSION_COOKIE_SECURE", True)
+    if is_auth_required() and not secure and not allow_insecure_dev_auth():
+        raise RuntimeError(
+            "Refusing to set an insecure auth cookie when SINTRA_AUTH_REQUIRED=1. "
+            "Use SINTRA_ALLOW_INSECURE_DEV_AUTH=1 only for local development."
+        )
     same_site = os.getenv("SINTRA_SESSION_COOKIE_SAMESITE", "lax") or "lax"
     response.set_cookie(
         SESSION_COOKIE_NAME,
@@ -117,8 +130,11 @@ def verify_google_credential(credential: str) -> dict[str, Any]:
     return payload
 
 
-def validate_google_csrf(request: Any, body_token: str = "") -> None:
+def validate_google_csrf(request: Any, body_token: str = "", *, strict: bool = False) -> None:
     cookie_token = str(request.cookies.get("g_csrf_token", "") or "")
+    strict = strict or env_flag("SINTRA_STRICT_GOOGLE_CSRF", False)
+    if strict and (not cookie_token or not body_token):
+        raise AuthServiceError(400, "Invalid Google CSRF token.")
     if not cookie_token and not body_token:
         return
     if not cookie_token or not body_token or not hmac.compare_digest(cookie_token, body_token):

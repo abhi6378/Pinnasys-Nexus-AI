@@ -7,6 +7,7 @@ from helpers.configs import AGENTS
 from models.contracts import ConnectorContext, ExecutionPolicy, RetryPolicy, ScheduleSpec, ScheduledTaskPayload
 from storage import repositories as repo
 from tools.connector_service import normalize_connector_context, validate_connector_context
+from utils.logging_utils import sanitize_for_persistence
 from utils.time_utils import utc_now
 from workflows.engine import WORKFLOWS
 
@@ -308,7 +309,7 @@ def complete_run_from_resume(db, scheduled_run_id: str | None, result: dict | No
         db,
         scheduled_run_id,
         status=status,
-        result_json=payload,
+        result_json=sanitize_for_persistence(payload),
         error_message=str(payload.get("error") or payload.get("output", "") if status == "failed" else ""),
         resume_token=str(payload.get("resume_token", "") or ""),
         idempotency_key=str(payload.get("idempotency_key", "") or ""),

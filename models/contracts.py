@@ -490,6 +490,7 @@ class ConnectorStatusSummary:
     connection_mode: str = ""
     auth_mode: str = ""
     last_verified_at: str = ""
+    remote_attempted: bool = False
     accounts: list[ConnectorAccountSummary] = field(default_factory=list)
 
     @classmethod
@@ -520,6 +521,7 @@ class ConnectorStatusSummary:
                 connection_mode=str(value.get("connection_mode", "") or ""),
                 auth_mode=str(value.get("auth_mode", "") or ""),
                 last_verified_at=str(value.get("last_verified_at", "") or ""),
+                remote_attempted=bool(value.get("remote_attempted", False)),
                 accounts=[
                     ConnectorAccountSummary.from_value(item)
                     for item in list(value.get("accounts", []) or [])

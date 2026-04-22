@@ -424,6 +424,13 @@ def list_connector_accounts(
     )
     cached = _cache_get(request_cache, cache_key)
     if cached is not None:
+        log_event(
+            logger,
+            logging.DEBUG,
+            "connector.accounts.cache_hit",
+            workspace_id=workspace_id,
+            toolkit=selected_toolkit,
+        )
         return [item.to_dict() if isinstance(item, ConnectorAccountSummary) else dict(item) for item in cached]
 
     local_accounts = _load_local_accounts(
@@ -432,6 +439,14 @@ def list_connector_accounts(
         db,
         include_disconnected=include_disconnected,
         selected_account_id=selected_account_id,
+    )
+    log_event(
+        logger,
+        logging.DEBUG,
+        "connector.accounts.cache_miss",
+        workspace_id=workspace_id,
+        toolkit=selected_toolkit,
+        local_count=len(local_accounts),
     )
     should_allow_remote = bool(allow_remote) or refresh
     should_refresh = refresh or not local_accounts
@@ -626,6 +641,7 @@ def _build_status_summary(
         connection_mode=str(toolkit_meta.get("connection_mode", "") or ""),
         auth_mode=str(toolkit_meta.get("auth_mode", "") or ""),
         last_verified_at=max(last_verified_values) if last_verified_values else "",
+        remote_attempted=bool(refresh or allow_remote),
         accounts=accounts,
     )
     return summary

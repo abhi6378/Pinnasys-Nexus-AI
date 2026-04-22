@@ -362,7 +362,7 @@ def _exec_workflow(workflow_key: str, user_input: str,
                 "mode": interrupt_mode,
                 "workflow_paused": True,
                 "step_label": wf_result.get("step_label"),
-                "resume_token": interrupt.get("resume_token", ""),
+                "resume_token_present": bool(interrupt.get("resume_token")),
                 "toolkit": interrupt.get("toolkit", ""),
             },
         )
@@ -406,7 +406,7 @@ def _exec_workflow(workflow_key: str, user_input: str,
                 "mode": mode,
                 "step_label": wf_result.get("step_label"),
                 "toolkit": wf_result.get("toolkit", ""),
-                "resume_token": wf_result.get("resume_token", ""),
+                "resume_token_present": bool(wf_result.get("resume_token")),
             },
         )
         return {

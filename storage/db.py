@@ -28,6 +28,12 @@ from sqlalchemy import (
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from utils.time_utils import utc_now
+from utils.runtime_config import (
+    allow_insecure_dev_auth,
+    is_auth_required,
+    should_fail_on_revision_drift,
+    validate_schema_bootstrap_config,
+)
 
 load_dotenv()
 
@@ -435,6 +441,7 @@ def _get_current_database_revision() -> str:
 
 def init_db(allow_bootstrap: bool | None = None):
     register_model_modules()
+    validate_schema_bootstrap_config()
 
     with engine.connect() as connection:
         connection.execute(text("SELECT 1"))
@@ -444,6 +451,11 @@ def init_db(allow_bootstrap: bool | None = None):
 
     if not has_tables:
         if bootstrap_allowed:
+            if is_auth_required() and not allow_insecure_dev_auth():
+                raise RuntimeError(
+                    "Schema bootstrap is disabled when SINTRA_AUTH_REQUIRED=1. "
+                    "Run 'alembic upgrade head' before startup."
+                )
             logger.warning(
                 "Bootstrapping database schema with create_all() because SINTRA_ALLOW_SCHEMA_BOOTSTRAP is enabled."
             )
@@ -457,12 +469,22 @@ def init_db(allow_bootstrap: bool | None = None):
     head_revision = _get_alembic_head_revision()
     current_revision = _get_current_database_revision()
     if head_revision and current_revision and current_revision != head_revision:
+        if should_fail_on_revision_drift():
+            raise RuntimeError(
+                "Database revision is behind Alembic head. "
+                f"current={current_revision} head={head_revision}. Run 'alembic upgrade head'."
+            )
         logger.warning(
             "Database revision is behind head. current=%s head=%s. Run 'alembic upgrade head'.",
             current_revision,
             head_revision,
         )
     elif head_revision and not current_revision:
+        if should_fail_on_revision_drift():
+            raise RuntimeError(
+                "Database schema is unversioned while SINTRA_AUTH_REQUIRED=1. "
+                f"Stamp or migrate the database to Alembic head {head_revision} before startup."
+            )
         logger.warning(
             "Database schema is unversioned. Stamp the existing schema with "
             "'alembic stamp %s' before running upgrades.",

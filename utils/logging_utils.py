@@ -28,6 +28,11 @@ _SECRET_MARKERS = (
 )
 
 
+def _is_sensitive_key(key: Any) -> bool:
+    lowered = str(key).lower()
+    return any(marker in lowered for marker in _SECRET_MARKERS)
+
+
 def configure_logging(level: str | None = None) -> None:
     """Best-effort bootstrap for app logging."""
     global _configured
@@ -73,7 +78,10 @@ def _sanitize_value(value: Any) -> Any:
     if isinstance(value, (list, tuple, set)):
         return [_sanitize_value(item) for item in list(value)[:10]]
     if isinstance(value, dict):
-        return {str(key): _sanitize_value(val) for key, val in list(value.items())[:20]}
+        return {
+            str(key): "[redacted]" if _is_sensitive_key(key) else _sanitize_value(val)
+            for key, val in list(value.items())[:20]
+        }
     return str(value)
 
 
@@ -81,12 +89,16 @@ def sanitize_context(context: dict[str, Any] | None) -> dict[str, Any]:
     clean: dict[str, Any] = {}
     for key, value in (context or {}).items():
         key_str = str(key)
-        lowered = key_str.lower()
-        if any(marker in lowered for marker in _SECRET_MARKERS):
+        if _is_sensitive_key(key_str):
             clean[key_str] = "[redacted]"
             continue
         clean[key_str] = _sanitize_value(value)
     return clean
+
+
+def sanitize_for_persistence(value: Any) -> Any:
+    """Redact auth/connector secrets before writing durable metadata/results."""
+    return _sanitize_value(value)
 
 
 def _build_payload(event: str, context: dict[str, Any] | None = None) -> dict[str, Any]:

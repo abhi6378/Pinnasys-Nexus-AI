@@ -11,8 +11,9 @@ from models.contracts import RetryPolicy, ScheduledTaskPayload
 from orchestrator.handler import handle_request
 from storage import repositories as repo
 from storage.db import SessionLocal, init_db
-from utils.logging_utils import configure_logging, log_event
+from utils.logging_utils import configure_logging, log_event, sanitize_for_persistence
 from utils.perf import elapsed_ms, perf_counter
+from utils.runtime_config import validate_production_config
 from utils.time_utils import utc_now
 
 from automation import service
@@ -68,15 +69,31 @@ def execute_run(db, run_id: str) -> dict:
         duration_ms=elapsed_ms(connector_started),
     )
     if connector_error:
+        safe_connector_status = {
+            key: connector_context.get(key)
+            for key in (
+                "mode",
+                "selected_toolkit",
+                "selected_connector_key",
+                "validation_status",
+                "status_reason",
+                "stale_selection",
+                "available_account_count",
+                "effective_account_id",
+                "effective_account_alias",
+                "connected",
+            )
+            if key in connector_context
+        }
         repo.update_scheduled_task_run(
             db,
             run_id,
             status="failed",
             error_message=connector_error,
-            result_json={"connector_context": connector_context},
+            result_json=sanitize_for_persistence({"connector_status": safe_connector_status}),
             finished_at=utc_now(),
         )
-        result = {"status": "failed", "error_message": connector_error}
+        result = {"status": "failed", "error_message": connector_error, "connector_status": safe_connector_status}
         log_event(logger, logging.INFO, "automation.worker.run", run_id=run_id, status="failed", duration_ms=elapsed_ms(started))
         return result
 
@@ -124,7 +141,7 @@ def execute_run(db, run_id: str) -> dict:
         db,
         run_id,
         status=status,
-        result_json=result,
+        result_json=sanitize_for_persistence(result),
         error_message=str((result.get("error") or result.get("output", "")) if status == "failed" else ""),
         resume_token=str(result.get("resume_token", "") or ""),
         idempotency_key=str(result.get("idempotency_key", "") or getattr(claimed, "idempotency_key", "") or ""),
@@ -199,6 +216,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=int(os.getenv("SINTRA_WORKER_BATCH_SIZE", "10") or "10"))
     args = parser.parse_args()
     configure_logging()
+    validate_production_config()
     init_db()
     if args.once:
         if args.with_scheduler:

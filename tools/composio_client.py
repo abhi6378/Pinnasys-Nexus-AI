@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 from tools.tool_registry import get_toolkit_app_enum, get_toolkit_runtime_config, get_toolkit_slug
 from utils.logging_utils import log_event, log_exception
 from utils.perf import elapsed_ms, perf_counter
+from utils.runtime_config import allow_composio_version_check_bypass
 
 load_dotenv()
 
@@ -918,19 +919,24 @@ def execute_tool(
 
     try:
         # SDK 1.0: tools.execute(slug, arguments, ...)
-        # When executing outside a framework integration (OpenAI/LangChain
-        # wrappers), the SDK requires either:
-        #   - a specific ``version`` string, or
-        #   - ``connected_account_id`` so the SDK can resolve the version, or
-        #   - ``dangerously_skip_version_check=True`` to bypass the check.
-        # We pass both connected_account_id (when available) AND the skip
-        # flag as a safety net so execution never fails on version lookup.
+        # Prefer connected_account_id for version resolution. The dangerous
+        # version-check bypass is available only as an explicit operational
+        # escape hatch via COMPOSIO_ALLOW_VERSION_CHECK_BYPASS=1.
         exec_kwargs: dict[str, Any] = {
             "user_id": entity_id,
-            "dangerously_skip_version_check": True,
         }
         if connected_account_id:
             exec_kwargs["connected_account_id"] = connected_account_id
+        if allow_composio_version_check_bypass():
+            exec_kwargs["dangerously_skip_version_check"] = True
+            log_event(
+                logger,
+                logging.WARNING,
+                "composio.tool.version_check_bypass",
+                user_id=user_id,
+                tool_name=tool_name,
+                connected_account=bool(connected_account_id),
+            )
 
         result = client.tools.execute(
             slug=action,
