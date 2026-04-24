@@ -8,6 +8,7 @@ class ComposioClientTests(unittest.TestCase):
         import tools.composio_client as composio_client
 
         self.client = composio_client
+        self.client._tool_version_cache.clear()
 
     def test_validate_tool_slug_uses_raw_catalog_schema(self):
         raw_lookup = Spy(return_value={"slug": "GMAIL_FETCH_EMAILS"})
@@ -66,6 +67,13 @@ class ComposioClientTests(unittest.TestCase):
 
         self.assertEqual(fake_tools.kwargs["version"], "20260413_01")
         self.assertEqual(fake_tools.kwargs["connected_account_id"], "acct-1")
+
+    def test_resolve_tool_version_uses_available_versions_fallback(self):
+        with patch_attr(self.client, "_get_raw_tool_schema", lambda tool_name: {"available_versions": ["latest", "20260424_01"]}), \
+             patch_attr(self.client, "get_tool", lambda tool_name: {"toolkit": "GMAIL"}):
+            version = self.client._resolve_tool_version("GMAIL_FETCH_EMAILS", "GMAIL")
+
+        self.assertEqual(version, "20260424_01")
 
 
 if __name__ == "__main__":

@@ -620,6 +620,7 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
     with request_context(request_id=request_id, workspace_id=workspace_id):
         request_cache: dict[str, object] = {}
         normalized_connector = normalize_connector_context(connector_context)
+        brain_context = ""
         log_event(
             logger,
             logging.INFO,
@@ -661,6 +662,35 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
                 actor_user_id=actor_user_id,
                 membership_id=membership_id,
             )
+            if (
+                schedule_result
+                and schedule_result.get("schedule_target_required")
+                and not workflow_hint
+            ):
+                brain = BrainAI(workspace_id, db)
+                brain_context = brain.get_relevant_context(user_input)
+                route_hint = route_request(
+                    user_input,
+                    workspace_id,
+                    db,
+                    brain_context,
+                    connector_context=normalized_connector.to_dict(),
+                )
+                routed_workflow = ""
+                if isinstance(route_hint, dict) and route_hint.get("route_type") == "workflow":
+                    candidate = str(route_hint.get("selected_workflow", "") or "").strip()
+                    if candidate in WORKFLOWS:
+                        routed_workflow = candidate
+                if routed_workflow:
+                    schedule_result = maybe_create_chat_schedule(
+                        db=db,
+                        workspace_id=workspace_id,
+                        user_input=user_input,
+                        workflow_key=routed_workflow,
+                        connector_context=normalized_connector.to_dict(),
+                        actor_user_id=actor_user_id,
+                        membership_id=membership_id,
+                    )
             if schedule_result:
                 repo.save_conversation(
                     db,
@@ -679,8 +709,9 @@ def handle_request(user_input: str, workspace_id: str, db: Session,
                 return schedule_result
 
         # 1. Load Brain AI context
-        brain = BrainAI(workspace_id, db)
-        brain_context = brain.get_relevant_context(user_input)
+        if not brain_context:
+            brain = BrainAI(workspace_id, db)
+            brain_context = brain.get_relevant_context(user_input)
 
         # 2. Route — priority: force_agent > force_workflow > LLM router > legacy
         if force_agent:

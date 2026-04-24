@@ -143,6 +143,7 @@ def maybe_create_chat_schedule(
                 "Please name a workflow such as `email triage`, `lead capture`, or `research and outreach`."
             ),
             "steps": [],
+            "schedule_target_required": True,
         }
     task = service.create_schedule(
         db,

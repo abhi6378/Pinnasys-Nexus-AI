@@ -336,6 +336,7 @@ def _resolve_tool_version(tool_name: str, toolkit: str = "") -> str:
     raw_schema = _get_raw_tool_schema(tool_name)
     schema_version = str(
         raw_schema.get("version")
+        or raw_schema.get("latest_version")
         or dict(raw_schema.get("deprecated", {}) or {}).get("version")
         or ""
     ).strip()
@@ -350,6 +351,21 @@ def _resolve_tool_version(tool_name: str, toolkit: str = "") -> str:
             source="raw_schema",
         )
         return _version_cache_set(tool_name, schema_version)
+    available_versions = raw_schema.get("available_versions") or raw_schema.get("versions") or []
+    if isinstance(available_versions, (list, tuple)):
+        for candidate in available_versions:
+            resolved = str(candidate or "").strip()
+            if resolved and resolved.lower() != "latest":
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "composio.tool.version_resolved",
+                    tool_name=tool_name,
+                    toolkit_slug=toolkit_slug,
+                    version=resolved,
+                    source="raw_schema_available_versions",
+                )
+                return _version_cache_set(tool_name, resolved)
     return ""
 
 

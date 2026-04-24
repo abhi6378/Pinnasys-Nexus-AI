@@ -438,3 +438,41 @@ class HandleRequestTests(unittest.TestCase):
         self.assertTrue(result["approval_required"])
         self.assertEqual(result["resume_token"], "resume-1")
         self.assertEqual(result["pending_kind"], "approval")
+
+    def test_handle_request_uses_router_workflow_to_schedule_chat_automation(self):
+        self.handler.repo.save_conversation = Spy()
+        responses = [
+            {
+                "mode": "clarify",
+                "agent": "system",
+                "output": "I found the schedule, but not the automation target.",
+                "steps": [],
+                "schedule_target_required": True,
+            },
+            {
+                "mode": "automation_scheduled",
+                "agent": "system",
+                "output": "Scheduled `email_triage` automation.",
+                "steps": [],
+                "automation": {"id": "task-1"},
+            },
+        ]
+        schedule_spy = Spy(side_effect=lambda *args, **kwargs: responses.pop(0))
+        with patch_attr(self.handler, "detect_workflow", Spy(return_value=None)), \
+             patch_attr(self.handler, "maybe_create_chat_schedule", schedule_spy), \
+             patch_attr(
+                 self.handler,
+                 "route_request",
+                 Spy(return_value={"route_type": "workflow", "selected_workflow": "email_triage"}),
+             ), \
+             patch_attr(self.handler, "extract_and_save", Spy()):
+            result = self.handler.handle_request(
+                "check my recent unread mail and schedule replies for tomorrow at 9 am",
+                "ws1",
+                object(),
+            )
+
+        self.assertEqual(result["mode"], "automation_scheduled")
+        self.assertEqual(len(schedule_spy.calls), 2)
+        self.assertEqual(schedule_spy.calls[1][1]["workflow_key"], "email_triage")
+        self.assertEqual(len(self.handler.repo.save_conversation.calls), 1)
