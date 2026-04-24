@@ -4,7 +4,7 @@ models/tool_connections.py  —  Tracks Composio-managed connector/account state
 The app DB stores only safe connector metadata and runtime state. OAuth tokens,
 API keys, and other secret material must remain outside this table.
 """
-from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, ForeignKey, Index, JSON, String, text
+from sqlalchemy import Boolean, CheckConstraint, Column, ForeignKey, Index, JSON, String, text
 
 from storage.db import Base, TZDateTime, new_id
 from utils.time_utils import utc_now

@@ -23,7 +23,7 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 
-from tools.tool_registry import get_toolkit_app_enum, get_toolkit_runtime_config, get_toolkit_slug
+from tools.tool_registry import get_tool, get_toolkit_app_enum, get_toolkit_runtime_config, get_toolkit_slug
 from utils.logging_utils import log_event, log_exception
 from utils.perf import elapsed_ms, perf_counter
 from utils.runtime_config import allow_composio_version_check_bypass
@@ -48,6 +48,7 @@ _schema_cache: dict[tuple[str, str], dict] = {}
 _schema_cache_times: dict[tuple[str, str], float] = {}
 _catalog_validation_cache: dict[str, tuple[float, dict]] = {}
 _auth_config_cache: dict[str, tuple[float, Optional[str]]] = {}
+_tool_version_cache: dict[str, tuple[float, str]] = {}
 SCHEMA_CACHE_TTL_SECONDS = int(os.getenv("COMPOSIO_SCHEMA_CACHE_TTL_SECONDS", "1800") or "1800")
 CATALOG_CACHE_TTL_SECONDS = int(os.getenv("COMPOSIO_CATALOG_CACHE_TTL_SECONDS", "1800") or "1800")
 AUTH_CONFIG_CACHE_TTL_SECONDS = int(os.getenv("COMPOSIO_AUTH_CONFIG_CACHE_TTL_SECONDS", "1800") or "1800")
@@ -227,6 +228,51 @@ def _is_cache_fresh(cache_key: tuple[str, str]) -> bool:
     return (time.time() - cached_at) <= SCHEMA_CACHE_TTL_SECONDS
 
 
+def _get_raw_tool_schema(tool_name: str, force_refresh: bool = False) -> dict:
+    """Fetch a tool schema without requiring a workspace-scoped user id.
+
+    Composio tool existence is global to the catalog. User-scoped tool fetches can
+    legitimately return an empty list when a workspace is not connected for that
+    toolkit yet, which should not be treated as "invalid tool".
+    """
+    if not tool_name or not is_available():
+        return {}
+
+    cache_key = ("__catalog__", tool_name)
+    if not force_refresh and cache_key in _schema_cache and _is_cache_fresh(cache_key):
+        log_event(logger, logging.DEBUG, "composio.schema.raw_cache_hit", tool_name=tool_name)
+        return dict(_schema_cache[cache_key])
+
+    started = perf_counter()
+    client = _get_client("")
+    if client is None:
+        return {}
+
+    try:
+        schema = _normalize_sdk_payload(client.tools.get_raw_composio_tool_by_slug(tool_name))
+        if isinstance(schema, dict) and schema:
+            _schema_cache[cache_key] = dict(schema)
+            _schema_cache_times[cache_key] = time.time()
+        log_event(
+            logger,
+            logging.INFO,
+            "composio.schema.raw_fetch",
+            tool_name=tool_name,
+            found=bool(schema),
+            duration_ms=elapsed_ms(started),
+        )
+        return dict(schema) if isinstance(schema, dict) else {}
+    except Exception as exc:
+        log_exception(
+            logger,
+            "composio.schema.raw_fetch_failed",
+            exc,
+            tool_name=tool_name,
+            duration_ms=elapsed_ms(started),
+        )
+        return {}
+
+
 def _auth_config_cache_get(toolkit_slug: str) -> Optional[str]:
     cached = _auth_config_cache.get(toolkit_slug)
     if not cached:
@@ -245,6 +291,66 @@ def _auth_config_cache_set(toolkit_slug: str, auth_config_id: Optional[str]) -> 
     if toolkit_slug and auth_config_id:
         _auth_config_cache[toolkit_slug] = (time.time(), auth_config_id)
     return auth_config_id
+
+
+def _version_cache_get(tool_name: str) -> str:
+    cached = _tool_version_cache.get(tool_name)
+    if not cached:
+        return ""
+    cached_at, version = cached
+    if (time.time() - cached_at) > SCHEMA_CACHE_TTL_SECONDS:
+        _tool_version_cache.pop(tool_name, None)
+        return ""
+    return version
+
+
+def _version_cache_set(tool_name: str, version: str) -> str:
+    if tool_name and version:
+        _tool_version_cache[tool_name] = (time.time(), version)
+    return version
+
+
+def _resolve_tool_version(tool_name: str, toolkit: str = "") -> str:
+    cached = _version_cache_get(tool_name)
+    if cached:
+        log_event(logger, logging.DEBUG, "composio.tool.version_cache_hit", tool_name=tool_name, version=cached)
+        return cached
+
+    entry = get_tool(tool_name) or {}
+    toolkit_slug = get_toolkit_slug(toolkit or str(entry.get("toolkit", "") or ""))
+    if toolkit_slug:
+        env_key = f"COMPOSIO_TOOLKIT_VERSION_{toolkit_slug.upper()}"
+        env_version = str(os.getenv(env_key, "") or "").strip()
+        if env_version and env_version.lower() != "latest":
+            log_event(
+                logger,
+                logging.INFO,
+                "composio.tool.version_resolved",
+                tool_name=tool_name,
+                toolkit_slug=toolkit_slug,
+                version=env_version,
+                source="env",
+            )
+            return _version_cache_set(tool_name, env_version)
+
+    raw_schema = _get_raw_tool_schema(tool_name)
+    schema_version = str(
+        raw_schema.get("version")
+        or dict(raw_schema.get("deprecated", {}) or {}).get("version")
+        or ""
+    ).strip()
+    if schema_version and schema_version.lower() != "latest":
+        log_event(
+            logger,
+            logging.INFO,
+            "composio.tool.version_resolved",
+            tool_name=tool_name,
+            toolkit_slug=toolkit_slug,
+            version=schema_version,
+            source="raw_schema",
+        )
+        return _version_cache_set(tool_name, schema_version)
+    return ""
 
 
 def get_session(user_id: str, force_refresh: bool = False) -> Any | None:
@@ -740,12 +846,14 @@ def get_tool_schemas(user_id: str, tool_names: list[str] | None = None) -> list[
     if not is_available():
         return []
 
-    client = _get_client(user_id)
-    if client is None:
-        return []
-
     actions = [name for name in (tool_names or []) if name]
     if not actions:
+        return []
+    if user_id in {"", "__catalog__"}:
+        return [schema for schema in (_get_raw_tool_schema(action) for action in actions) if schema]
+
+    client = _get_client(user_id)
+    if client is None:
         return []
 
     started = perf_counter()
@@ -816,6 +924,8 @@ def get_tool_schemas(user_id: str, tool_names: list[str] | None = None) -> list[
 def get_live_tool_schema(user_id: str, tool_name: str, force_refresh: bool = False) -> dict:
     if not tool_name:
         return {}
+    if user_id in {"", "__catalog__"}:
+        return _get_raw_tool_schema(tool_name, force_refresh=force_refresh)
     entity_id = _entity_id(user_id or "__catalog__")
     cache_key = (entity_id, tool_name)
     if not force_refresh and cache_key in _schema_cache and _is_cache_fresh(cache_key):
@@ -851,10 +961,10 @@ def validate_tool_slug(tool_name: str) -> dict:
 
     started = perf_counter()
     try:
-        schemas = get_tool_schemas("__catalog__", [tool_name])
+        schema = _get_raw_tool_schema(tool_name)
         result = {
             "available": True,
-            "exists": bool(schemas),
+            "exists": bool(schema),
             "error": None,
         }
         _catalog_validation_cache[tool_name] = (time.time(), dict(result))
@@ -916,6 +1026,9 @@ def execute_tool(
 
     params = arguments or {}
     entity_id = _entity_id(user_id)
+    entry = get_tool(tool_name) or {}
+    toolkit_key = str(entry.get("toolkit", "") or "")
+    resolved_version = _resolve_tool_version(tool_name, toolkit=toolkit_key)
 
     try:
         # SDK 1.0: tools.execute(slug, arguments, ...)
@@ -927,6 +1040,8 @@ def execute_tool(
         }
         if connected_account_id:
             exec_kwargs["connected_account_id"] = connected_account_id
+        if resolved_version:
+            exec_kwargs["version"] = resolved_version
         if allow_composio_version_check_bypass():
             exec_kwargs["dangerously_skip_version_check"] = True
             log_event(
@@ -936,6 +1051,7 @@ def execute_tool(
                 user_id=user_id,
                 tool_name=tool_name,
                 connected_account=bool(connected_account_id),
+                version=resolved_version,
             )
 
         result = client.tools.execute(
@@ -962,6 +1078,7 @@ def execute_tool(
         user_id=user_id,
         tool_name=tool_name,
         connected_account=bool(connected_account_id),
+        version=resolved_version,
         duration_ms=elapsed_ms(started),
     )
     if isinstance(normalized, dict):
