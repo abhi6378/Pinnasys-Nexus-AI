@@ -33,11 +33,21 @@ class RouterLoggingTests(unittest.TestCase):
     def setUp(self):
         self.router = load_router_module()
 
+    def test_route_request_short_circuits_smalltalk_to_assistant(self):
+        llm_spy = Spy(side_effect=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("LLM router should not run for smalltalk")))
+        with patch_attr(self.router, "generate_json", llm_spy):
+            result = self.router.route_request("how are you", "ws1", object(), "ctx")
+
+        self.assertEqual(result["route_type"], "single_agent")
+        self.assertEqual(result["selected_agent"], "assistant")
+        self.assertEqual(result["primary_intent"], "small_talk")
+        self.assertEqual(result["route_method"], "smalltalk_shortcut")
+
     def test_route_request_logs_exception_and_returns_none_on_failure(self):
         exception_spy = Spy()
         with patch_attr(self.router, "generate_json", Spy(side_effect=lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")))), \
              patch_attr(self.router, "log_exception", exception_spy):
-            result = self.router.route_request("hello", "ws1", object(), "ctx")
+            result = self.router.route_request("write a proposal", "ws1", object(), "ctx")
 
         self.assertIsNone(result)
         self.assertEqual(len(exception_spy.calls), 1)

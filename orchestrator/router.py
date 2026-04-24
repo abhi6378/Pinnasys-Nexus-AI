@@ -13,6 +13,7 @@ Route types:
 """
 import json
 import logging
+import re
 from helpers.configs import AGENTS
 from models.contracts import ApprovalRequirement, RouteDecision, RouteStepSkeleton
 from workflows.engine import WORKFLOWS
@@ -315,6 +316,59 @@ VALID_WORKFLOW_KEYS = set(WORKFLOWS.keys())
 CONFIDENCE_THRESHOLD = 0.4
 
 
+SMALLTALK_PATTERNS = (
+    r"hi",
+    r"hello",
+    r"hey",
+    r"how are you",
+    r"how're you",
+    r"how r you",
+    r"what's up",
+    r"whats up",
+    r"sup",
+    r"good morning",
+    r"good afternoon",
+    r"good evening",
+)
+
+
+def _normalize_short_input(text: str) -> str:
+    lowered = str(text or "").strip().lower()
+    lowered = re.sub(r"[^\w\s']", " ", lowered)
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
+def _detect_smalltalk_route(user_input: str) -> RouteDecision | None:
+    normalized = _normalize_short_input(user_input)
+    if not normalized:
+        return None
+    token_count = len(normalized.split())
+    if token_count > 8:
+        return None
+    if normalized in {"how are you doing", "how are you today"}:
+        pass
+    elif normalized not in SMALLTALK_PATTERNS:
+        return None
+    return RouteDecision(
+        route_type="single_agent",
+        confidence=0.99,
+        intent="small_talk",
+        domain="general",
+        system_family="general",
+        operation="read",
+        requires_live_data=False,
+        approval_required=ApprovalRequirement(required=False),
+        selected_agent="assistant",
+        selected_workflow=None,
+        missing_info=[],
+        reason="Short greeting or check-in request; route directly to the assistant.",
+        ordered_steps=[RouteStepSkeleton(agent="assistant", task="Respond conversationally and briefly.")],
+        clarification_question="",
+        risk_flags=[],
+        route_method="smalltalk_shortcut",
+    )
+
+
 def _normalize_missing_info(value, clarification_question: str) -> list[str]:
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
@@ -542,6 +596,33 @@ def route_request_decision(
         workspace_id=workspace_id,
         has_brain_context=bool(brain_context),
     )
+    shortcut = _detect_smalltalk_route(user_input)
+    if shortcut:
+        log_event(
+            logger,
+            logging.INFO,
+            "router.decision",
+            workspace_id=workspace_id,
+            route_type=shortcut.route_type,
+            intent=shortcut.intent,
+            agent_name=shortcut.selected_agent or "",
+            workflow_name=shortcut.selected_workflow or "",
+            confidence=shortcut.confidence,
+            missing_info=shortcut.missing_info,
+            system_family=shortcut.system_family,
+            operation=shortcut.operation,
+        )
+        log_event(
+            logger,
+            logging.INFO,
+            "router.exit",
+            workspace_id=workspace_id,
+            route_type=shortcut.route_type,
+            agent_name=shortcut.selected_agent or "",
+            workflow_name=shortcut.selected_workflow or "",
+            route_method=shortcut.route_method,
+        )
+        return shortcut
     try:
         conversation_context = _build_conversation_context(workspace_id, db)
         prompt = _build_router_prompt(user_input, conversation_context, brain_context, connector_context=connector_context)
