@@ -79,6 +79,58 @@ def _integrity_message(exc: Exception) -> str:
     return str(getattr(exc, "orig", exc) or "")
 
 
+def _find_existing_workspace(
+    db: Session,
+    workspace_name: str,
+    *,
+    owner_user_id: str | None = None,
+):
+    query = db.query(WorkspaceModel).filter(WorkspaceModel.name == workspace_name)
+    if owner_user_id:
+        existing = query.filter(WorkspaceModel.owner_user_id == owner_user_id).first()
+        if existing:
+            return existing
+    return query.order_by(WorkspaceModel.created_at).first()
+
+
+def _ensure_workspace_initialized(
+    db: Session,
+    workspace,
+    *,
+    owner_user_id: str | None = None,
+):
+    brain = get_brain(db, workspace.id)
+    if not brain:
+        try:
+            db.add(BrainProfileModel(workspace_id=workspace.id))
+            db.commit()
+        except Exception as exc:
+            _safe_rollback(db)
+            if not _is_integrity_error(exc):
+                raise
+    if owner_user_id:
+        if not getattr(workspace, "owner_user_id", None):
+            try:
+                workspace.owner_user_id = owner_user_id
+                db.commit()
+            except Exception as exc:
+                _safe_rollback(db)
+                if not _is_integrity_error(exc):
+                    raise
+        upsert_workspace_membership(
+            db,
+            workspace_id=workspace.id,
+            user_id=owner_user_id,
+            role="owner",
+            status="active",
+        )
+    try:
+        db.refresh(workspace)
+    except Exception:
+        pass
+    return workspace
+
+
 def _pending_request_expiry():
     return utc_now() + timedelta(hours=PENDING_REQUEST_TTL_HOURS)
 
@@ -564,6 +616,8 @@ def revoke_auth_session(db: Session, session_hash: str) -> bool:
 
 def create_workspace(db: Session, name: str, *, owner_user_id: str | None = None) -> WorkspaceModel:
     workspace_name = str(name or "").strip()
+    if not workspace_name:
+        raise ValueError("workspace name is required")
     ws_id = _id()
     created_at = utc_now()
     if owner_user_id and not get_user(db, owner_user_id):
@@ -575,59 +629,29 @@ def create_workspace(db: Session, name: str, *, owner_user_id: str | None = None
             workspace_name=workspace_name,
         )
         owner_user_id = None
+    existing = _find_existing_workspace(db, workspace_name, owner_user_id=owner_user_id)
+    if existing:
+        _ensure_workspace_initialized(db, existing, owner_user_id=owner_user_id)
+        log_event(
+            logger,
+            logging.INFO,
+            "storage.workspace.reused_existing",
+            workspace_id=getattr(existing, "id", ""),
+            workspace_name=workspace_name,
+            owner_user_id=owner_user_id,
+        )
+        return existing
     try:
         ws = WorkspaceModel(id=ws_id, name=workspace_name, owner_user_id=owner_user_id, created_at=created_at)
         db.add(ws)
-        # seed empty brain profile
-        bp = BrainProfileModel(workspace_id=ws.id)
-        db.add(bp)
         db.commit()
-        if owner_user_id:
-            upsert_workspace_membership(
-                db,
-                workspace_id=ws.id,
-                user_id=owner_user_id,
-                role="owner",
-                status="active",
-            )
-            db.refresh(ws)
-        db.refresh(ws)
-        return ws
+        return _ensure_workspace_initialized(db, ws, owner_user_id=owner_user_id)
     except Exception as exc:
         if _is_integrity_error(exc):
-            db.rollback()
-            existing = None
-            query = db.query(WorkspaceModel).filter(WorkspaceModel.name == workspace_name)
-            if owner_user_id:
-                existing = query.filter(WorkspaceModel.owner_user_id == owner_user_id).first()
-            else:
-                existing = query.order_by(WorkspaceModel.created_at).first()
+            _safe_rollback(db)
+            existing = _find_existing_workspace(db, workspace_name, owner_user_id=owner_user_id)
             if existing:
-                brain = get_brain(db, existing.id)
-                if not brain:
-                    try:
-                        db.add(BrainProfileModel(workspace_id=existing.id))
-                        db.commit()
-                    except Exception:
-                        db.rollback()
-                if owner_user_id:
-                    if not getattr(existing, "owner_user_id", None):
-                        try:
-                            existing.owner_user_id = owner_user_id
-                            db.commit()
-                        except Exception:
-                            db.rollback()
-                    upsert_workspace_membership(
-                        db,
-                        workspace_id=existing.id,
-                        user_id=owner_user_id,
-                        role="owner",
-                        status="active",
-                    )
-                    try:
-                        db.refresh(existing)
-                    except Exception:
-                        pass
+                _ensure_workspace_initialized(db, existing, owner_user_id=owner_user_id)
                 log_event(
                     logger,
                     logging.WARNING,

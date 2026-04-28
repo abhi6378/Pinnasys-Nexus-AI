@@ -217,15 +217,26 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(workspace.id, "ws-1")
         self.assertEqual(workspace.name, "Acme")
         self.assertEqual(len(db.added), 2)
-        self.assertEqual(db.commits, 1)
+        self.assertEqual(db.commits, 2)
         self.assertEqual(db.refreshed, [workspace])
 
     def test_create_workspace_recovers_existing_workspace_on_integrity_error(self):
         existing = SimpleNamespace(id="ws-existing", name="Acme", owner_user_id=None, created_at="2026-01-01")
 
+        class DeferredExistingQuery(FakeQuery):
+            def __init__(self):
+                super().__init__(first_result=None)
+                self._calls = 0
+
+            def first(self):
+                self._calls += 1
+                if self._calls == 1:
+                    return None
+                return existing
+
         class IntegritySession(FakeSession):
             def __init__(self):
-                super().__init__({self_repo.WorkspaceModel: FakeQuery(first_result=existing)})
+                super().__init__({self_repo.WorkspaceModel: DeferredExistingQuery()})
                 self._raised = False
 
             def commit(self):
@@ -243,6 +254,15 @@ class RepositoryTests(unittest.TestCase):
 
         self.assertEqual(workspace.id, "ws-existing")
         self.assertEqual(db.rollbacks, 1)
+
+    def test_create_workspace_reuses_existing_workspace_before_insert(self):
+        existing = SimpleNamespace(id="ws-existing", name="Acme", owner_user_id=None, created_at="2026-01-01")
+        db = FakeSession({self.repo.WorkspaceModel: FakeQuery(first_result=existing)})
+        with patch_attr(self.repo, "get_brain", lambda db, workspace_id: SimpleNamespace(workspace_id=workspace_id)):
+            workspace = self.repo.create_workspace(db, "Acme")
+
+        self.assertEqual(workspace.id, "ws-existing")
+        self.assertEqual(db.commits, 0)
 
     def test_update_brain_creates_profile_and_ignores_falsy_updates(self):
         db = FakeSession()
