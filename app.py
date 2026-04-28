@@ -62,6 +62,15 @@ try:
             st.session_state.chat_history = []
             st.session_state.connector_context = default_connector_context()
             st.session_state.connector_context_workspace_id = None
+    if not st.session_state.workspace_id:
+        if _auth_user:
+            visible_workspaces = repo.list_workspaces_for_user(_auth_db, _auth_user.id)
+        else:
+            visible_workspaces = repo.list_workspaces(_auth_db)
+        if visible_workspaces:
+            first_workspace = visible_workspaces[0]
+            st.session_state.workspace_id = first_workspace.id
+            st.session_state.workspace_name = first_workspace.name
 finally:
     _auth_db.close()
 

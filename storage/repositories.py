@@ -75,6 +75,10 @@ def _is_missing_column_error(exc: Exception) -> bool:
     )
 
 
+def _integrity_message(exc: Exception) -> str:
+    return str(getattr(exc, "orig", exc) or "")
+
+
 def _pending_request_expiry():
     return utc_now() + timedelta(hours=PENDING_REQUEST_TTL_HOURS)
 
@@ -559,10 +563,20 @@ def revoke_auth_session(db: Session, session_hash: str) -> bool:
 # ── Workspace ─────────────────────────────────────────────────────────────────
 
 def create_workspace(db: Session, name: str, *, owner_user_id: str | None = None) -> WorkspaceModel:
+    workspace_name = str(name or "").strip()
     ws_id = _id()
     created_at = utc_now()
+    if owner_user_id and not get_user(db, owner_user_id):
+        log_event(
+            logger,
+            logging.WARNING,
+            "storage.workspace.owner_missing",
+            owner_user_id=owner_user_id,
+            workspace_name=workspace_name,
+        )
+        owner_user_id = None
     try:
-        ws = WorkspaceModel(id=ws_id, name=name, owner_user_id=owner_user_id, created_at=created_at)
+        ws = WorkspaceModel(id=ws_id, name=workspace_name, owner_user_id=owner_user_id, created_at=created_at)
         db.add(ws)
         # seed empty brain profile
         bp = BrainProfileModel(workspace_id=ws.id)
@@ -580,13 +594,58 @@ def create_workspace(db: Session, name: str, *, owner_user_id: str | None = None
         db.refresh(ws)
         return ws
     except Exception as exc:
+        if _is_integrity_error(exc):
+            db.rollback()
+            existing = None
+            query = db.query(WorkspaceModel).filter(WorkspaceModel.name == workspace_name)
+            if owner_user_id:
+                existing = query.filter(WorkspaceModel.owner_user_id == owner_user_id).first()
+            else:
+                existing = query.order_by(WorkspaceModel.created_at).first()
+            if existing:
+                brain = get_brain(db, existing.id)
+                if not brain:
+                    try:
+                        db.add(BrainProfileModel(workspace_id=existing.id))
+                        db.commit()
+                    except Exception:
+                        db.rollback()
+                if owner_user_id:
+                    if not getattr(existing, "owner_user_id", None):
+                        try:
+                            existing.owner_user_id = owner_user_id
+                            db.commit()
+                        except Exception:
+                            db.rollback()
+                    upsert_workspace_membership(
+                        db,
+                        workspace_id=existing.id,
+                        user_id=owner_user_id,
+                        role="owner",
+                        status="active",
+                    )
+                    try:
+                        db.refresh(existing)
+                    except Exception:
+                        pass
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "storage.workspace.integrity_recovered",
+                    workspace_id=getattr(existing, "id", ""),
+                    workspace_name=workspace_name,
+                    owner_user_id=owner_user_id,
+                    detail=_integrity_message(exc),
+                )
+                return existing
+            raise
         if not _is_missing_column_error(exc):
             raise
         db.rollback()
         table = _get_reflected_table(db, "workspaces")
         if table is None:
             raise
-        insert_values = {"id": ws_id, "name": name}
+        insert_values = {"id": ws_id, "name": workspace_name}
         if "created_at" in table.c:
             insert_values["created_at"] = created_at
         db.execute(table.insert().values(**insert_values))

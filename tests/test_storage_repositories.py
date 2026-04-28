@@ -14,7 +14,7 @@ from tests.support import (
 
 
 def load_repositories_module():
-    WorkspaceModel = make_model_class("WorkspaceModel", ["id", "created_at"])
+    WorkspaceModel = make_model_class("WorkspaceModel", ["id", "name", "owner_user_id", "created_at"])
     BrainProfileModel = make_model_class(
         "BrainProfileModel",
         [
@@ -219,6 +219,30 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(len(db.added), 2)
         self.assertEqual(db.commits, 1)
         self.assertEqual(db.refreshed, [workspace])
+
+    def test_create_workspace_recovers_existing_workspace_on_integrity_error(self):
+        existing = SimpleNamespace(id="ws-existing", name="Acme", owner_user_id=None, created_at="2026-01-01")
+
+        class IntegritySession(FakeSession):
+            def __init__(self):
+                super().__init__({self_repo.WorkspaceModel: FakeQuery(first_result=existing)})
+                self._raised = False
+
+            def commit(self):
+                if not self._raised:
+                    self._raised = True
+                    raise RuntimeError("duplicate key value violates unique constraint")
+                super().commit()
+
+        self_repo = self.repo
+        db = IntegritySession()
+        with patch_attr(self.repo, "_id", lambda: "ws-1"), \
+             patch_attr(self.repo, "_is_integrity_error", lambda exc: True), \
+             patch_attr(self.repo, "get_brain", lambda db, workspace_id: SimpleNamespace(workspace_id=workspace_id)):
+            workspace = self.repo.create_workspace(db, "Acme")
+
+        self.assertEqual(workspace.id, "ws-existing")
+        self.assertEqual(db.rollbacks, 1)
 
     def test_update_brain_creates_profile_and_ignores_falsy_updates(self):
         db = FakeSession()
