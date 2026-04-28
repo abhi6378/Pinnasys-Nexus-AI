@@ -47,7 +47,7 @@ from utils.logging_utils import configure_logging
 from utils.perf import timed_log
 from utils.runtime_config import parse_allowed_origins, validate_production_config
 
-app = FastAPI(title="Sintra Clone API", version="1.0.0")
+app = FastAPI(title="Nexus Ai API", version="1.0.0")
 configure_logging()
 logger = logging.getLogger(__name__)
 

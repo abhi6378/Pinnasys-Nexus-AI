@@ -209,7 +209,7 @@ def worker_loop(*, poll_seconds: int = 10, batch_size: int = 10, with_scheduler:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the Sintra automation worker.")
+    parser = argparse.ArgumentParser(description="Run the Nexus Ai automation worker.")
     parser.add_argument("--once", action="store_true", help="Process one batch and exit.")
     parser.add_argument("--with-scheduler", action="store_true", help="Also enqueue due runs before each worker tick.")
     parser.add_argument("--poll-seconds", type=int, default=int(os.getenv("SINTRA_WORKER_POLL_SECONDS", "10") or "10"))

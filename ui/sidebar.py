@@ -40,7 +40,7 @@ def _connector_scope_kwargs(db, workspace_id: str) -> dict:
 def render_sidebar(auth_user=None):
     ensure_connector_state(st.session_state)
     with st.sidebar:
-        st.markdown("## 🧠 Sintra Clone")
+        st.markdown("## 🧠 Nexus Ai")
         if auth_user:
             st.caption(f"Signed in as {auth_user.email or auth_user.display_name or auth_user.id}")
             if st.button("Sign out", use_container_width=True):

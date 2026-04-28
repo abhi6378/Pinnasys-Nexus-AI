@@ -1,6 +1,6 @@
 # Durable Scheduling And Automation
 
-Sintra automations are database-backed schedules executed by separate scheduler
+Nexus Ai automations are database-backed schedules executed by separate scheduler
 and worker processes. Streamlit and FastAPI can create and inspect schedules, but
 they are not the authority for timekeeping.
 

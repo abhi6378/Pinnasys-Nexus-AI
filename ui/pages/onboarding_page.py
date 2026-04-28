@@ -8,7 +8,7 @@ from workspace.manager import create_workspace
 
 
 def render_onboarding(auth_user=None):
-    st.markdown("# 🧠 Welcome to Sintra Clone")
+    st.markdown("# 🧠 Welcome to Nexus Ai")
     st.markdown("#### Your AI workforce platform — 12 agents, one workspace.")
     st.markdown("---")
 

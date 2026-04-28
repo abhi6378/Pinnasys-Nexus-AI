@@ -19,7 +19,7 @@ from utils.logging_utils import configure_logging
 
 # Must be first Streamlit call
 st.set_page_config(
-    page_title="Sintra Clone",
+    page_title="Nexus Ai",
     page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded"
