@@ -38,13 +38,34 @@ class WorkflowEngineTests(unittest.TestCase):
         }
 
         with patch_attr(engine, "run_agent", Spy(side_effect=fake_run_agent)):
-            result = engine.email_triage_workflow("check inbox", "ctx", resume_state=resume_state)
+            result = engine.email_triage_workflow("check inbox and draft replies", "ctx", resume_state=resume_state)
 
         self.assertFalse(result["error"])
         self.assertEqual(len(result["steps"]), 2)
         self.assertEqual(result["steps"][0]["step"], "Read Emails")
         self.assertEqual(result["steps"][1]["step"], "Draft Replies")
         self.assertEqual(len(calls), 1)
+
+    def test_email_triage_summary_only_skips_draft_replies(self):
+        calls = []
+
+        def fake_run_agent(agent_key, user_input, brain_context="", **kwargs):
+            calls.append(kwargs.get("workflow_state", {}).get("current_step", ""))
+            return {
+                "name": agent_key.title(),
+                "output": "triaged",
+                "success": True,
+                "tool_used": "GMAIL_FETCH_EMAILS",
+            }
+
+        with patch_attr(engine, "run_agent", Spy(side_effect=fake_run_agent)):
+            result = engine.email_triage_workflow("summarize my recent mails", "ctx")
+
+        self.assertFalse(result["error"])
+        self.assertEqual(calls, ["Read Emails"])
+        self.assertEqual(len(result["steps"]), 1)
+        self.assertEqual(result["steps"][0]["step"], "Read Emails")
+        self.assertNotIn("DRAFTS", result["final_output"])
 
     def test_lead_capture_finalizer_preserves_sync_status_contract(self):
         def fake_run_agent(agent_key, user_input, brain_context="", **kwargs):

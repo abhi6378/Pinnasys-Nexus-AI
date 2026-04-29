@@ -84,6 +84,21 @@ def _find_step(steps: list[dict], label: str) -> dict:
     return {}
 
 
+def _should_draft_email_replies(user_input: str) -> bool:
+    lowered = str(user_input or "").lower()
+    reply_signals = (
+        "reply",
+        "repl",
+        "respond",
+        "draft",
+        "write back",
+        "send response",
+        "send reply",
+        "schedule reply",
+    )
+    return any(signal in lowered for signal in reply_signals)
+
+
 def _build_step_execution_constraint(
     label: str,
     *,
@@ -654,7 +669,16 @@ def lead_capture_workflow(user_input: str, brain_context: str, workspace_id: str
 
 
 def email_triage_workflow(user_input: str, brain_context: str, workspace_id: str = "", db: Session = None, resume_state: dict = None, connector_context: dict | None = None) -> dict:
-    return _run_workflow_definition(WORKFLOW_DEFINITIONS["email_triage"], user_input, brain_context, workspace_id, db, resume_state, connector_context)
+    definition = WORKFLOW_DEFINITIONS["email_triage"]
+    if not _should_draft_email_replies(user_input):
+        definition = WorkflowDefinition(
+            key=definition.key,
+            steps=tuple(step for step in definition.steps if step.label != "Draft Replies"),
+            finalizer=lambda steps: _sectioned_output(
+                [("TRIAGE", _find_step(steps, "Read Emails").get("output", ""))]
+            ),
+        )
+    return _run_workflow_definition(definition, user_input, brain_context, workspace_id, db, resume_state, connector_context)
 
 
 def competitor_research_workflow(user_input: str, brain_context: str, workspace_id: str = "", db: Session = None, resume_state: dict = None, connector_context: dict | None = None) -> dict:
