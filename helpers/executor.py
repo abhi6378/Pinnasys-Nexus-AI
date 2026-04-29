@@ -28,6 +28,7 @@ import logging
 import re
 from typing import Optional
 
+from brain.memory_sanitizer import sanitize_structure_for_memory, sanitize_text_for_memory
 from helpers.configs import get_agent
 from llm.client import generate, generate_with_tool_awareness
 from models.contracts import ConnectorContext, ExecutionConstraint, ToolPlan
@@ -54,6 +55,11 @@ UNVERIFIED_ACTION_PATTERN = re.compile(
     r"\b(sent|emailed|posted|published|scheduled|created|updated|synced|logged|delivered)\b",
     re.IGNORECASE,
 )
+MAX_TOOL_PAYLOAD_ITEMS = 8
+MAX_TOOL_PAYLOAD_STRING_CHARS = 280
+MAX_TOOL_PAYLOAD_DEPTH = 4
+MAX_TOOL_MESSAGE_CHARS = 6000
+MAX_HISTORY_MESSAGE_CHARS = 1600
 
 
 
@@ -300,6 +306,64 @@ def _build_followup_prompt(
         "Otherwise return the final user-facing answer in plain text. "
         "Do not claim any unverified live action."
     )
+
+
+def _compact_text_for_llm(value: str | None, *, limit: int = MAX_TOOL_PAYLOAD_STRING_CHARS) -> str:
+    return sanitize_text_for_memory(value, max_length=limit)
+
+
+def _compact_structure_for_llm(value, *, depth: int = 0):
+    if depth >= MAX_TOOL_PAYLOAD_DEPTH:
+        return "[truncated]"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _compact_text_for_llm(value)
+    if isinstance(value, list):
+        items = [
+            _compact_structure_for_llm(item, depth=depth + 1)
+            for item in value[:MAX_TOOL_PAYLOAD_ITEMS]
+        ]
+        remaining = len(value) - len(items)
+        if remaining > 0:
+            items.append({"_truncated_items": remaining})
+        return items
+    if isinstance(value, tuple):
+        return _compact_structure_for_llm(list(value), depth=depth)
+    if isinstance(value, dict):
+        compacted = {}
+        items = list(value.items())
+        for index, (key, item) in enumerate(items[:MAX_TOOL_PAYLOAD_ITEMS]):
+            compacted[str(key)[:80]] = _compact_structure_for_llm(item, depth=depth + 1)
+        remaining = len(items) - min(len(items), MAX_TOOL_PAYLOAD_ITEMS)
+        if remaining > 0:
+            compacted["_truncated_keys"] = remaining
+        return compacted
+    return _compact_text_for_llm(str(value))
+
+
+def _compact_tool_output_payload(tool_output) -> dict:
+    payload = tool_output if isinstance(tool_output, dict) else {"data": tool_output}
+    safe_payload = sanitize_structure_for_memory(payload, max_items=MAX_TOOL_PAYLOAD_ITEMS)
+    compacted = _compact_structure_for_llm(safe_payload)
+    serialized = json.dumps(compacted, default=str)
+    if len(serialized) <= MAX_TOOL_MESSAGE_CHARS:
+        return compacted if isinstance(compacted, dict) else {"data": compacted}
+    return {
+        "summary": _compact_text_for_llm(serialized, limit=MAX_TOOL_MESSAGE_CHARS - 64),
+        "_truncated": True,
+    }
+
+
+def _compact_history_messages(history: list[dict] | None) -> list[dict]:
+    compacted: list[dict] = []
+    for message in history or []:
+        item = dict(message)
+        content = item.get("content")
+        if isinstance(content, str):
+            item["content"] = _compact_text_for_llm(content, limit=MAX_HISTORY_MESSAGE_CHARS)
+        compacted.append(item)
+    return compacted
 
 
 def _looks_like_unverified_action_claim(
@@ -555,7 +619,7 @@ def _run_with_tools(
     config_allowed: set[str] = set(resolved_access.get("allowed_tools", []))
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
     if history:
-        messages.extend(history[-10:])
+        messages.extend(_compact_history_messages(history[-6:]))
     messages.append({"role": "user", "content": user_input})
     prompt_tools = available_tools
     workflow_capability_request = None
@@ -980,14 +1044,8 @@ def _run_with_tools(
             tool_used = resolved_tool_name or tool_name
             executed_tools.append(tool_used)
             tool_output = result.get("output", {})
-            tool_output_payload = (
-                tool_output if isinstance(tool_output, dict) else {"data": tool_output}
-            )
-
-            if isinstance(tool_output, dict):
-                tool_output_str = json.dumps(tool_output, indent=2, default=str)
-            else:
-                tool_output_str = str(tool_output)
+            tool_output_payload = _compact_tool_output_payload(tool_output)
+            tool_output_str = json.dumps(tool_output_payload, indent=2, default=str)
 
             tool_history.append(
                 f"Tool: {tool_used}\nResult:\n{tool_output_str[:2000]}"
@@ -1013,7 +1071,10 @@ def _run_with_tools(
                     {
                         "role": "tool",
                         "tool_call_id": openai_tool_call["id"],
-                        "content": json.dumps(tool_output_payload, default=str),
+                        "content": _compact_text_for_llm(
+                            json.dumps(tool_output_payload, default=str),
+                            limit=MAX_TOOL_MESSAGE_CHARS,
+                        ),
                     }
                 )
             else:

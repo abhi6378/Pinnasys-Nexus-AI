@@ -1,4 +1,5 @@
 import unittest
+import json
 
 import helpers.executor as executor
 from tests.support import Spy, make_module, patch_attr, stubbed_modules
@@ -237,3 +238,30 @@ class RunAgentTests(unittest.TestCase):
 
         self.assertIn("Verified execution history", prompt)
         self.assertIn("Ground the answer only in the verified execution results", prompt)
+
+    def test_compact_tool_output_payload_limits_large_email_results(self):
+        payload = {
+            "emails": [
+                {
+                    "subject": f"Subject {index}",
+                    "body": "A" * 5000,
+                    "from": "sender@example.com",
+                }
+                for index in range(20)
+            ]
+        }
+
+        compacted = executor._compact_tool_output_payload(payload)
+        serialized = json.dumps(compacted, default=str)
+
+        self.assertLessEqual(len(serialized), executor.MAX_TOOL_MESSAGE_CHARS)
+        self.assertIn("emails", compacted)
+        self.assertNotIn("A" * 1000, serialized)
+
+    def test_compact_history_messages_truncates_large_content(self):
+        history = [{"role": "assistant", "content": "B" * 8000}]
+
+        compacted = executor._compact_history_messages(history)
+
+        self.assertEqual(len(compacted), 1)
+        self.assertLessEqual(len(compacted[0]["content"]), executor.MAX_HISTORY_MESSAGE_CHARS)

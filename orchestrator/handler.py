@@ -30,6 +30,7 @@ from automation.chat_intent import maybe_create_chat_schedule
 from utils.logging_utils import log_event, log_exception, request_context
 
 logger = logging.getLogger(__name__)
+MAX_HISTORY_OUTPUT_CHARS = 1600
 
 
 # ── Legacy routing (fallback only) ────────────────────────────────────────────
@@ -151,7 +152,10 @@ def _sanitize_history_output(text: str) -> str:
         or "i can't process this request" in lowered
     ):
         return ""
-    return str(text or "")
+    clean = str(text or "").strip()
+    if len(clean) <= MAX_HISTORY_OUTPUT_CHARS:
+        return clean
+    return clean[: MAX_HISTORY_OUTPUT_CHARS - 3].rstrip() + "..."
 
 
 def _should_probe_opportunity(

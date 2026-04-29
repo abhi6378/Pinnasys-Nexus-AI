@@ -16,6 +16,9 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+MAX_HISTORY_MESSAGES = int(os.getenv("SINTRA_MAX_LLM_HISTORY_MESSAGES", "6") or "6")
+MAX_MESSAGE_CHARS = int(os.getenv("SINTRA_MAX_LLM_MESSAGE_CHARS", "4000") or "4000")
+MAX_TOTAL_MESSAGE_CHARS = int(os.getenv("SINTRA_MAX_LLM_TOTAL_MESSAGE_CHARS", "18000") or "18000")
 
 try:
     from openai import APIConnectionError, OpenAI, RateLimitError
@@ -44,6 +47,59 @@ def _normalize_message(message: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in message.items() if value is not None}
 
 
+def _truncate_message_content(value: Any, limit: int = MAX_MESSAGE_CHARS) -> Any:
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - 3, 0)].rstrip() + "..."
+
+
+def _estimate_message_size(message: dict[str, Any]) -> int:
+    content = message.get("content")
+    if isinstance(content, str):
+        return len(content)
+    if content is None:
+        return 0
+    try:
+        return len(json.dumps(content, default=str))
+    except Exception:
+        return len(str(content))
+
+
+def _compact_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not messages:
+        return []
+    normalized = [_normalize_message(message) for message in messages]
+    system_message: dict[str, Any] | None = None
+    tail = normalized
+    if normalized and normalized[0].get("role") == "system":
+        system_message = dict(normalized[0])
+        system_message["content"] = _truncate_message_content(system_message.get("content"), MAX_MESSAGE_CHARS * 2)
+        tail = normalized[1:]
+
+    clipped_tail: list[dict[str, Any]] = []
+    for message in tail[-MAX_HISTORY_MESSAGES:]:
+        clipped = dict(message)
+        clipped["content"] = _truncate_message_content(clipped.get("content"))
+        clipped_tail.append(clipped)
+
+    budget = MAX_TOTAL_MESSAGE_CHARS
+    selected_reversed: list[dict[str, Any]] = []
+    for message in reversed(clipped_tail):
+        size = _estimate_message_size(message)
+        if selected_reversed and budget - size < 0:
+            continue
+        selected_reversed.append(message)
+        budget -= size
+
+    compacted = list(reversed(selected_reversed)) or clipped_tail[-1:]
+    if system_message:
+        return [system_message, *compacted]
+    return compacted
+
+
 def _build_messages(
     system_prompt: str,
     prompt: str,
@@ -57,7 +113,7 @@ def _build_messages(
     supplied system prompt is ensured to be present at the front.
     """
     if messages is not None:
-        normalized = [_normalize_message(message) for message in messages]
+        normalized = _compact_messages(messages)
         if normalized and normalized[0].get("role") == "system":
             normalized[0]["content"] = system_prompt
             return normalized
@@ -65,7 +121,7 @@ def _build_messages(
 
     payload: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
     if history:
-        payload.extend(_normalize_message(message) for message in history[-10:])
+        payload.extend(_compact_messages(history))
     payload.append({"role": "user", "content": prompt})
     return payload
 
